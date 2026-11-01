@@ -1,7 +1,10 @@
 import { ItemIdSequence } from '../ItemIdSequence';
 import type { KeyNode } from '../../storage/schema';
-import { buildEffectivelyEnabledIds } from '../../storage/schema';
-import { domCodeToQtKey, listToQtModifiers } from './qtKeys';
+import { buildEffectivelyEnabledIds, inTreeOrder, isTempParentRef, tempParentRef, tempRootOf } from '../../storage/schema';
+import {
+    bindingQtModifiers, domCodeToQtKey, isKeypadBinding, isPrintableQtKey, isQtKeypadEvent,
+    keypadEventQtKey, printableEventQtKey, QT_KEY_UNKNOWN,
+} from './qtKeys';
 
 export type { KeyNode };
 
@@ -13,14 +16,54 @@ export interface KeyCodeInfo {
     modifiers: number;
 }
 
-function matchesEvent(key: string, modifiers: string[], event: KeyboardEvent): boolean {
-    if (event.code !== key) return false;
-    return (
-        event.ctrlKey  === modifiers.includes('ctrl')  &&
-        event.shiftKey === modifiers.includes('shift') &&
-        event.altKey   === modifiers.includes('alt')   &&
-        event.metaKey  === modifiers.includes('meta')
-    );
+/** What a binding is matched on: the DOM code it is stored under, its
+ *  modifier names, and the Qt::Key it was made with when that says more than
+ *  the code does (a shifted symbol, or a NumLock-off numpad key). */
+interface Matchable {
+    key: string;
+    modifiers: string[];
+    qtKey?: number;
+}
+
+/**
+ * Whether `event` is the key `b` is bound to — desktop's `TKey::match`, which
+ * compares the Qt::Key and the WHOLE modifier mask, Keypad bit included.
+ *
+ *  - Ctrl/Shift/Alt/Meta must be exactly the binding's.
+ *  - A numpad binding only answers the numpad, and the main keyboard's keys
+ *    only answer main-keyboard bindings: `permKey(Keypad, Key_8)` is numpad 8
+ *    and never the top-row 8.
+ *  - On the numpad the key is compared in Qt terms, so NumLock decides it as it
+ *    does on desktop: numpad 8 is Key_8 with NumLock on and Key_Up with it off.
+ *  - A binding made with a printable Qt key (permKey, tempKey, desktop XML,
+ *    the recorder) is compared with the character the press produced, as Qt
+ *    compares it — layout and all. `!` without Shift never fires on a US plain
+ *    1 (Qt never reports `!` for it), while on AZERTY the unshifted `&/1` key
+ *    is Key_Ampersand and Shift+it is Key_1|Shift, which a US-position match
+ *    would put on the 7 key and on nothing respectively.
+ *  - Otherwise — a named key, a binding stored only as a DOM code, or a press
+ *    with no usable character — the DOM code (the physical key) decides.
+ */
+function matchesEvent(b: Matchable, event: KeyboardEvent): boolean {
+    const { modifiers } = b;
+    if (
+        event.ctrlKey  !== modifiers.includes('ctrl')  ||
+        event.shiftKey !== modifiers.includes('shift') ||
+        event.altKey   !== modifiers.includes('alt')   ||
+        event.metaKey  !== modifiers.includes('meta')
+    ) return false;
+    const keypad = isKeypadBinding(b.key, modifiers);
+    if (keypad !== isQtKeypadEvent(event)) return false;
+    if (keypad) {
+        // 0 is "no Qt key known" (an unmapped string handed to tempKey).
+        const want = b.qtKey || domCodeToQtKey(b.key);
+        return want !== undefined && want === keypadEventQtKey(event);
+    }
+    if (isPrintableQtKey(b.qtKey)) {
+        const typed = printableEventQtKey(event);
+        if (typed !== undefined) return typed === b.qtKey;
+    }
+    return b.key !== '' && event.code === b.key;
 }
 
 interface TempKey {
@@ -36,9 +79,32 @@ interface TempKey {
     enabled: boolean;
     /** Killed, but not yet reaped. Mudlet frees a killed key in the deferred
      *  cleanup its unit runs at the end of a line, so until then the key is
-     *  still findable while no longer firing: `exists` says 1, `isActive` says
-     *  0, and a second `killKey` finds a corpse and answers false. */
+     *  held while no longer firing: `exists` and `isActive` say 0 (desktop
+     *  skips an item pending deletion), getProfileStats still counts it, and
+     *  a second `killKey` finds a corpse and answers false. */
     dead?: boolean;
+    /** Its script did not compile. Mudlet still makes the key, but
+     *  TKey::setScript leaves it unable to fire or report active, however it
+     *  is switched. */
+    uncompiled?: boolean;
+    /** Place in the profile's one key list — see {@link KeyEngine.process}. */
+    seq: number;
+    /** Called once when the key is freed, so the callback it runs can be let
+     *  go of (desktop's ~TKey unrefs its function). */
+    onFree?: () => void;
+}
+
+/** A permanent key's getKeyCode answer: the Qt::Key it was made with when
+ *  known, else its code's, and the mask with the Keypad bit a Numpad* code
+ *  implies. A group has no key of its own, and a code outside Qt's range — a
+ *  group's -1 in a package, or a number no key has — reads as Key_unknown, as
+ *  desktop's TKey keeps it. */
+export function permKeyCode(node: Pick<KeyNode, 'key' | 'modifiers' | 'qtKey'> & { isGroup?: boolean }): KeyCodeInfo {
+    const keyCode = node.isGroup ? QT_KEY_UNKNOWN : node.qtKey ?? domCodeToQtKey(node.key) ?? 0;
+    return {
+        keyCode: keyCode < 0 || keyCode > QT_KEY_UNKNOWN ? QT_KEY_UNKNOWN : keyCode,
+        modifiers: bindingQtModifiers(node.key, node.modifiers),
+    };
 }
 
 export class KeyEngine {
@@ -48,19 +114,114 @@ export class KeyEngine {
     private idSeq = new ItemIdSequence();
     setIdSequence(seq: ItemIdSequence): void { this.idSeq = seq; }
 
+    // ── Unified ordering (Mudlet `mKeyRootNodeList`) ──────────────────────────
+    // Desktop keeps temporary and permanent keys in ONE root list, in the order
+    // they were created, and KeyUnit::processDataStream walks it front to back,
+    // so the earlier-made key wins a key two bindings share. Numbered as
+    // PatternEngine numbers aliases: a permanent key draws its seq the first
+    // time it is seen (kept across reloads), a temp key when it is made, and a
+    // permanent key sorts by its ROOT's seq — a subtree is walked whole where
+    // its root sits.
+    private regCounter = 1;
+    private readonly permReg = new Map<string, number>();
+    /** Each key in {@link perm} → the seq of the root it hangs under. */
+    private permRootSeq = new Map<string, number>();
+
     // ── Temp keybindings (session-scoped, created by scripts) ─────────────────
 
-    /** Number of live session-scoped temp keys (Mudlet `getProfileStats` temp
-     *  count). Killed-but-unreaped keys are not live and don't count. */
+    /** Temp keys in the tree (Mudlet `getProfileStats` temp count) — killed
+     *  ones too, until the cleanup frees them: KeyUnit::assembleReport walks
+     *  the tree, and a killed key stays in it until doCleanup(). */
     get tempCount(): number {
+        return this.temp.size;
+    }
+
+    /** Of {@link tempCount}, the keys that are still active. */
+    get tempActiveCount(): number {
         let n = 0;
-        for (const t of this.temp.values()) if (!t.dead) n++;
+        for (const id of this.temp.keys()) if (this.tempIsActive(id)) n++;
         return n;
     }
 
-    addTemp(key: string, modifiers: string[], fn: TempFn, qt?: { keyCode: number; modifier: number }): number {
+    /** Each permanent key hanging off a temporary one (as of the last
+     *  loadPerm) → that temporary root's id; and the parent refs in use. */
+    private permTempRoot = new Map<string, number>();
+    private tempParentRefs = new Set<string>();
+    private orphanedParents = new Set<string>();
+    private onOrphans: (() => void) | null = null;
+
+    /** Tree keys of freed temp keys that had permanent children, since the
+     *  last call. Their owner removes those subtrees from the store. */
+    takeOrphanedParents(): string[] {
+        if (this.orphanedParents.size === 0) return [];
+        const out = [...this.orphanedParents];
+        this.orphanedParents.clear();
+        return out;
+    }
+
+    /** Told when {@link takeOrphanedParents} has something to hand over. */
+    setOrphanListener(fn: (() => void) | null): void {
+        this.onOrphans = fn;
+    }
+
+    /** In the tree and not killed — what exists() and findItems() count. */
+    hasLiveTemp(id: number): boolean {
+        const t = this.temp.get(id);
+        return !!t && !t.dead;
+    }
+
+    /** Live, switched on and compiled — isActive(). */
+    tempIsActive(id: number): boolean {
+        const t = this.temp.get(id);
+        return !!t && !t.dead && t.enabled && !t.uncompiled;
+    }
+
+    /** Live temp key ids, ascending, whose name — the id itself — passes `test`. */
+    liveTempIds(test: (name: string) => boolean): number[] {
+        const out: number[] = [];
+        for (const [id, t] of this.temp) if (!t.dead && test(String(id))) out.push(id);
+        return out.sort((a, b) => a - b);
+    }
+
+    /** The temp key named `name` — a temp key is named after its id — or
+     *  null; a killed one only when `includeDead` (perm* parent resolution). */
+    newestTempByName(name: string, includeDead: boolean): number | null {
+        const id = Number(name);
+        if (!Number.isInteger(id) || String(id) !== name) return null;
+        const t = this.temp.get(id);
+        return t && (includeDead || !t.dead) ? id : null;
+    }
+
+    /** `killKey(name)` for the temporaries. */
+    killTempByName(name: string): boolean {
+        const id = this.newestTempByName(name, false);
+        return id !== null && this.killKey(id);
+    }
+
+    /** The order seq of a permanent key's root — for one hanging off a
+     *  temporary key, that key's. */
+    private rootSeqOf(id: string): number {
+        const temp = this.permTempRoot.get(id);
+        if (temp !== undefined) return this.temp.get(temp)?.seq ?? Number.MAX_SAFE_INTEGER;
+        return this.permRootSeq.get(id) ?? Number.MAX_SAFE_INTEGER;
+    }
+
+    /** Whether a permanent key is reached at all: under a temporary key only
+     *  while that key is active (TKey::match tests its children only then). */
+    private reachable(id: string): boolean {
+        const temp = this.permTempRoot.get(id);
+        return temp === undefined || this.tempIsActive(temp);
+    }
+
+    addTemp(
+        key: string, modifiers: string[], fn: TempFn,
+        qt?: { keyCode: number; modifier: number; uncompiled?: boolean; onFree?: () => void },
+    ): number {
         const id = this.idSeq.next();
-        this.temp.set(id, { key, modifiers, fn, qtKey: qt?.keyCode, qtModifier: qt?.modifier, enabled: true });
+        this.temp.set(id, {
+            key, modifiers, fn, qtKey: qt?.keyCode, qtModifier: qt?.modifier, enabled: true,
+            uncompiled: qt?.uncompiled === true, seq: this.regCounter++, onFree: qt?.onFree,
+        });
         return id;
     }
 
@@ -68,7 +229,10 @@ export class KeyEngine {
     hasTemp(id: number): boolean { return this.temp.has(id); }
 
     /** Whether a live temp key is enabled — backs isActive(id, "key"). */
-    isTempEnabled(id: number): boolean { return this.temp.get(id)?.enabled === true; }
+    isTempEnabled(id: number): boolean {
+        const t = this.temp.get(id);
+        return t?.enabled === true && !t.uncompiled;
+    }
 
     /** enableKey/disableKey with a numeric id. False when no temp key matches. */
     setTempEnabled(id: number, enabled: boolean): boolean {
@@ -95,12 +259,12 @@ export class KeyEngine {
             if (!t || t.dead) return null;
             return {
                 keyCode: t.qtKey ?? (typeof t.key === 'string' ? domCodeToQtKey(t.key) ?? 0 : t.key),
-                modifiers: t.qtModifier ?? listToQtModifiers(t.modifiers),
+                modifiers: t.qtModifier ?? bindingQtModifiers(t.key, t.modifiers),
             };
         }
-        const node = this.perm.find(k => k.name === idOrName && k.key);
+        const node = this.perm.find(k => k.name === idOrName);
         if (!node) return null;
-        return { keyCode: domCodeToQtKey(node.key) ?? 0, modifiers: listToQtModifiers(node.modifiers) };
+        return permKeyCode(node);
     }
 
     killKey(id: number): boolean {
@@ -118,7 +282,16 @@ export class KeyEngine {
     /** Free every key killed since the last call. Runs once per processed line
      *  batch, mirroring the deferred cleanup Mudlet's TKeyUnit does. */
     reapKilled(): void {
-        for (const [id, t] of this.temp) if (t.dead) this.temp.delete(id);
+        for (const [id, t] of this.temp) {
+            if (!t.dead) continue;
+            this.temp.delete(id);
+            t.onFree?.();
+            const ref = tempParentRef(id);
+            if (this.tempParentRefs.has(ref)) {
+                this.orphanedParents.add(ref);
+                this.onOrphans?.();
+            }
+        }
     }
 
     /** @param all Mudlet's "React to all keybindings on the same key": run
@@ -128,9 +301,47 @@ export class KeyEngine {
      *  exists to avoid. */
     processTemp(event: KeyboardEvent, all = false): boolean {
         let fired = false;
-        for (const { key, modifiers, fn, enabled } of [...this.temp.values()]) {
-            if (!enabled || !matchesEvent(key, modifiers, event)) continue;
-            fn();
+        for (const t of [...this.temp.values()]) {
+            if (!this.fireTemp(t, event)) continue;
+            if (!all) return true;
+            fired = true;
+        }
+        return fired;
+    }
+
+    /** Run one temp key if it is live and `event` is its key. */
+    private fireTemp(t: TempKey, event: KeyboardEvent): boolean {
+        if (!t.enabled || t.uncompiled || !matchesEvent(t, event)) return false;
+        t.fn();
+        return true;
+    }
+
+    /**
+     * A keypress's whole key pass: temporary and permanent keys alike, in the
+     * one order desktop's `mKeyRootNodeList` holds them (creation order, see
+     * the unified-ordering note above). The first match fires and ends the
+     * pass, unless `all` (Mudlet's "React to all keybindings on the same key")
+     * asks for every match. Running all the temps first put a tempKey made
+     * after a permKey ahead of it (mudlet-web#340). Temps fire themselves; a
+     * permanent hit goes to `firePerm`. Both lists are snapshots taken when the
+     * pass began — a handler may make, kill or toggle keys. True when anything
+     * fired.
+     */
+    process(event: KeyboardEvent, all: boolean, firePerm: (binding: KeyNode) => void): boolean {
+        const steps: { seq: number; at: number; temp?: TempKey; perm?: KeyNode }[] = [];
+        for (const t of this.temp.values()) steps.push({ seq: t.seq, at: 0, temp: t });
+        this.perm.forEach((binding, i) => {
+            steps.push({ seq: this.rootSeqOf(binding.id), at: i + 1, perm: binding });
+        });
+        steps.sort((a, b) => a.seq - b.seq || a.at - b.at);
+        let fired = false;
+        for (const step of steps) {
+            if (step.temp) {
+                if (!this.fireTemp(step.temp, event)) continue;
+            } else if (step.perm) {
+                if (!this.reachable(step.perm.id) || !matchesEvent(step.perm, event)) continue;
+                firePerm(step.perm);
+            }
             if (!all) return true;
             fired = true;
         }
@@ -142,22 +353,74 @@ export class KeyEngine {
     /** `blocked`: bindings whose code will not compile, which Mudlet leaves
      *  inactive — see buildEffectivelyEnabledIds. */
     loadPerm(keybindings: KeyNode[], blocked?: ReadonlySet<string>): void {
+        // Store order puts a parent before its children, so registering in it
+        // numbers a new root ahead of anything under it.
+        this.reserveOrder(keybindings);
+        const byId = new Map(keybindings.map(k => [k.id, k]));
+        for (const id of this.permReg.keys()) {
+            if (!byId.has(id)) this.permReg.delete(id);
+        }
+        // Permanent keys hanging off a temporary one (see TEMP_PARENT_PREFIX).
+        this.permTempRoot = new Map();
+        this.tempParentRefs.clear();
+        for (const k of keybindings) if (isTempParentRef(k.parentId)) this.tempParentRefs.add(k.parentId);
+        if (this.tempParentRefs.size > 0) {
+            for (const k of keybindings) {
+                const root = tempRootOf(k, byId);
+                if (root !== null) this.permTempRoot.set(k.id, root);
+            }
+        }
+        const rootSeq = (node: KeyNode): number => {
+            let cur = node;
+            const seen = new Set<string>([cur.id]);
+            while (cur.parentId) {
+                const parent = byId.get(cur.parentId);
+                if (!parent || seen.has(parent.id)) break;
+                seen.add(parent.id);
+                cur = parent;
+            }
+            return this.permReg.get(cur.id) ?? Number.MAX_SAFE_INTEGER;
+        };
         const enabledIds = buildEffectivelyEnabledIds(keybindings, blocked);
-        this.perm = keybindings.filter(k => enabledIds.has(k.id) && k.key);
+        // A key with no DOM code can still be bound by the character it types
+        // (Key_Eacute from an AZERTY profile has no US position at all).
+        // Tree order, not store order: a key added later to an older group
+        // sits inside that group, ahead of root keys made since (#336).
+        const ordered = inTreeOrder(keybindings);
+        const bound = (k: KeyNode) => !k.isGroup && (k.key || isPrintableQtKey(k.qtKey));
+        this.perm = ordered.filter(k => enabledIds.has(k.id) && (k.key || isPrintableQtKey(k.qtKey)));
+        this.permHolders = ordered.filter(bound);
+        this.permRootSeq = new Map(this.perm.map(k => [k.id, rootSeq(k)]));
     }
 
-    matchPerm(event: KeyboardEvent): KeyNode | null {
-        for (const binding of this.perm) {
-            if (matchesEvent(binding.key, binding.modifiers, event)) return binding;
+    /** Every saved binding with a key, switched on or not — see {@link holderOf}. */
+    private permHolders: KeyNode[] = [];
+
+    /**
+     * Give the profile's saved keys their place in the firing order before any
+     * script can make a temporary one. Desktop builds them from the profile
+     * before a script runs, so a tempKey a script makes at load time sorts
+     * after them — but here the scripts run before the first {@link loadPerm},
+     * which then reuses the seqs reserved here.
+     */
+    reserveOrder(items: readonly { id: string }[]): void {
+        for (const item of items) {
+            if (!this.permReg.has(item.id)) this.permReg.set(item.id, this.regCounter++);
         }
-        return null;
+    }
+
+    /** The first permanent keybinding the event matches, in tree order — the
+     *  permanent half of {@link process}, for callers that ask about the
+     *  saved keys alone. */
+    matchPerm(event: KeyboardEvent): KeyNode | null {
+        return this.perm.find(b => this.reachable(b.id) && matchesEvent(b, event)) ?? null;
     }
 
     /** Every permanent keybinding the event matches, in tree order. The list
      *  form of {@link matchPerm}, for Mudlet's "React to all keybindings on the
      *  same key". */
     matchAllPerm(event: KeyboardEvent): KeyNode[] {
-        return this.perm.filter(b => matchesEvent(b.key, b.modifiers, event));
+        return this.perm.filter(b => this.reachable(b.id) && matchesEvent(b, event));
     }
 
     /**
@@ -172,6 +435,10 @@ export class KeyEngine {
      * list in Mudlet's key unit), and a temporary one answers with no name: it
      * is named after its own id, which names nothing a player could go and look
      * for.
+     *
+     * A switched-off binding still holds its key — on its own or through its
+     * group — since scripts switch bindings on and off and enableKey() does not
+     * look for commands; one killed does not, as it can never fire again.
      */
     holderOf(key: string, modifiers: string[]): { name: string; temporary: boolean } | null {
         const same = (bindingKey: string, bindingMods: string[]): boolean =>
@@ -179,10 +446,10 @@ export class KeyEngine {
             && bindingMods.length === modifiers.length
             && bindingMods.every(m => modifiers.includes(m));
         for (const t of this.temp.values()) {
-            if (!t.enabled || t.dead) continue;
+            if (t.dead || t.uncompiled) continue;
             if (same(t.key, t.modifiers)) return { name: '', temporary: true };
         }
-        for (const binding of this.perm) {
+        for (const binding of this.permHolders) {
             if (same(binding.key, binding.modifiers)) return { name: binding.name, temporary: false };
         }
         return null;
@@ -190,6 +457,11 @@ export class KeyEngine {
 
     destroy(): void {
         this.temp.clear();
+        this.orphanedParents.clear();
+        this.tempParentRefs.clear();
+        this.permTempRoot = new Map();
         this.perm = [];
+        this.permHolders = [];
+        this.permRootSeq = new Map();
     }
 }

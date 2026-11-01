@@ -1,11 +1,14 @@
+import { flushSync } from 'react-dom';
 import { type OutputRendererControls } from '../output/OutputRenderer';
 import type { Console } from '../../mud/text/Console';
 import type { AnsiAwareBuffer } from '../../mud/text/FormatState';
 import type { DockSide, MxpTabPage, WindowHandle, WindowOpenOptions, ScriptWindowRenderData } from './types';
-import { MAP_VIEW_ID_RE, mapViewWindowId, migrateClientWindowHints } from './types';
-import { MapStore } from '../../map/MapStore';
+import { MAP_VIEW_ID_RE, MAP_WIDGET_ID, mapViewWindowId, migrateClientWindowHints } from './types';
+import { MapStore, type MapIssue } from '../../map/MapStore';
+import { centerviewAreaChange } from './panels/mapAreaChange';
 import { parseXmlMap } from '../../map/xmlMapImport';
 import { exportAreaImage } from '../../map/mapImageExport';
+import { withLabelPixmapBytes } from '../../map/labelPixmap';
 import { useAppStore, selectProfileField } from '../../storage';
 import { saveMap as saveMapToStorage, loadMap as loadMapFromStorage } from '../../storage/mapStorage';
 import { readMapFromBuffer, writeMapToBuffer } from 'mudlet-map-binary-reader';
@@ -13,6 +16,11 @@ import { serializeMapInWorker, streamMapInWorker } from '../../map/mapParserClie
 import { assertReadableMapVersion, MapVersionError } from '../../map/mapVersion';
 import { Buffer } from 'buffer';
 import { OverlayLayerOrder } from '../layout/overlayLayerOrder';
+import { TIMESTAMP_GUTTER_COLUMNS } from '../../mud/connection/TelnetNegotiator';
+import { DEFAULT_CMD_LINE_HOST, SubCommandLine, type CmdLineHost } from '../cmdline/subCommandLine';
+import { cssEscape } from '../labels/qtCss';
+import { DEFAULT_SPLIT_PANE_HEIGHT } from '../output/clearSplit';
+import { outputRows } from '../output/outputRows';
 
 interface ScriptWindowData extends ScriptWindowRenderData {
     pendingText: Array<string | AnsiAwareBuffer>;
@@ -27,6 +35,8 @@ interface WindowCmdLineState {
      *  the main connection (mirrors Mudlet's pre-setCmdLineAction default) —
      *  see {@link WindowManager.submitCmdLine}. */
     action: ((text: string) => void) | null;
+    /** The line's keyboard state (history, Tab), outliving the input's mounts. */
+    model: SubCommandLine;
 }
 
 interface ScrollState {
@@ -98,6 +108,13 @@ const TEXT_BUFFER_LIMIT = 5000;
 /** Map a DOM MouseEvent.button to Mudlet's button number for
  *  sysWindowMousePress/ReleaseEvent. DOM: 0=left,1=middle,2=right,3=back,
  *  4=forward → Mudlet: 1=left,2=right,3=middle,4=back,5=forward (0 otherwise). */
+/** The widget a mouse event belongs to: the innermost window box or label
+ *  around its target. */
+function mouseOwner(target: EventTarget | null): Element | null {
+    if (!(target instanceof Element)) return null;
+    return target.closest('[data-mouse-window], [data-mudlet-label]');
+}
+
 function mouseButtonNumber(button: number): number {
     switch (button) {
         case 0: return 1; // left
@@ -181,6 +198,16 @@ export class WindowManager {
     private readonly mapControls   = new Map<string, MapControl>();
     /** See {@link hasMapper}. */
     private mapperCreated = false;
+    /** The area the map widget shows, and whether a centerview has run since
+     *  it opened (or its map went away) — what sysMapAreaChanged is worked out
+     *  from (centerviewAreaChange). Kept here, not in MapPanel, because desktop
+     *  builds the widget synchronously: a centerview straight after
+     *  openMapWidget raises the event even though the panel has not mounted. */
+    private mapShownArea: number | null = null;
+    private mapCentered = false;
+    /** A repaint of the map widget was asked for and has not run its map info
+     *  contributors yet — see {@link pumpMapPaint}. */
+    private mapPaintDue = false;
     /** Per-window teardown for the mousedown/mouseup listeners observeMouse
      *  attaches. Keyed by window id ('main' for the central output). */
     private readonly mouseCleanups = new Map<string, () => void>();
@@ -554,6 +581,7 @@ export class WindowManager {
             win.pendingPartial = undefined;
         }
         this.elements.set(id, element);
+        this.watchTail(element);
         this.applyScrollClasses(id);
     }
 
@@ -580,6 +608,7 @@ export class WindowManager {
     registerMainOutput(element: HTMLElement | null): void {
         if (element) {
             this.elements.set('main', element);
+            this.watchTail(element);
             this.applyScrollClasses('main');
         } else {
             this.elements.delete('main');
@@ -618,6 +647,19 @@ export class WindowManager {
         return this.mainViewportEl;
     }
 
+    /**
+     * The box the main window's size is read from: the `.main-viewport` host,
+     * which the console viewport spans (`inset: 0`) but which carries none of
+     * its padding. The borders are that padding, and desktop's borders are
+     * insets inside a console whose size they leave alone — measuring the
+     * padded viewport instead let a border wider than the console widen the
+     * "window" (setBorderRight(1000000) answered a window a million pixels
+     * wide), which every attached Adjustable.Container then took for a resize.
+     */
+    getMainSizeElement(): HTMLElement | null {
+        return this.mainViewportHostEl ?? this.mainViewportEl;
+    }
+
     /** The `.main-viewport` box the console viewport and the overlay root both
      *  span (`inset: 0`). It is the one element that can be given a size — the
      *  two inside it are absolutely positioned against it, so sizing either of
@@ -628,8 +670,19 @@ export class WindowManager {
         this.mainViewportHostEl = element;
         // A remount arrives with the override still in force — re-apply it, or a
         // script's sizing would silently come undone by a layout switch.
-        if (element && this.mainViewportSize) {
+        if (element && this.mainViewportSize && !this.mainWindowFrameEl) {
             this.applyMainViewportSize(element, this.mainViewportSize.width, this.mainViewportSize.height);
+        }
+    }
+
+    /** The `.content-layout` column — button bars, docks, the console and the
+     *  command bar — which stands in for desktop's application window: what
+     *  setMainWindowSize sizes, the console taking what the rest leaves. */
+    private mainWindowFrameEl: HTMLElement | null = null;
+    registerMainWindowFrame(element: HTMLElement | null): void {
+        this.mainWindowFrameEl = element;
+        if (element && this.mainViewportSize) {
+            this.applyMainWindowFrameSize(element, this.mainViewportSize.width, this.mainViewportSize.height);
         }
     }
 
@@ -642,23 +695,34 @@ export class WindowManager {
         host.style.height = `${height}px`;
     }
 
+    private applyMainWindowFrameSize(frame: HTMLElement, width: number, height: number): void {
+        // `.content-layout` is `flex: 1` in its column; fixed on both axes
+        // instead, and the console inside it keeps its `flex: 1`.
+        frame.style.flex = '0 0 auto';
+        frame.style.width = `${width}px`;
+        frame.style.height = `${height}px`;
+    }
+
     /**
      * Mudlet `setMainWindowSize(width, height)`. Desktop resizes the application
      * window; a browser tab cannot resize itself — `window.resizeTo` is refused
-     * for anything the script did not open — so what is sized is the main
-     * viewport, which is what `getMainWindowSize` has always measured. The two
-     * therefore agree exactly, with none of the window chrome between them that
-     * desktop has to account for.
+     * for anything the script did not open — so what is sized is the column
+     * that stands in for that window ({@link registerMainWindowFrame}): the
+     * console in it is what `getMainWindowSize` measures, and the command bar
+     * and button bars take their room from it as they grow, as on desktop.
+     * Before that column has mounted, the console's own box is sized.
      *
      * Returns false only when there is no viewport to size (before mount).
      */
     setMainWindowSize(width: number, height: number): boolean {
         const host = this.mainViewportHostEl;
-        if (!host) return false;
+        const frame = this.mainWindowFrameEl;
+        if (!host && !frame) return false;
         const w = Math.max(0, Math.round(width));
         const h = Math.max(0, Math.round(height));
         this.mainViewportSize = { width: w, height: h };
-        this.applyMainViewportSize(host, w, h);
+        if (frame) this.applyMainWindowFrameSize(frame, w, h);
+        else if (host) this.applyMainViewportSize(host, w, h);
         // ResizeObserver would deliver this through the browser's event loop,
         // and a script that resizes and then measures is still sitting on top of
         // that loop — so it would read the old size and Geyser would not have
@@ -863,13 +927,25 @@ export class WindowManager {
         // Skip the initial 0×0 frame and any spurious zero-size entries
         // that happen during portal moves between dock/floating shells.
         if (w <= 0 && h <= 0) return;
-        this.emitWindowSize(id, w, h);
-        // Mudlet sysConsoleSizeChanged(name, columns, rows) — fires when
-        // the char-grid changes. cols is the wrap setting (falling back to
+        // Mudlet sysConsoleSizeChanged(name, columns, rows, gutter) — fires
+        // when the char-grid changes. cols is the wrap setting (falling back to
         // an estimate from element width); rows is derived from element
         // height. Both axes use the rendered monospace cell size so the
         // event values match what scripts can use to lay out output.
+        //
+        // Raised before the window-size events, as on desktop: TConsole's
+        // resizeEvent resizes its text pane first, whose own resizeEvent
+        // raises the grid event, and only then raises sysWindowResizeEvent.
         this.emitConsoleGridIfChanged(id, w, h, element);
+        // The main window's size is its unpadded box's, as getMainWindowSize
+        // reads it (see getMainSizeElement).
+        const sizeEl = id === 'main' ? this.getMainSizeElement() : null;
+        if (sizeEl && sizeEl !== element) {
+            const box = sizeEl.getBoundingClientRect();
+            this.emitWindowSize(id, Math.round(box.width), Math.round(box.height));
+        } else {
+            this.emitWindowSize(id, w, h);
+        }
     }
 
     /** Raise sysWindowResizeEvent/sysUserWindowResizeEvent for `id` at w×h,
@@ -930,7 +1006,8 @@ export class WindowManager {
      * {@link pumpCreatedSizes}, whichever comes first. It carries the size
      * getUserWindowSize() gives at that moment, the mounted box or the stored
      * one, and the dedup in emitWindowSize keeps the observer's own first tick
-     * from repeating it.
+     * from repeating it. resizeWindow() queues one the same way, for the size
+     * a script just gave the window.
      */
     announceCreatedSize(id: string): void {
         this.createdSizesDue.add(id);
@@ -982,6 +1059,16 @@ export class WindowManager {
      *  resize observer last reported — which on a fast/mobile connect may be
      *  stale or not yet fired. No-op when the main element isn't mounted, or
      *  when the size is unchanged (the dedup guard in emitConsoleGridIfChanged). */
+    /** Apply the profile's setBorder* insets to the main viewport now and
+     *  re-measure the char grid inside them, raising sysConsoleSizeChanged if
+     *  it moved. Host::setBorders resizes the console — and with it the text
+     *  pane, whose resize raises that event — before it raises
+     *  sysWindowResizeEvent, so a border change reports the grid first. */
+    applyMainBorders(): void {
+        this.applyMainViewportInsets();
+        this.remeasureMainGrid();
+    }
+
     remeasureMainGrid(): void {
         const el = this.elements.get('main') ?? this.mainViewportEl;
         if (!el) return;
@@ -1015,10 +1102,30 @@ export class WindowManager {
         const wrap = win?.wrapAt ?? 0;
         const cols = wrap > 0 ? wrap : Math.max(1, Math.floor(Math.max(0, usableW) / cellW));
         const rows = Math.max(1, Math.floor(Math.max(0, usableH) / cellH));
+        this.reportConsoleGrid(id, cols, rows);
+    }
+
+    /**
+     * Raise sysConsoleSizeChanged(name, columns, rows, gutter) for a console
+     * whose character grid is now `cols` × `rows`, unless that is the grid it
+     * last reported — TConsole::raiseMudletResizeEvent compares against what
+     * it reported before. Called by the resize path above, and by a timestamp
+     * column being shown or hidden, which reports a grid that a font change
+     * (which reports nothing on its own) left unreported.
+     */
+    reportConsoleGrid(id: string, cols: number, rows: number): void {
         const last = this.lastEmittedGrid.get(id);
         if (last && last.cols === cols && last.rows === rows) return;
         this.lastEmittedGrid.set(id, { cols, rows });
-        this.onRaiseEvent?.('sysConsoleSizeChanged', [id, cols, rows]);
+        // The 4th argument is the timestamp gutter's width in columns —
+        // TConsole::raiseMudletResizeEvent's `showTimeStamps() ?
+        // TBuffer::smTimeStampFormat.size() : 0`. Main's column is the
+        // profile's setting; every other console's is its own.
+        const shown = id === 'main'
+            ? selectProfileField(useAppStore.getState(), this._connectionId, 'showTimestamps') === true
+            : this.timeStampsEnabled(id) === true;
+        const gutter = shown ? TIMESTAMP_GUTTER_COLUMNS : 0;
+        this.onRaiseEvent?.('sysConsoleSizeChanged', [id, cols, rows, gutter]);
         // Keep NAWS in sync with the main output area's character grid.
         if (id === 'main') this.onMainConsoleResize?.(cols, rows);
     }
@@ -1038,11 +1145,19 @@ export class WindowManager {
      * ResizeObserver tick, which never fired for the case the event exists for:
      * content growing inside an element does not resize that element, so a
      * console could overflow indefinitely without a single event.
+     *
+     * The counts come from `measure`, called only for a console that cannot
+     * scroll: counting rows reads the pane's computed style and height, which
+     * forces a layout of everything the console holds. Measured up front on
+     * every write, that made each line written to a chat window cost more the
+     * fuller it was — and a console that scrolls, the default, never uses it
+     * (mudlet-web#439).
      */
-    noteLineOverflow(id: string, lineCount: number, rows: number): void {
-        if (rows <= 0) return;
+    noteLineOverflow(id: string, measure: () => { lineCount: number; rows: number }): void {
         const scroll = this.scrollState.get(id);
         if (!scroll || scroll.scrollingEnabled) return;
+        const { lineCount, rows } = measure();
+        if (rows <= 0) return;
         const overflowLines = lineCount - rows;
         if (overflowLines <= 0) return;
         this.onRaiseEvent?.('sysWindowOverflowEvent', [id, overflowLines]);
@@ -1052,23 +1167,79 @@ export class WindowManager {
      *  window's box. Args mirror Mudlet: (button, x, y, name) where button is
      *  1=left, 2=right, 3=middle, 4=back, 5=forward (0 = anything else), x/y are
      *  pixel coordinates relative to the window, and name is the window id
-     *  ('main' for the central output). */
+     *  ('main' for the central output).
+     *
+     *  Desktop's ordering is what shapes the wiring:
+     *  - The press is raised before anything inside the console acts on it — a
+     *    link runs between the press and release events (TConsole raises the
+     *    press, then TTextEdit::mousePressEvent runs the link), so the press
+     *    listens in the capture phase, ahead of the link's own handler.
+     *  - Qt gives the release to the widget the press went to (its implicit
+     *    mouse grab), wherever the pointer is let go, so the release is raised
+     *    for the window that took the press, from a document listener.
+     *  - A press on a label or a nested window belongs to that widget: labels
+     *    pass on only what they have no callback for (see
+     *    {@link raiseUnhandledMouse}), and a nested window raises its own. */
     private observeMouse(id: string, element: HTMLElement): void {
         this.mouseCleanups.get(id)?.();
-        const fire = (event: string) => (e: MouseEvent) => {
-            const rect = element.getBoundingClientRect();
-            const x = Math.round(e.clientX - rect.left);
-            const y = Math.round(e.clientY - rect.top);
-            this.onRaiseEvent?.(event, [mouseButtonNumber(e.button), x, y, id]);
+        if (element.dataset) element.dataset.mouseWindow = id;
+        const onDown = (e: MouseEvent) => {
+            if (mouseOwner(e.target) !== element) return;
+            this.raiseWindowMouse('sysWindowMousePressEvent', id, element, e);
+            this.mouseGrab = { id, element };
         };
-        const onDown = fire('sysWindowMousePressEvent');
-        const onUp = fire('sysWindowMouseReleaseEvent');
-        element.addEventListener('mousedown', onDown);
-        element.addEventListener('mouseup', onUp);
+        element.addEventListener('mousedown', onDown, true);
+        this.installMouseReleaseListener();
         this.mouseCleanups.set(id, () => {
-            element.removeEventListener('mousedown', onDown);
-            element.removeEventListener('mouseup', onUp);
+            element.removeEventListener('mousedown', onDown, true);
+            if (element.dataset?.mouseWindow === id) delete element.dataset.mouseWindow;
+            if (this.mouseGrab?.id === id) this.mouseGrab = null;
+            this.mouseCleanups.delete(id);
+            if (this.mouseCleanups.size === 0 && this.mouseReleaseListener) {
+                document.removeEventListener('mouseup', this.mouseReleaseListener, true);
+                this.mouseReleaseListener = null;
+            }
         });
+    }
+
+    /** The window holding Qt's implicit mouse grab: the one the last press
+     *  went to, until every button is up again. */
+    private mouseGrab: { id: string; element: HTMLElement } | null = null;
+    private mouseReleaseListener: ((e: MouseEvent) => void) | null = null;
+
+    private installMouseReleaseListener(): void {
+        if (this.mouseReleaseListener || typeof document === 'undefined') return;
+        const onUp = (e: MouseEvent) => {
+            const grab = this.mouseGrab;
+            if (!grab) return;
+            if (e.buttons === 0) this.mouseGrab = null;
+            this.raiseWindowMouse('sysWindowMouseReleaseEvent', grab.id, grab.element, e);
+        };
+        this.mouseReleaseListener = onUp;
+        document.addEventListener('mouseup', onUp, true);
+    }
+
+    private raiseWindowMouse(event: string, id: string, element: HTMLElement, e: MouseEvent): void {
+        const rect = element.getBoundingClientRect();
+        const x = Math.round(e.clientX - rect.left);
+        const y = Math.round(e.clientY - rect.top);
+        this.onRaiseEvent?.(event, [mouseButtonNumber(e.button), x, y, id]);
+    }
+
+    /**
+     * A press or release a label had no callback for. TLabel::mousePressEvent
+     * and mouseReleaseEvent hand an event they don't use on to the widget
+     * under them — the label's window — which raises it as its own
+     * sysWindowMousePressEvent / sysWindowMouseReleaseEvent, at the pointer's
+     * position in that window.
+     */
+    raiseUnhandledMouse(kind: 'press' | 'release', windowId: string, e: MouseEvent): void {
+        const element = windowId === 'main' ? this.mainViewportEl : this.viewports.get(windowId);
+        if (!element) return;
+        this.raiseWindowMouse(
+            kind === 'press' ? 'sysWindowMousePressEvent' : 'sysWindowMouseReleaseEvent',
+            windowId, element, e,
+        );
     }
 
     /** Mudlet `sysDropEvent(filepath, suffix, x, y, name)` and
@@ -1147,8 +1318,63 @@ export class WindowManager {
         // On success Mudlet sets the player room (mRoomIdHash) as a side effect,
         // so getPlayerRoom() returns this id afterwards.
         this.mapStore.setPlayerRoom(roomId);
+        // Mudlet `sysMapAreaChanged(newAreaID, prevAreaID)`. Only a map widget
+        // raises it, and only once however many widgets show the map.
+        const areaId = this.mapStore.getRoomArea(roomId);
+        if (areaId !== undefined && this.hasMapWidget()) {
+            const change = centerviewAreaChange(!this.mapCentered, this.mapShownArea, areaId);
+            this.mapCentered = true;
+            this.mapShownArea = areaId;
+            if (change) this.onRaiseEvent?.('sysMapAreaChanged', change);
+        }
         for (const cb of this.mapCallbacks.values()) cb(roomId);
+        this.mapPaintDue = true;
         return true;
+    }
+
+    /**
+     * Run the map info contributors as a paint of the map widget would
+     * (T2DMap::paintEvent → dlgMapper::paintMapInfo), for the paint that
+     * updateMap() or a centerview asked for. MapPanel does this on its own
+     * render, but a script that blocks the event loop (a busted run, a
+     * pumpEvents() wait) never lets React render — where desktop's
+     * pumpEvents delivers the queued repaint. So the busted pump calls this,
+     * and a contributor runs as it would on desktop: with the selection's
+     * centre or else the player's room, and not at all without one.
+     */
+    pumpMapPaint(): boolean {
+        if (!this.mapPaintDue) return false;
+        this.mapPaintDue = false;
+        if (!this.hasMapWidget()) return false;
+        const store = this.mapStore;
+        const roomId = store.getSelectionCenter() ?? store.getPlayerRoom();
+        const roomArea = roomId == null ? undefined : store.getRoomArea(roomId);
+        if (roomId == null || roomArea === undefined) return false;
+        const displayedArea = this.mapShownArea ?? roomArea;
+        store.evaluateMapInfos(roomId, store.getMapSelectionSize(), roomArea, displayedArea);
+        return true;
+    }
+
+    /** Whether a map widget (not a secondary map view) is open. */
+    private hasMapWidget(): boolean {
+        for (const win of this.windows.values()) {
+            if (win.kind === 'map' && !MAP_VIEW_ID_RE.test(win.id)) return true;
+        }
+        return false;
+    }
+
+    /** MapPanel reports the area it switched to (the area picker, or the view
+     *  restored on open), so the next centerview's sysMapAreaChanged names it
+     *  as the previous area. */
+    noteMapArea(areaId: number): void {
+        this.mapShownArea = areaId;
+    }
+
+    /** The map went away (deleteMap, a failed load): whatever map comes next is
+     *  shown fresh, so its first centerview reports -2 as the previous area. */
+    resetMapArea(): void {
+        this.mapShownArea = null;
+        this.mapCentered = false;
     }
 
     /** The area a map view is showing, or a refusal when there is no such view.
@@ -1182,7 +1408,7 @@ export class WindowManager {
 
     registerMapControl(id: string, ctrl: MapControl): void {
         this.mapControls.set(id, ctrl);
-        this.mapperCreated = true;
+        if (!MAP_VIEW_ID_RE.test(id)) this.mapperCreated = true;
     }
 
     /** Whether a mapper has been created this session — Mudlet's
@@ -1223,6 +1449,7 @@ export class WindowManager {
 
     /** Force the map to re-read MapStore and redraw (Mudlet `updateMap`). */
     updateMap(): boolean {
+        this.mapPaintDue = true;
         let redrawn = false;
         for (const c of this.mapControls.values()) {
             c.redraw();
@@ -1266,7 +1493,9 @@ export class WindowManager {
             areaId: area,
             zoom: this.mapStore.getAreaZoom(area) ?? MapStore.DEFAULT_MAP_ZOOM,
             zLevel: 0,
-            centeredRoomId: this.mapStore.getAreaCenterRoomId(area, 0) ?? 0,
+            // Desktop's new view hasn't been centred on anything yet: it
+            // reports 0 until a centerview(roomID, viewID) aims it.
+            centeredRoomId: 0,
         });
         // Opens floating but stays dockable, matching Mudlet: the view is a real
         // dock widget added to the right dock area and then immediately floated,
@@ -1431,10 +1660,10 @@ export class WindowManager {
      * map as Mudlet's TMap::audit does (MapStore.auditMap), so the report is
      * already collected; this only decides whether the player sees it.
      */
-    private reportMapIssues(): void {
+    private reportMapIssues(taken?: MapIssue[]): void {
         // Take the report either way: it is owed to this load, and leaving it in
         // the store would hand it to the next one instead.
-        const collected = this.mapStore.takeAuditIssues();
+        const collected = taken ?? this.mapStore.takeAuditIssues();
         if (!this._connectionId) return;
         if (!selectProfileField(useAppStore.getState(), this._connectionId, 'reportMapIssues')) return;
 
@@ -1562,7 +1791,8 @@ export class WindowManager {
      * into the manager/store, and any open MapPanel is asked to re-render.
      * Without a buffer the panel is told to reload from cache. Returns false
      * on synchronous parse failure; the IndexedDB write is fire-and-forget
-     * (failures appear in console.warn). Fires sysMapLoadEvent on success.
+     * (failures appear in console.warn). Raises no event: desktop has no
+     * sysMapLoadEvent, so a script waiting on one would never run there.
      */
     loadMap(buf?: ArrayBuffer, source?: string): boolean {
         // Host::loadMapFile creates the mapper before it reads anything.
@@ -1600,16 +1830,14 @@ export class WindowManager {
             this.reportMapIssues();
         }
         // The panel callback is advisory — its return value reports render
-        // success, but sysMapLoadEvent fires on successful data ingest so
-        // headless scripts (no MapPanel open) still receive the event.
+        // success, which loadMap's result does not depend on.
         this.mapLoadCallback?.(buf);
-        if (buf) this.onRaiseEvent?.('sysMapLoadEvent', []);
         return true;
     }
 
     /**
      * Async sibling of {@link loadMap} with identical effects — IndexedDB
-     * persistence, store ingest, panel re-render, `sysMapLoadEvent` — but the
+     * persistence, store ingest, panel re-render — but the
      * parse runs in the worker and streams into the store, publishing progress
      * as it goes.
      *
@@ -1643,12 +1871,10 @@ export class WindowManager {
             this.reportMapLoadFailure('loadMapAsync parse failed', err);
             return false;
         }
-        // Same advisory contract as loadMap: the panel reports render success,
-        // but the event fires on successful ingest so headless scripts still
-        // see it. The buffer is detached by now, so the callback is invoked
-        // without it — every consumer re-reads through the store anyway.
+        // Same advisory contract as loadMap. The buffer is detached by now, so
+        // the callback is invoked without it — every consumer re-reads through
+        // the store anyway.
         this.mapLoadCallback?.();
-        this.onRaiseEvent?.('sysMapLoadEvent', []);
         return true;
     }
 
@@ -1665,7 +1891,9 @@ export class WindowManager {
         let bytes: ArrayBuffer;
         const version = this.mapStore.getVersion();
         try {
-            const buf = writeMapToBuffer(this.mapStore.toMudletMapForSave());
+            // Base64 label pixmaps to bytes first, as the worker save does —
+            // written as strings they corrupt the file from the labels on.
+            const buf = writeMapToBuffer(withLabelPixmapBytes(this.mapStore.toMudletMapForSave()));
             // Copy into a freshly-allocated standalone ArrayBuffer — the
             // returned Buffer is a view onto a Node Buffer pool (and at the
             // type level its .buffer may be SharedArrayBuffer), neither of
@@ -1785,12 +2013,29 @@ export class WindowManager {
      * open map panel to re-render. Returns false on parse failure or when the
      * JSON doesn't carry the expected MudletMap shape.
      */
-    loadJsonMap(json: string): boolean {
+    loadJsonMap(json: string, source = ''): boolean {
         if (!this.mapStore.loadFromJsonString(json)) return false;
-        this.reportMapIssues();
+        const issues = this.mapStore.takeAuditIssues();
+        // TMap::importJsonMapFile: what an import found goes to the profile's
+        // log/errors.txt under a title naming the file, and the console names
+        // that report whether or not it shows the details.
+        this.lastMapReport = '';
+        if (issues.length > 0) {
+            const title = `Importing JSON map "${source}" at ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`;
+            this.lastMapReport = [title, ...issues.map(i => `[ ${i.severity === 'warn' ? 'WARN' : 'INFO'} ]  - ${i.message}`), ''].join('\n');
+        }
+        this.reportMapIssues(issues);
         this.mapLoadCallback?.();
-        this.onRaiseEvent?.('sysMapLoadEvent', []);
         return true;
+    }
+
+    private lastMapReport = '';
+
+    /** The report the last loadJsonMap wrote for log/errors.txt, once. */
+    takeMapReport(): string {
+        const report = this.lastMapReport;
+        this.lastMapReport = '';
+        return report;
     }
 
     /**
@@ -1809,7 +2054,6 @@ export class WindowManager {
         this.reportMapIssues();
         this.scheduleMapSave(0);
         this.mapLoadCallback?.();
-        this.onRaiseEvent?.('sysMapLoadEvent', []);
         return true;
     }
 
@@ -1855,6 +2099,12 @@ export class WindowManager {
         this.mxpFrameIds.add(id);
         this.setScrollBarVisible(id, false);
         this.notify();
+    }
+
+    /** Whether `id` is an MXP frame's own console — false once a script has
+     *  deleted it, even if it then made a window of its own under the name. */
+    isMxpFrame(id: string): boolean {
+        return this.mxpFrameIds.has(id);
     }
 
     /** Install (or replace) an MXP frame's tab strip. An empty `pages` list
@@ -2121,12 +2371,25 @@ export class WindowManager {
 
     /** Mudlet enable/disableScrolling — when disabled, the wrapper sticks to the
      *  bottom (wheel/touch/keys cannot scroll back). Mudlet forbids this on the
-     *  main window; we follow that policy. Returns false on 'main', true otherwise. */
+     *  main window; we follow that policy. Returns false on 'main', true otherwise.
+     *  Disabling also closes the split view (TConsole::setScrolling calls
+     *  clearSplit), so a console a script had scrolled up does not stay parked
+     *  there with no way left to scroll it down. */
     setScrollingEnabled(id: string, enabled: boolean): boolean {
         if (id === 'main') return false;
         this.getScrollStateMut(id).scrollingEnabled = enabled;
         this.applyScrollClasses(id);
+        if (!enabled) this.clearSplit(id);
         return true;
+    }
+
+    /** Mudlet `TConsole::clearSplit` for a script: forget any scrolled-to line
+     *  and put the console back on its tail. The renderer's own scroll handler
+     *  sees the wrapper reach the bottom and drops the split pane. */
+    clearSplit(id: string): void {
+        this.scriptScrollLine.delete(id);
+        const el = this.elements.get(id);
+        if (el) el.scrollTop = el.scrollHeight;
     }
 
     /**
@@ -2176,14 +2439,6 @@ export class WindowManager {
         return this.scrollState.get(id)?.scrollingEnabled ?? DEFAULT_SCROLL_STATE.scrollingEnabled;
     }
 
-    /** Buffer-line index of the topmost visible line in `id`'s wrapper. In tail
-     *  mode returns the last line number (matching Mudlet's mCursorY behaviour at
-     *  the end of the buffer). Returns 0 if the element is unmounted or empty.
-     *
-     *  Uses getBoundingClientRect rather than offsetTop because `.output-container`
-     *  is `position: relative` — child offsetTop is relative to *that*, not to the
-     *  scroll-container `.output-wrapper`, so the rectangles are the unambiguous
-     *  way to relate child position to the scroll viewport. */
     /** Whether `id`'s wrapper is mounted with laid-out lines, i.e. whether
      *  {@link getScrollLine}'s measurement means anything. A console whose panel
      *  isn't on screen yet measures as 0, which is indistinguishable from being
@@ -2209,13 +2464,101 @@ export class WindowManager {
      */
     private readonly scriptScrollLine = new Map<string, number>();
 
+    /** The buffer dropped `removed` lines off its top (TBuffer::shrinkBuffer).
+     *  A console scrolled back keeps showing the lines it showed, which are now
+     *  that many lines nearer the start, so the line a script parked it on
+     *  moves up with them, as desktop's upper pane cursor does. */
+    noteLinesRemoved(id: string, removed: number): void {
+        const parked = this.scriptScrollLine.get(id);
+        if (parked !== undefined) this.scriptScrollLine.set(id, Math.max(0, parked - removed));
+    }
+
+    /** Whether `id` follows its output (desktop's TTextEdit::mIsTailMode):
+     *  neither a script nor the reader has scrolled it back. */
+    followsNewLines(id: string): boolean {
+        if (this.scriptScrollLine.has(id)) return false;
+        const el = this.elements.get(id);
+        return !el || !this.scrolledBack.get(el);
+    }
+
     /** Called when the *user* scrolls a console, so a script's remembered
      *  position stops overriding what they can see. */
     noteUserScroll(id: string): void {
         this.scriptScrollLine.delete(id);
     }
 
-    getScrollLine(id: string): number {
+    /** The wrapper's scrollTop as scrollToLine left it. A scroll event that
+     *  lands anywhere else was the reader's (wheel, scroll bar, PageUp, the
+     *  split view closing), so the scripted position stops being the answer. */
+    private readonly scriptScrollTop = new WeakMap<HTMLElement, number>();
+
+    /**
+     * Wrappers the reader has scrolled back from the end of — the inverse of
+     * desktop's `TTextEdit::mIsTailMode`. Kept from scroll events rather than
+     * measured when asked: new output is appended before the renderer scrolls
+     * down to it, so in between a console that is following its output measures
+     * as some way up — right after a burst of echoes, at the very top. Desktop
+     * stays in tail mode through that, and so does this; only a scroll that
+     * actually leaves the end takes a console out of it.
+     */
+    private readonly scrolledBack = new WeakMap<HTMLElement, boolean>();
+
+    private watchTail(el: HTMLElement): void {
+        if (this.scrolledBack.has(el)) return;
+        this.scrolledBack.set(el, false);
+        el.addEventListener('scroll', () => {
+            this.scrolledBack.set(el, el.scrollHeight - el.scrollTop - el.clientHeight > 1);
+            const expected = this.scriptScrollTop.get(el);
+            if (expected === undefined || Math.abs(el.scrollTop - expected) <= 1) return;
+            this.scriptScrollTop.delete(el);
+            for (const [id, e] of this.elements) {
+                if (e === el) this.noteUserScroll(id);
+            }
+        }, { passive: true });
+    }
+
+    /** Height of the split view's lower pane laid over the bottom of `el` —
+     *  the sticky area StickyOutputPanel renders as the wrapper's sibling. It
+     *  keeps its height while hidden, which is the height it will cover once a
+     *  scroll back raises it. */
+    private splitPaneHeight(el: HTMLElement): number {
+        const parent = el.parentElement;
+        if (!parent) return 0;
+        for (const child of Array.from(parent.children)) {
+            if (child.classList.contains('output-sticky')) return child.getBoundingClientRect().height;
+        }
+        return 0;
+    }
+
+    /** The height the split view's lower pane takes off `id`'s upper pane
+     *  while it is open — the console scrolled back, by hand or by script —
+     *  and 0 while the console follows its output. A console with no panel to
+     *  measure yet, scrolled back by a script, has the pane at the height it
+     *  opens at. */
+    openSplitPaneHeight(id: string): number {
+        const el = this.elements.get(id);
+        if (!el) return this.scriptScrollLine.has(id) ? DEFAULT_SPLIT_PANE_HEIGHT : 0;
+        if (!this.scriptScrollLine.has(id) && !this.scrolledBack.get(el)) return 0;
+        return this.splitPaneHeight(el);
+    }
+
+    /** Mudlet's scroll position for `id`'s wrapper, or null while it follows
+     *  its output (tail mode), where Mudlet's getScroll answers the last line —
+     *  which the caller takes from the buffer, since the DOM's line count is not
+     *  the buffer's. Returns 0 if the element is unmounted or empty.
+     *
+     *  Desktop's position is the upper pane's `mCursorY`, and that pane draws
+     *  the rows *above* it (TTextEdit::imageTopLine is `mCursorY -
+     *  mScreenHeight`): the number is the first line below the scrolled view,
+     *  one past its bottom row — not the top row. The scrolled view ends where
+     *  the split view's lower pane begins, so that pane's height comes off the
+     *  bottom.
+     *
+     *  Uses getBoundingClientRect rather than offsetTop because `.output-container`
+     *  is `position: relative` — child offsetTop is relative to *that*, not to the
+     *  scroll-container `.output-wrapper`, so the rectangles are the unambiguous
+     *  way to relate child position to the scroll viewport. */
+    getScrollLine(id: string): number | null {
         const parked = this.scriptScrollLine.get(id);
         if (parked !== undefined) return parked;
         const el = this.elements.get(id);
@@ -2223,64 +2566,80 @@ export class WindowManager {
         const lineEls = this.lineElements(el);
         const total = lineEls.length;
         if (total === 0) return 0;
+        if (!this.scrolledBack.get(el)) return null;
         const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-        if (distFromBottom <= 1) return total - 1;
-        const containerTop = el.getBoundingClientRect().top;
+        if (distFromBottom <= 1) return null;
+        const viewBottom = el.getBoundingClientRect().top + el.clientHeight - this.splitPaneHeight(el);
         for (let i = 0; i < total; i++) {
-            const rect = lineEls[i].getBoundingClientRect();
-            // First line whose bottom edge sits inside the viewport — that's the
-            // topmost partly-visible line. -1 tolerates sub-pixel rounding.
-            if (rect.bottom > containerTop + 1) return i;
+            // First line starting at or below the view's bottom edge. -1
+            // tolerates sub-pixel rounding.
+            if (lineEls[i].getBoundingClientRect().top >= viewBottom - 1) return i;
         }
-        return total - 1;
+        return total;
     }
 
-    /** Scroll `id`'s wrapper so `line` (0-indexed) sits at the top. `undefined`
-     *  resumes tail mode (scroll-to-bottom); negative values count from the end
-     *  (Mudlet semantics). Returns false if the wrapper is not mounted. */
+    /** Mudlet `scrollTo(window, line)`: scroll `id`'s wrapper so `line` is the
+     *  first line below the scrolled view — its bottom row is `line - 1`, the
+     *  same edge {@link getScrollLine} reads. `undefined`, or a line at or past
+     *  the last one, resumes tail mode (TMainConsole::scrollWindowTo); negative
+     *  values count back from the last line. Returns false if the console has
+     *  neither a buffer nor a mounted wrapper. */
     scrollToLine(id: string, line: number | undefined): boolean {
         // disableScrolling parks the console at the end and keeps it there, and
         // that holds for a scripted scroll as much as for the wheel — Mudlet
         // gates both on the same flag.
         if (!this.isScrollingEnabled(id)) return false;
         // Line counts come from the buffer, not the DOM: the console may have
-        // 200 lines and no laid-out panel to measure them in.
+        // 200 lines and no laid-out panel to measure them in. `last` is Lua's
+        // getLastLineNumber, which counts the always-open line the buffer keeps
+        // past the finished ones.
         const total = this.consoleRegistry?.get(id)?.getLineCount() ?? -1;
-        const lineCount = total >= 0 ? total + 1 : 0;
+        const last = total >= 0 ? total + 1 : 0;
         const el = this.elements.get(id);
-        if (!el && lineCount === 0) return false;
+        if (!el && last === 0) return false;
 
-        if (line === undefined) {
-            // Tail mode: forget the parked line so the measurement takes over.
-            this.scriptScrollLine.delete(id);
-            if (el) el.scrollTop = el.scrollHeight;
+        if (line === undefined || line >= last) {
+            this.clearSplit(id);
             return true;
         }
-        let target = line;
-        if (target < 0) target = Math.max(lineCount + target, 0);
-        // Clamped to the last line index, which counts the always-open line the
-        // buffer keeps past the finished ones (as getLastLineNumber does).
-        target = Math.max(0, Math.min(target, lineCount));
+        const target = line < 0 ? Math.max(last + line, 0) : line;
         this.scriptScrollLine.set(id, target);
 
         const lineEls = el ? this.lineElements(el) : [];
         if (!el || lineEls.length === 0) return true;
-        if (target >= lineEls.length - 1) {
-            el.scrollTop = el.scrollHeight;
-            return true;
-        }
         if (target <= 0) {
             el.scrollTop = 0;
-            return true;
+        } else {
+            // Bounding-rect math: convert the bottom row's viewport-relative
+            // bottom edge into a scroll position within the wrapper. offsetTop
+            // is relative to the nearest positioned ancestor
+            // (`.output-container`), not to the scroll container, so we can't
+            // read it directly.
+            const bottomRow = lineEls[Math.min(target, lineEls.length) - 1];
+            const rowBottom = bottomRow.getBoundingClientRect().bottom - el.getBoundingClientRect().top + el.scrollTop;
+            el.scrollTop = Math.max(0, rowBottom - (el.clientHeight - this.splitPaneHeight(el)));
         }
-        // Bounding-rect math: convert the line's viewport-relative top into a
-        // scroll position within the wrapper. offsetTop is relative to the
-        // nearest positioned ancestor (`.output-container`), not to the scroll
-        // container, so we can't read it directly.
-        const containerRect = el.getBoundingClientRect();
-        const lineRect = lineEls[target].getBoundingClientRect();
-        el.scrollTop = Math.max(0, lineRect.top - containerRect.top + el.scrollTop);
+        this.scriptScrollTop.set(el, el.scrollTop);
         return true;
+    }
+
+    /** Mudlet's PageUp / PageDown in the command line (TCommandLine::event):
+     *  scroll `id`'s console a page — the scrolled view's height, the split
+     *  pane excluded — up or down. Paging down into what the split pane already
+     *  shows closes it and resumes tail mode, as TConsole::scrollDown does. */
+    scrollPage(id: string, direction: 'up' | 'down'): void {
+        if (!this.isScrollingEnabled(id)) return;
+        const el = this.elements.get(id);
+        if (!el) return;
+        const pane = this.splitPaneHeight(el);
+        const page = Math.max(1, el.clientHeight - pane);
+        if (direction === 'up') {
+            el.scrollTop = Math.max(0, el.scrollTop - page);
+            return;
+        }
+        const next = el.scrollTop + page;
+        if (el.scrollHeight - next - el.clientHeight <= pane) this.clearSplit(id);
+        else el.scrollTop = next;
     }
 
     private getScrollStateMut(id: string): ScrollState {
@@ -2301,14 +2660,11 @@ export class WindowManager {
         el.classList.toggle('mudlet-no-scrolling', !s.scrollingEnabled);
     }
 
-    /** Direct line-element children of the wrapper (skips the sticky-output
-     *  sentinel, which sits at the end with height: 0). */
+    /** The wrapper's line elements, in order, through its scrollback blocks
+     *  (skips the sticky-output sentinel, which sits at the end with
+     *  height: 0). */
     private lineElements(el: HTMLElement): HTMLElement[] {
-        const out: HTMLElement[] = [];
-        for (const child of Array.from(el.children) as HTMLElement[]) {
-            if (child.classList.contains('output-msg')) out.push(child);
-        }
-        return out;
+        return outputRows(el);
     }
 
     /** Mudlet setBackgroundColor for a userwindow / miniconsole. */
@@ -2369,7 +2725,7 @@ export class WindowManager {
     enableCommandLine(id: string): boolean {
         const win = this.windows.get(id);
         if (!win) return false;
-        if (!this.cmdLineState.has(id)) this.cmdLineState.set(id, { action: null });
+        if (!this.cmdLineState.has(id)) this.cmdLineState.set(id, { action: null, model: new SubCommandLine(id) });
         if (win.cmdLineEnabled) return true;
         win.cmdLineEnabled = true;
         this.notify();
@@ -2425,12 +2781,97 @@ export class WindowManager {
      *  window's command line. Pass null to clear. Returns false when the
      *  window doesn't exist. */
     setCmdLineAction(id: string, cb: ((text: string) => void) | null): boolean {
-        const win = this.windows.get(id);
-        if (!win) return false;
-        const state = this.cmdLineState.get(id) ?? { action: null };
+        const state = this.cmdLineState.get(id);
+        if (!this.windows.has(id) || !state) return false;
         state.action = cb;
-        this.cmdLineState.set(id, state);
         return true;
+    }
+
+    /**
+     * How much taller (positive) or shorter (negative) window `id`'s text pane
+     * is about to be than it measures now: enable/disableCommandLine change
+     * whether it has a command line under it at once, but the panel only takes
+     * the input in or out on its next render, which a script still running
+     * does not let happen. getRowCount adds this so it counts the rows the pane
+     * has, not the ones it had.
+     */
+    pendingCmdLineHeightDelta(id: string): number {
+        const win = this.windows.get(id);
+        if (!win || typeof document === 'undefined') return 0;
+        // A panel that has not mounted yet has no input either.
+        const viewport = this.viewports.get(id);
+        // TextPanel puts the input last in the stack that is the viewport's
+        // first child. Looked up there rather than with querySelector, which
+        // walks every line the console holds before giving up when the window
+        // has no command line — the usual case.
+        const last = viewport?.firstElementChild?.lastElementChild;
+        const shown = last instanceof HTMLElement && last.matches(
+            `textarea.window-cmdline[data-mudlet-cmdline="${cssEscape(id)}"]`) ? last : null;
+        if (win.cmdLineEnabled && !shown) return -this.cmdLineHeight(viewport);
+        if (!win.cmdLineEnabled && shown) return shown.offsetHeight;
+        return 0;
+    }
+
+    /** The height a window's one-row command line takes, measured once off a
+     *  hidden probe styled as the real one; 0 where nothing can be measured. */
+    private cmdLineHeight(host: HTMLElement | undefined): number {
+        if (this.measuredCmdLineHeight > 0) return this.measuredCmdLineHeight;
+        try {
+            const probe = document.createElement('textarea');
+            probe.className = 'window-cmdline';
+            probe.rows = 1;
+            probe.style.cssText = 'position:absolute;visibility:hidden;left:0;top:0;';
+            (host ?? document.body).appendChild(probe);
+            const height = probe.offsetHeight;
+            probe.remove();
+            if (height > 0) this.measuredCmdLineHeight = height;
+            return height > 0 ? height : 0;
+        } catch {
+            return 0;
+        }
+    }
+    private measuredCmdLineHeight = 0;
+
+    /** Whether window `id` has a command line of its own: one enableCommandLine
+     *  made, which disableCommandLine only hides. A console that never had one
+     *  enabled has none (#342). */
+    hasCommandLine(id: string): boolean {
+        return this.windows.has(id) && this.cmdLineState.has(id);
+    }
+
+    /** Window `id`'s command-line keyboard state, or null when it has none. */
+    cmdLineModel(id: string): SubCommandLine | null {
+        return this.cmdLineState.get(id)?.model ?? null;
+    }
+
+    /** The profile settings and Tab pool every command line reads. Set by the
+     *  ScriptingEngine. */
+    cmdLineHost: CmdLineHost = DEFAULT_CMD_LINE_HOST;
+
+    /**
+     * Mudlet deleteCommandLine(name) on a miniconsole's or user window's own
+     * line (TMainConsole::deleteCommandLine finds it in mSubCommandLineMap,
+     * under the console's name): the line goes, action and history with it,
+     * and the console has none until enableCommandLine makes a new one.
+     * False when it has none.
+     */
+    deleteCommandLine(id: string): boolean {
+        const win = this.windows.get(id);
+        if (!win || !this.cmdLineState.has(id)) return false;
+        this.cmdLineState.delete(id);
+        this.cmdLineValueProbes.delete(id);
+        win.cmdLineEnabled = false;
+        win.cmdLineValue = '';
+        win.cmdLineValueSeq = (win.cmdLineValueSeq ?? 0) + 1;
+        this.notify();
+        return true;
+    }
+
+    /** What a script last put on window `id`'s command line, and the count
+     *  that changes with every such write. */
+    cmdLineSeed(id: string): { value: string; seq: number } | null {
+        const win = this.windows.get(id);
+        return win ? { value: win.cmdLineValue ?? '', seq: win.cmdLineValueSeq ?? 0 } : null;
     }
 
     /** Whether a script has bound a per-window Enter handler. */
@@ -2445,8 +2886,9 @@ export class WindowManager {
     }
 
     /** Where Enter goes on a window command line with no action bound: the
-     *  game, as typed input. Set by the ScriptingEngine (its `hostSend`). */
-    onCmdLineDefaultSend?: (text: string) => void;
+     *  game, as typed input, then echoed into window `id` itself. Set by the
+     *  ScriptingEngine. */
+    onCmdLineDefaultSend?: (text: string, id: string) => void;
 
     /**
      * The user pressed Enter in window `id`'s command line. Runs the bound
@@ -2457,11 +2899,14 @@ export class WindowManager {
     submitCmdLine(id: string, text: string): boolean {
         const cb = this.getCmdLineAction(id);
         if (cb) {
+            // TLuaInterpreter::callCmdLineAction: no action runs while the
+            // server is masking input for a password (#342).
+            if (this.cmdLineHost.remoteEcho()) return true;
             try { cb(text); } catch (err) { console.warn(`[WindowCmdLine ${id}] action threw:`, err); }
             return true;
         }
         if (!this.onCmdLineDefaultSend) return false;
-        this.onCmdLineDefaultSend(text);
+        this.onCmdLineDefaultSend(text, id);
         return true;
     }
 
@@ -2471,7 +2916,7 @@ export class WindowManager {
      *  exist or has no command line. */
     clearWindowCmdLine(id: string): boolean {
         const win = this.windows.get(id);
-        if (!win || !win.cmdLineEnabled) return false;
+        if (!win || !this.cmdLineState.has(id)) return false;
         win.cmdLineValue = '';
         win.cmdLineValueSeq = (win.cmdLineValueSeq ?? 0) + 1;
         this.notify();
@@ -2482,7 +2927,7 @@ export class WindowManager {
      *  the input contents and moves the caret to the end (React side). */
     printWindowCmdLine(id: string, text: string): boolean {
         const win = this.windows.get(id);
-        if (!win || !win.cmdLineEnabled) return false;
+        if (!win || !this.cmdLineState.has(id)) return false;
         win.cmdLineValue = String(text ?? '');
         win.cmdLineValueSeq = (win.cmdLineValueSeq ?? 0) + 1;
         this.notify();
@@ -2493,7 +2938,7 @@ export class WindowManager {
      *  `text` onto the end of the current contents. */
     appendWindowCmdLine(id: string, text: string): boolean {
         const win = this.windows.get(id);
-        if (!win || !win.cmdLineEnabled) return false;
+        if (!win || !this.cmdLineState.has(id)) return false;
         win.cmdLineValue = String(win.cmdLineValue ?? '') + String(text ?? '');
         win.cmdLineValueSeq = (win.cmdLineValueSeq ?? 0) + 1;
         this.notify();
@@ -2779,13 +3224,16 @@ export class WindowManager {
             this.touchOverlayWindows(existing);
             this.notify();
             if (existing.kind === 'map') {
-                this.mapperCreated = true;
+                // A map view (createMapView) is a second look at the map, not
+                // the mapper itself: desktop leaves mpMapper unmade for it.
+                if (!MAP_VIEW_ID_RE.test(id)) this.mapperCreated = true;
                 this.onMapOpen?.(id);
             }
             return this.makeHandle(id);
         }
 
         const kind = options.kind ?? 'text';
+        if (kind === 'map' && !MAP_VIEW_ID_RE.test(id) && !this.hasMapWidget()) this.resetMapArea();
         const hint = options.ignoreHint ? undefined : this.windowHints[id];
         const def  = DEFAULT_SIZE[kind];
 
@@ -2831,7 +3279,7 @@ export class WindowManager {
 
         const win: ScriptWindowData = {
             id,
-            title:       options.title ?? (kind === 'map' ? 'Map' : id),
+            title:       options.title ?? (id === MAP_WIDGET_ID ? this.defaultTitle(id) : kind === 'map' ? 'Map' : id),
             kind,
             // Honor `hidden` from options (setWindowHints spreads the saved
             // hint into options for autoOpen restore) but NOT from the bare
@@ -2878,7 +3326,7 @@ export class WindowManager {
         this.saveHint(id, win);
         this.notify();
         if (kind === 'map') {
-            this.mapperCreated = true;
+            if (!MAP_VIEW_ID_RE.test(id)) this.mapperCreated = true;
             this.onMapOpen?.(id);
         }
         return this.makeHandle(id);
@@ -2952,6 +3400,11 @@ export class WindowManager {
         return this.windows.get(id)?.visible ?? false;
     }
 
+    /** Whether the window sits in a dock (rather than floating). */
+    isDocked(id: string): boolean {
+        return !!this.windows.get(id)?.docked;
+    }
+
     /** Stored geometry for a user window / miniconsole — deliberately the saved
      *  x/y/width/height rather than {@link getSize}'s live DOM rect, so it is an
      *  exact inverse of moveWindow/resizeWindow (Mudlet's getWindowGeometry
@@ -2959,7 +3412,60 @@ export class WindowManager {
     getGeometry(id: string): { x: number; y: number; width: number; height: number } | null {
         const win = this.windows.get(id);
         if (!win) return null;
+        // A docked window's x/y/width/height are its floating rectangle, kept for
+        // when it is undocked — not where it is. Desktop reads a docked user
+        // window's geometry off its dock widget (title bar included), so report
+        // the dock frame the panel is laid out in.
+        if (win.docked && win.visible && !win.poppedOut) {
+            const frame = this.dockFrame(id);
+            if (frame) {
+                const rect = frame.getBoundingClientRect();
+                if (rect.width > 0 || rect.height > 0) {
+                    return {
+                        x: Math.round(rect.left), y: Math.round(rect.top),
+                        width: Math.round(rect.width), height: Math.round(rect.height),
+                    };
+                }
+            }
+        }
         return { x: win.x, y: win.y, width: win.width, height: win.height };
+    }
+
+    /** The dock frame (title bar and content) a docked window is shown in. */
+    private dockFrame(id: string): HTMLElement | null {
+        const target = this.portalTargets.get(id);
+        if (!target?.isConnected) return null;
+        return target.closest<HTMLElement>('.docked-panel, .tab-group-panel');
+    }
+
+    /**
+     * Lay the windows out NOW rather than on React's next render, so the script
+     * line after a dock change already sees the sizes it produced.
+     *
+     * Desktop docks synchronously: by the time openUserWindow() returns, the
+     * dock has its size, the main console has shrunk to make room and
+     * sysWindowResizeEvent has fired, so getUserWindowSize, getMainWindowSize
+     * and getWindowGeometry all answer with the final layout. Here the layout is
+     * React state, which commits on a later turn — scripts that positioned
+     * things right after creating a docked window read the pre-dock numbers.
+     * flushSync commits that render (and the panels' mount effects) before it
+     * returns, so the DOM — which every geometry getter measures — is already
+     * the docked layout, and the main viewport's resize is raised on the spot
+     * like setMainWindowSize does; the observer's own tick dedupes to nothing.
+     *
+     * A no-op beyond the measure when no layout is mounted. When called from
+     * inside a React render or effect, React refuses to flush and the layout
+     * catches up on its own turn, as it always did.
+     */
+    settleLayout(): void {
+        if (this.onWindowsChange) {
+            try {
+                flushSync(() => this.notify());
+            } catch {
+                this.notify();
+            }
+        }
+        if (this.mainViewportEl) this.measureAndEmitResize('main', this.mainViewportEl);
     }
 
     /** The window this one nests inside, or null for a root floating window.
@@ -3007,6 +3513,9 @@ export class WindowManager {
         // Also reset the upstream Console — without this the next echo would
         // re-include any pre-clear partial text when drainWindowConsole fires.
         this.consoleRegistry?.get(id)?.clear();
+        // The lines a script scrolled to are gone: the console follows its
+        // output again, so the next lines move getScroll with them.
+        this.clearSplit(id);
     }
 
     /**
@@ -3031,16 +3540,21 @@ export class WindowManager {
 
     /**
      * The title a window carries when nobody has set one. Mudlet builds it from
-     * the profile and the window's own name ("<profile> - <window>"), which is
-     * what a player sees on a freshly opened user window; Mudlet Web used to fall
-     * back to the bare id, so resetting a title lost the profile half of it.
+     * the profile and the window's own name ("User window - <profile> -
+     * <window>", TMainConsole's tr() string), which is what
+     * setUserWindowTitle(name) with no title goes back to; Mudlet Web used to
+     * fall back to the bare id, then to "<profile> - <window>" (mudlet-web#380).
      * The profile name is injected by ScriptingAPI — the manager has no other
      * reason to know it.
      */
     profileName = '';
 
     defaultTitle(id: string): string {
-        return this.profileName ? `${this.profileName} - ${id}` : id;
+        // The map dock is the exception: desktop heads it "Map - <profile>"
+        // (TMainConsole::createMapper) and setMapWindowTitle("") goes back to
+        // that, never to the client's internal window id.
+        if (id === MAP_WIDGET_ID) return this.profileName ? `Map - ${this.profileName}` : 'Map';
+        return `User window - ${this.profileName} - ${id}`;
     }
 
     focus(id: string): void { this.bringToFront(id); }

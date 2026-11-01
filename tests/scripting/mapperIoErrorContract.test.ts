@@ -49,11 +49,16 @@ describe('mapper return contracts (#173)', () => {
     });
 
     // Issue #239: Mudlet checks for the mapper before the player room, so rooms
-    // (and even a player room) without a mapper ever shown still read as no map.
+    // without a mapper ever shown still read as no map. Issue #355: centerview
+    // is refused then too, and records nothing for the map to find once open.
     it('getPlayerRoom says no map was opened while only rooms exist', () => {
-        t.run('addRoom(61); centerview(61)');
+        expect(t.run('addRoom(61); local a, b = centerview(61); return a == nil and b'))
+            .toBe("you haven't opened a map yet");
         expect(t.run('local a, b = getPlayerRoom(); return a == nil and b')).toBe("you haven't opened a map yet");
         t.run('openMapWidget(); closeMapWidget()');
+        expect(t.run('local a, b = getPlayerRoom(); return a == nil and b'))
+            .toBe('the player does not have a valid roomID set');
+        t.run('centerview(61)');
         expect(t.run('return getPlayerRoom()')).toBe(61);
     });
 
@@ -75,6 +80,7 @@ class DirStubVFS {
     files = new Map<string, Uint8Array>();
     dirs = new Set<string>(['/', '/profiles', '/profiles/test']);
     resolvePath(p: string): string { return p.startsWith('/') ? p : `${this.profilePath}/${p}`; }
+    nameTooLong(): boolean { return false; }
     exists(p: string): boolean { const a = this.resolvePath(p); return this.files.has(a) || this.dirs.has(a); }
     stat(p: string): { type: 'file' | 'dir' } | null {
         const a = this.resolvePath(p);

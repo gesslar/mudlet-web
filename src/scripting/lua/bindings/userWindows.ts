@@ -18,6 +18,9 @@ const DOCKMAP: Record<string, string> = {
     main: 'main',
 };
 
+/** The point size TMainConsole::createUserWindow gives every new user window. */
+const USER_WINDOW_DEFAULT_FONT_SIZE = 10;
+
 /**
  * Creating and destroying the addressable UI surfaces Lua can open:
  * user windows, the map widget, mini-consoles, command lines, and scroll
@@ -33,6 +36,7 @@ export function installUserWindowBindings({
     emitEvent,
     unregisterCb,
     overlayCmdLineActionCbIds,
+    windowCmdLineActionCbIds,
     vfs,
 }: BindingContext): void {
     /** profile.ini as it stands. Written on every change rather than held open
@@ -65,6 +69,23 @@ export function installUserWindowBindings({
         if (api.isBuffer(window)) return 'buffer';
         return null;
     });
+    // backgroundColorRefusal (TLuaInterpreterUI.cpp): only consoles and labels
+    // have a background colour of their own; a scroll box, text edit or command
+    // line takes its from a stylesheet, and one name can be several of those,
+    // so each is named with the setter that does reach it. Null when the name
+    // is none of them.
+    lua.global.set('__backgroundColorRefusal', (name: unknown, reading: unknown) => {
+        if (typeof name !== 'string') return null;
+        const kinds: string[] = [];
+        const setters: string[] = [];
+        if (api.scrollBoxes.has(name)) { kinds.push('a scroll box'); setters.push('setProfileStyleSheet()'); }
+        if (api.textEdits.has(name)) { kinds.push('a text edit'); setters.push('setTextEditStyleSheet()'); }
+        if (api.cmdLines.has(name)) { kinds.push('a command line'); setters.push('setCmdLineStyleSheet()'); }
+        if (kinds.length === 0) return null;
+        return reading
+            ? `'${name}' is ${kinds.join(' and ')}, whose background color cannot be read back`
+            : `'${name}' is ${kinds.join(' and ')}, use ${setters.join(' or ')} to set its background`;
+    });
     // Mudlet `openUserWindow(name, [restoreLayout, autoDock, dockingArea]) → true`.
     // Always returns true once the window registry has the panel. The handle
     // returned by ScriptingWindowsAPI.open is kept internal — userscripts
@@ -78,6 +99,7 @@ export function installUserWindowBindings({
             ? (DOCKMAP[dockingArea.toLowerCase()] ?? 'right')
             : undefined;
         const existed = api.windows.has(window);
+        if (!existed) api.noteUserWindowOpened(window);
         api.windows.open(window, {
             autoDock,
             // Only a freshly-created window falls back to the right dock.
@@ -94,17 +116,31 @@ export function installUserWindowBindings({
         // Geyser.UserWindow:setDockPosition, so without it a package could
         // never move a panel out of the side it was born in.
         if (existed && area) api.windows.setDockArea(window, area);
-        else if (!existed) {
+        // Desktop has docked the window, shrunk the main console and raised
+        // sysWindowResizeEvent by the time openUserWindow returns; commit the
+        // layout now so getUserWindowSize / getMainWindowSize / getWindowGeometry
+        // on the very next line agree with it. A window opened floating leaves
+        // the dock layout alone, so it settles nothing: flushing there would
+        // commit some earlier, unrelated change (a dock deleted a line before)
+        // in the middle of a constructor that measured the main window before
+        // the call and resolves its percentages against it straight after.
+        if (api.windows.isDocked(window)) api.windows.settleLayout();
+        if (!existed) {
+            // Host::openWindow gives a new user window a font of its own —
+            // TMainConsole::createUserWindow's setFontSize(10), whatever size
+            // main is in — so it neither starts at main's size nor follows a
+            // later setFontSize("main", …). Desktop announces that font as
+            // sysFontChangeEvent like any font change.
+            api.windows.setFontSize(window, USER_WINDOW_DEFAULT_FONT_SIZE);
             api.windows.announceCreatedSize(window);
-            // Host::openWindow gives a new user window a font of its own, which
-            // desktop announces as sysFontChangeEvent like any font change.
             api.raiseFontChangeEvent(window);
         }
         return true;
     });
     // Mudlet `openMapWidget([dockingArea | x, y [, w, h]]) → true`.
     //   no args            → restore saved layout, or right-dock if none
-    //   (area)             → "f" floating, or "l"/"r"/"t"/"b" dock side
+    //   (area)             → "f"/"floating", or "l"/"r"/"t"/"b" (or the full
+    //                        word, any case) dock side; "" is the 0-arg form
     //   (x, y)             → floating at (x, y); width/height inherit the
     //                        saved hint (or panel defaults if none)
     //   (x, y, w, h)       → floating at given pixel position and size
@@ -119,10 +155,9 @@ export function installUserWindowBindings({
             const keepPosition = Number(a) < 0 && Number(b) < 0;
             api.windows.open(MAP_WIDGET_ID, {
                 kind: 'map',
-                // Only names a *new* widget: reopening one keeps the title it
-                // was given, since it is the same dock coming back rather than
-                // a fresh one (Mapper_spec pins that).
-                ...(api.windows.has(MAP_WIDGET_ID) ? {} : { title: 'Map' }),
+                // No title: a new widget is headed "Map - <profile>" by the
+                // manager, and reopening one keeps the title it was given,
+                // since it is the same dock coming back (Mapper_spec pins that).
                 autoDock: false,
                 ignoreHint: true,
                 ...(keepPosition ? {} : { x: Number(a), y: Number(b) }),
@@ -130,27 +165,28 @@ export function installUserWindowBindings({
             });
             return true;
         }
-        // 0-arg: restore saved layout, fall back to right dock
-        if (a === undefined || a === null) {
+        // 0-arg (or ""): restore saved layout, fall back to right dock
+        if (a === undefined || a === null || a === '') {
             api.windows.open(MAP_WIDGET_ID, {
                 kind: 'map',
-                // Only names a *new* widget: reopening one keeps the title it
-                // was given, since it is the same dock coming back rather than
-                // a fresh one (Mapper_spec pins that).
-                ...(api.windows.has(MAP_WIDGET_ID) ? {} : { title: 'Map' }),
+                // No title: a new widget is headed "Map - <profile>" by the
+                // manager, and reopening one keeps the title it was given,
+                // since it is the same dock coming back (Mapper_spec pins that).
                 dockingArea: 'right',
             });
             return true;
         }
         // 1-arg: dockingArea string
-        const area = String(a);
-        if (area === 'f') {
+        const area = String(a).toLowerCase();
+        if (area === 'f' || area === 'floating') {
+            // Host::openMapWidget floats the dock it already has, so a docked
+            // widget comes out of its dock rather than staying put.
+            api.windows.setDockArea(MAP_WIDGET_ID, 'main');
             api.windows.open(MAP_WIDGET_ID, {
                 kind: 'map',
-                // Only names a *new* widget: reopening one keeps the title it
-                // was given, since it is the same dock coming back rather than
-                // a fresh one (Mapper_spec pins that).
-                ...(api.windows.has(MAP_WIDGET_ID) ? {} : { title: 'Map' }),
+                // No title: a new widget is headed "Map - <profile>" by the
+                // manager, and reopening one keeps the title it was given,
+                // since it is the same dock coming back (Mapper_spec pins that).
                 autoDock: false,
                 ignoreHint: true,
             });
@@ -160,7 +196,6 @@ export function installUserWindowBindings({
         const existed = api.windows.has(MAP_WIDGET_ID);
         api.windows.open(MAP_WIDGET_ID, {
             kind: 'map',
-            title: 'Map',
             ignoreHint: true,
             dockingArea: side,
         });
@@ -209,11 +244,10 @@ export function installUserWindowBindings({
         return true;
     });
     // Mudlet clearUserWindow([name]) — defaults to clearing the main
-    // console when no name is given (matches `clearWindow` behaviour).
+    // console when no name is given. The same function as clearWindow on
+    // desktop, so it clears a buffer too.
     lua.global.set("clearUserWindow", (window?: unknown) => {
-        const name = typeof window === 'string' ? window : undefined;
-        if (!name || name === 'main') api.clearWindow();
-        else api.windows.clear(name);
+        api.clearWindow(typeof window === 'string' ? window : undefined);
     });
     // createMiniConsole has two calling conventions:
     //   createMiniConsole(name, x, y, w, h)              — 5 args, parent defaults to main
@@ -276,10 +310,26 @@ export function installUserWindowBindings({
         // Free any bound action callback chunk so the Lua registry slot is
         // released — overlayCmdLineActionCbIds bookkeeping mirrors the
         // per-window cmd-line lifecycle.
-        const prev = overlayCmdLineActionCbIds.get(name);
-        if (prev) { unregisterCb(prev); overlayCmdLineActionCbIds.delete(name); }
-        const ok = api.cmdLines.destroy(name);
-        if (ok) emitEvent('sysCommandLineDeleted', [name]);
+        const free = (ids: Map<string, number>) => {
+            const prev = ids.get(name);
+            if (prev) { unregisterCb(prev); ids.delete(name); }
+        };
+        let ok = false;
+        if (api.cmdLines.has(name)) {
+            free(overlayCmdLineActionCbIds);
+            ok = api.cmdLines.destroy(name);
+        } else if (api.windows.hasCommandLine(name)) {
+            // A miniconsole's or user window's own line is registered under the
+            // console's name, so it is deleted by that name too — the console
+            // stays, without a command line (#342).
+            free(windowCmdLineActionCbIds);
+            ok = api.windows.deleteCommandLine(name);
+        }
+        if (ok) {
+            api.forgetCmdLineCompletion(name);
+            api.cmdLineMenu.drop(name);
+            emitEvent('sysCommandLineDeleted', [name]);
+        }
         return ok;
     });
     // Mudlet deleteMiniConsole(name) → true, or (false, errMsg) when the named

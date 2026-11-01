@@ -67,6 +67,12 @@ export function ContentLayout({
         return () => manager.registerMainViewportHost(null);
     }, [manager, outputHost]);
 
+    // The column setMainWindowSize sizes in place of desktop's application
+    // window, whichever layout branch renders it.
+    const registerFrame = useCallback((element: HTMLDivElement | null) => {
+        manager.registerMainWindowFrame(element);
+    }, [manager]);
+
     const handleTitlebarContextMenu = useCallback((e: React.MouseEvent) => {
         e.preventDefault();
         setMenuPos({ x: e.clientX, y: e.clientY });
@@ -117,7 +123,7 @@ export function ContentLayout({
     const showTop    = hasTop    || dragState?.potentialDock === 'top';
     const showBottom = hasBottom || dragState?.potentialDock === 'bottom';
 
-    const buttonStrips = useButtonStrips({ connectionId, engineRef: scriptingEngineRef ?? NULL_ENGINE_REF, vfs });
+    const buttonStrips = useButtonStrips({ connectionId, engineRef: scriptingEngineRef ?? NULL_ENGINE_REF, vfs, commandInputRef });
 
     // Content pool — one panel component per open window, mounted once for its
     // lifetime. Each renders into a stable portal-target div that the layout
@@ -125,7 +131,7 @@ export function ContentLayout({
     // physically moves around without ever unmounting the component. Shared by
     // both the desktop and mobile branches so panel state survives a rotate.
     const contentPool = windows.map(w => createPortal(
-        w.kind === 'text' ? <TextPanel id={w.id} title={w.title} manager={manager} labels={session.labels} cmdLines={session.cmdLines} scrollBoxes={session.scrollBoxes} fontSize={w.fontSize} fontFamily={w.fontFamily} lineHeight={w.lineHeight} wrapAt={w.wrapAt} wrapIndent={w.wrapIndent} wrapHangingIndent={w.wrapHangingIndent} backgroundColor={w.backgroundColor} backgroundImage={w.backgroundImage} cmdLineEnabled={w.cmdLineEnabled} cmdLineStyleSheet={w.cmdLineStyleSheet} cmdLineValue={w.cmdLineValue} cmdLineValueSeq={w.cmdLineValueSeq} />
+        w.kind === 'text' ? <TextPanel id={w.id} title={w.title} manager={manager} labels={session.labels} cmdLines={session.cmdLines} scrollBoxes={session.scrollBoxes} mouseEvents={session.mouseEvents} fontSize={w.fontSize} fontFamily={w.fontFamily} lineHeight={w.lineHeight} wrapAt={w.wrapAt} wrapIndent={w.wrapIndent} wrapHangingIndent={w.wrapHangingIndent} backgroundColor={w.backgroundColor} backgroundImage={w.backgroundImage} cmdLineEnabled={w.cmdLineEnabled} cmdLineStyleSheet={w.cmdLineStyleSheet} cmdLineValue={w.cmdLineValue} cmdLineValueSeq={w.cmdLineValueSeq} />
       : w.kind === 'html' ? <HtmlPanel id={w.id} manager={manager} labels={session.labels} cmdLines={session.cmdLines} scrollBoxes={session.scrollBoxes} backgroundColor={w.backgroundColor} backgroundImage={w.backgroundImage} cmdLineEnabled={w.cmdLineEnabled} cmdLineStyleSheet={w.cmdLineStyleSheet} cmdLineValue={w.cmdLineValue} cmdLineValueSeq={w.cmdLineValueSeq} />
       : <MapPanel id={w.id} manager={manager} connectionId={connectionId} vfs={vfs} />,
         manager.getOrCreatePortalTarget(w.id),
@@ -147,7 +153,7 @@ export function ContentLayout({
         return (
             <>
             {outputPool}
-            <div className="content-layout">
+            <div className="content-layout" ref={registerFrame}>
                 <MobileLayout
                     session={session}
                     manager={manager}
@@ -166,7 +172,7 @@ export function ContentLayout({
     return (
         <>
         {outputPool}
-        <div className="content-layout">
+        <div className="content-layout" ref={registerFrame}>
             {buttonStrips.top}
             {showTop && (
                 <DockArea side="top" windows={laidOut} extent={dockExtents.top} {...dockAreaProps} />

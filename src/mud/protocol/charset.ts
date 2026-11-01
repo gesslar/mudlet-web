@@ -2,13 +2,16 @@ import {
     CHARSET_ACCEPTED,
     CHARSET_REJECTED,
     CHARSET_REQUEST,
+    CHARSET_TTABLE_IS,
+    CHARSET_TTABLE_REJECTED,
     GMCP_IAC,
     GMCP_SB,
     GMCP_SE,
     OPT_CHARSET,
 } from "./constants";
-import { fromByteString } from "./byteString";
+import { decodeUtf8Stream, fromByteString, toByteString } from "./byteString";
 import { codePageUpperHalf, VENDORED_CODE_PAGES } from "./codePages";
+import { QT_CODE_PAGES } from "./qtCodePages.generated";
 import { decodeMultiByte, isMultiByteFramed, type MultiByteLabel } from "./multiByte";
 import { canBuildMultiByteEncoder, encodeMultiByteChar, type MultiByteEncoding } from "./multiByteEncode";
 
@@ -66,6 +69,8 @@ export function normalizeCharsetName(raw: string): string | null {
     if (n === 'gb18030') return 'gb18030';
     if (n === 'big5' || n === 'big5-hkscs') return 'big5';
     if (n === 'euc-kr' || n === 'euckr') return 'euc-kr';
+    if (n === 'shift-jis' || n === 'sjis' || n === 'ms-kanji' || n === 'csshiftjis') return 'shift_jis';
+    if (n === 'euc-jp' || n === 'eucjp') return 'euc-jp';
     // Mudlet spells these with a space ("ISO 8859-2" — see TEncodingTable.cpp),
     // the wire and IANA with a dash, and both reach here.
     const iso = /^iso[- ]?8859-?(\d{1,2})$/.exec(n);
@@ -109,7 +114,7 @@ export const SUPPORTED_SERVER_ENCODINGS: readonly string[] = [
     'WINDOWS-1250', 'WINDOWS-1251', 'WINDOWS-1252', 'WINDOWS-1253', 'WINDOWS-1254',
     'WINDOWS-1255', 'WINDOWS-1256', 'WINDOWS-1257', 'WINDOWS-1258',
     // The multi-byte East Asian encodings, which the browser decodes for us.
-    'GBK', 'GB18030', 'BIG5', 'BIG5-HKSCS', 'EUC-KR',
+    'GBK', 'GB18030', 'BIG5', 'BIG5-HKSCS', 'EUC-KR', 'SHIFT_JIS', 'EUC-JP',
 ];
 
 /** Names Mudlet Web once listed and saved to profiles that Mudlet itself never
@@ -156,17 +161,16 @@ export function canonicalServerEncoding(raw: string): string | null {
 }
 
 /**
- * Char → byte for a single-byte encoding, built by decoding every byte value
- * with the browser's own TextDecoder. That table is the only encoding data a
- * browser exposes (TextEncoder writes UTF-8 and nothing else), and inverting it
- * is exact for the single-byte codepages above.
+ * Char → byte for a single-byte encoding, built by inverting its decode table
+ * (TextEncoder writes UTF-8 and nothing else, so there is no encoder to ask),
+ * which is exact for the single-byte codepages above.
  */
 const reverseTables = new Map<string, Map<string, number>>();
 
 /** Byte value → character for a single-byte encoding, or null when `label`
- *  names a multi-byte one (which has no such table) or nothing at all. A
- *  vendored code page answers from codePages.ts; everything else is read out of
- *  the browser's own decoder one byte at a time. */
+ *  names a multi-byte one (which has no such table) or nothing at all. Every
+ *  single-byte encoding listed answers from codePages.ts; anything else is read
+ *  out of the browser's own decoder one byte at a time. */
 function forwardTable(label: string): readonly string[] | null {
     const own = singleByteDecodeTable(label);
     if (own) return own;
@@ -201,7 +205,7 @@ function reverseTable(label: string): Map<string, number> | null {
 
 /** Labels whose decoder reads more than one byte per character, so none of the
  *  single-byte table paths apply to them. */
-const MULTI_BYTE_LABELS = new Set(['utf-8', 'gbk', 'gb18030', 'big5', 'euc-kr']);
+const MULTI_BYTE_LABELS = new Set(['utf-8', 'gbk', 'gb18030', 'big5', 'euc-kr', 'shift_jis', 'euc-jp']);
 
 /** The multi-byte encoder for decoder `label`, or null when it is not one of
  *  those. Big5 and BIG5-HKSCS share a decoder but not an encoder — only the
@@ -211,6 +215,22 @@ function multiByteEncoding(label: string, name: string): MultiByteEncoding | nul
     if (!isMultiByteFramed(label)) return null;
     if (label === 'big5' && canonicalServerEncoding(name) === 'BIG5-HKSCS') return 'big5-hkscs';
     return label;
+}
+
+/**
+ * What desktop puts on the wire for a character the encoding has no bytes
+ * for. Not always Qt's '?': the pages it reads through Qt are written through
+ * ICU's converters, whose substitute is SUB (0x1A) — so `send("a中b")` under
+ * ISO 8859-1, KOI8-R or WINDOWS-1251 sends `61 1a 62`. EUC-KR is ICU's too,
+ * which takes SUB for a character up to U+00FF and its double-byte substitute,
+ * AF FE, past it. GBK and Big5 are Microsoft's tables in ICU, which substitute
+ * '?', and so do the pages Mudlet encodes from its own tables (CP437 and the
+ * rest of codePages.ts) and ASCII.
+ */
+function substitute(label: string, multi: MultiByteEncoding | null, ch: string): string {
+    if (multi === 'euc-kr') return (ch.codePointAt(0) ?? 0) <= 0xff ? '\x1a' : '\xaf\xfe';
+    if (!multi && Object.hasOwn(QT_CODE_PAGES, label)) return '\x1a';
+    return '?';
 }
 
 /**
@@ -262,7 +282,14 @@ export function decodeForServer(byteString: string, serverEncoding: string): str
     // A sequence running off the end of a complete payload is truncated data,
     // not data still arriving, so its bytes are dropped rather than held —
     // which is what Mudlet does for anything that did not come off the socket.
-    if (isMultiByteFramed(label)) return decodeMultiByte(byteString, label).text;
+    // The exception is a double-byte lead held across a colour code for its
+    // trail byte: TBuffer::endLocalFeedSequences flushes it as a replacement
+    // character (flushPendingLead), and the colour code still applies.
+    if (isMultiByteFramed(label)) {
+        const { text, pending } = decodeMultiByte(byteString, label);
+        if (pending.length > 1 && pending.charCodeAt(1) === 0x1b) return text + '\uFFFD' + pending.slice(1);
+        return text;
+    }
     const bytes = new Uint8Array(byteString.length);
     for (let i = 0; i < byteString.length; i++) bytes[i] = byteString.charCodeAt(i) & 0xff;
     try {
@@ -274,9 +301,12 @@ export function decodeForServer(byteString: string, serverEncoding: string): str
 
 /** The 256-entry byte → character table for a single-byte `label`, or null when
  *  the label names a decoder the browser has to run (UTF-8 and the multi-byte
- *  East Asian set). ASCII is one of these: it has no table of its own, so it is
- *  built here as plain ASCII with a replacement character for every byte that
- *  has its top bit set — which is exactly what Mudlet substitutes. */
+ *  East Asian set). Every single-byte encoding Mudlet Web lists has one, from
+ *  codePages.ts — the browser's decoders for the WHATWG ones read 0x80–0x9F
+ *  and several unassigned bytes differently from desktop. ASCII has no table
+ *  of its own, so it is built here as plain ASCII with a replacement character
+ *  for every byte that has its top bit set — which is exactly what Mudlet
+ *  substitutes. */
 const singleByteTables = new Map<string, readonly string[] | null>();
 function singleByteDecodeTable(label: string): readonly string[] | null {
     if (singleByteTables.has(label)) return singleByteTables.get(label) ?? null;
@@ -300,8 +330,8 @@ function decodeWithTable(byteString: string, table: readonly string[]): string {
 
 /**
  * Parse an `IAC SB CHARSET REQUEST ...` subnegotiation body (leading byte is
- * the option code 42, then subcommand byte 1, then optional `[TTABLE]<ver>`
- * prefix, then a separator byte, then separator-delimited IANA names). Returns
+ * the option code 42, then subcommand byte 1, then a separator byte, then
+ * separator-delimited IANA names). Returns
  * the one to switch to with both the original wire spelling (echoed back in
  * the ACCEPTED reply per RFC 2066) and this client's canonical name for it,
  * which is what `getServerEncoding()` then reports. Returns null if no offered
@@ -312,18 +342,15 @@ export function pickCharsetFromRequest(
     current?: string,
 ): { original: string; canonical: string } | null {
     if (subneg.length < 4) return null;
-    let i = 2; // skip option code (42) + subcommand (REQUEST = 1)
-    // Optional `[TTABLE]<version>` prefix — skip the bracket-delimited tag and
-    // the single version byte after it. We don't support translation tables;
-    // we just step past the prefix so we can find the real separator.
-    if (subneg.charCodeAt(i) === 0x5B /* '[' */) {
-        const close = subneg.indexOf(']', i);
-        if (close === -1) return null;
-        i = close + 1;
-        if (i >= subneg.length) return null;
-        i++; // skip version byte
-    }
-    if (i >= subneg.length) return null;
+    const i = 2; // skip option code (42) + subcommand (REQUEST = 1)
+    // The byte after REQUEST is taken as the separator, always. A request
+    // opening with RFC 2066's `[TTABLE]<version>` prefix (an offer to use
+    // translation tables, which this client does not support) therefore splits
+    // on '[' and offers nothing recognisable, so it is REJECTED — which is what
+    // Mudlet answers it with: its `[TTABLE]1` strip compares against a payload
+    // that still starts with the REQUEST byte, so it never fires, and the
+    // request is split on '[' exactly as here. Accepting a name out of such a
+    // request would leave a server expecting a translation table we never use.
     const sep = subneg[i];
     const list = subneg.substring(i).split(sep).filter(name => name.length > 0);
     if (list.length === 0) return null;
@@ -340,25 +367,34 @@ export function pickCharsetFromRequest(
 }
 
 /**
- * The session's byte→char codec. Owns the streaming inbound `TextDecoder`
- * (holding trailing partial multi-byte chars across WebSocket frames) and the
+ * The session's byte→char codec. Owns the streaming inbound decoder (holding
+ * trailing partial multi-byte chars across WebSocket frames) and the
  * matching outgoing encoding. Starts at UTF-8 — correct for ASCII and modern
  * MUDs — and switches when a CHARSET exchange (or an explicit
  * `setServerEncoding`) agrees on something else.
  */
 export class SessionCodec {
-    private decoder = new TextDecoder('utf-8', { fatal: false });
+    /** The browser's decoder, for a label none of the paths below covers.
+     *  Null for UTF-8, which is decoded by TBuffer's rule (decodeUtf8Stream). */
+    private decoder: TextDecoder | null = null;
     /** Set instead of {@link decoder} while a single-byte encoding is in use. */
     private table: readonly string[] | null = null;
     /** Set instead of both while an encoding Mudlet Web frames itself is in use. */
     private framed: MultiByteLabel | null = null;
-    /** Bytes of a framed sequence cut short by the end of a frame, waiting for
-     *  the rest of it. TextDecoder holds this itself for the encodings it
-     *  decodes; the framed ones need it kept here. */
+    /** Bytes of a UTF-8 or framed sequence cut short by the end of a frame,
+     *  waiting for the rest of it. */
     private pendingBytes = '';
     private currentEncoding = 'utf-8';
     /** The encoder for outgoing text while a multi-byte encoding is in use. */
     private outgoingMultiByte: MultiByteEncoding | null = null;
+    /** What the next decode starts with: the replacement mark for a sequence
+     *  an encoding change cut short (see {@link trySetEncoding}). */
+    private owed = '';
+    /** Called just before the encoding actually changes, while the old one is
+     *  still in place — cTelnet's postHeldDataBeforeEncodingChange, which
+     *  posts the text ahead of the change in the same read under the encoding
+     *  it was sent in. */
+    onBeforeEncodingChange: (() => void) | null = null;
 
     /** The IANA name of the decoder currently applied to the inbound stream. */
     get encoding(): string {
@@ -367,20 +403,36 @@ export class SessionCodec {
 
     /** Back to the UTF-8 baseline with a fresh decoder (call on connect). */
     reset(): void {
-        this.decoder = new TextDecoder('utf-8', { fatal: false });
+        this.decoder = null;
         this.table = null;
         this.framed = null;
         this.pendingBytes = '';
+        this.owed = '';
         this.currentEncoding = 'utf-8';
         this.outgoingMultiByte = null;
     }
 
+    /** About to decode with `encoding`. When that is a change, the text ahead
+     *  of it is posted first, and the bytes of a sequence still waiting for
+     *  the rest of it are dropped for one replacement mark at the head of the
+     *  next text: they were sent in the old encoding and cannot be paired with
+     *  a byte read in the new one (TBuffer::translateToPlainText, on seeing
+     *  the encoding differ). A colour change held behind a lead byte is not
+     *  part of the character and is kept. */
+    private beforeSwitch(encoding: string): void {
+        // The same encoding again is no change: what it holds still pairs.
+        if (encoding === this.currentEncoding) return;
+        this.onBeforeEncodingChange?.();
+        const held = this.pendingBytes;
+        if (held) this.owed += '\uFFFD' + (held[1] === '\x1b' ? held.slice(1) : '');
+        this.pendingBytes = '';
+    }
+
     /** Swap the streaming decoder to a new encoding label (an IANA name the
-     *  TextDecoder constructor accepts: 'utf-8', 'iso-8859-2', ...). Any partial
-     *  multi-byte sequence buffered in the previous decoder is discarded —
-     *  fine because CHARSET typically negotiates before any real content
-     *  arrives. Returns false (leaving the current decoder untouched) when the
-     *  browser refuses the label. `name` is the encoding's own name where it
+     *  TextDecoder constructor accepts: 'utf-8', 'iso-8859-2', ...). A partial
+     *  multi-byte sequence buffered under the previous encoding becomes one
+     *  replacement mark (see {@link beforeSwitch}). Returns false (leaving the
+     *  current decoder untouched) when the browser refuses the label. `name` is the encoding's own name where it
      *  says more than the label does — BIG5-HKSCS, which decodes as big5 but
      *  encodes differently. */
     trySetEncoding(encoding: string, name: string = encoding): boolean {
@@ -388,9 +440,9 @@ export class SessionCodec {
         // TextDecoder: ASCII and the DOS code pages have no browser decoder to
         // ask for. Being single-byte, they also carry no state across frames,
         // so the streaming buffer simply does not apply to them.
-        this.pendingBytes = '';
         const table = singleByteDecodeTable(encoding);
         if (table) {
+            this.beforeSwitch(encoding);
             this.table = table;
             this.framed = null;
             this.currentEncoding = encoding;
@@ -398,22 +450,35 @@ export class SessionCodec {
             return true;
         }
         if (isMultiByteFramed(encoding)) {
+            this.beforeSwitch(encoding);
             this.framed = encoding;
             this.table = null;
             this.currentEncoding = encoding;
             this.outgoingMultiByte = multiByteEncoding(encoding, name);
             return true;
         }
-        try {
-            this.decoder = new TextDecoder(encoding, { fatal: false });
+        if (encoding === 'utf-8') {
+            this.beforeSwitch(encoding);
+            this.decoder = null;
             this.table = null;
             this.framed = null;
             this.outgoingMultiByte = null;
             this.currentEncoding = encoding;
             return true;
+        }
+        let decoder: TextDecoder;
+        try {
+            decoder = new TextDecoder(encoding, { fatal: false });
         } catch {
             return false;
         }
+        this.beforeSwitch(encoding);
+        this.decoder = decoder;
+        this.table = null;
+        this.framed = null;
+        this.outgoingMultiByte = null;
+        this.currentEncoding = encoding;
+        return true;
     }
 
     /** Converts a Latin-1 byte-string into decoded text under the current
@@ -423,12 +488,33 @@ export class SessionCodec {
      *  continue a sequence either, so a sequence the prompt cut short earns its
      *  replacement mark there and the next line starts afresh. */
     decode(byteString: string, final = false): string {
+        const text = this.decodeStream(byteString, final);
+        if (!this.owed || (byteString.length === 0 && !final)) return text;
+        const owed = this.owed;
+        this.owed = '';
+        return owed + text;
+    }
+
+    private decodeStream(byteString: string, final: boolean): string {
         if (this.table) return decodeWithTable(byteString, this.table);
         if (this.framed) {
             if (byteString.length === 0 && !(final && this.pendingBytes)) return '';
             const framed = decodeMultiByte(this.pendingBytes + byteString, this.framed);
             this.pendingBytes = final ? '' : framed.pending;
-            return final && framed.pending ? framed.text + '\uFFFD' : framed.text;
+            if (!final || !framed.pending) return framed.text;
+            // A lead byte held over a colour change keeps the change behind it.
+            const heldSgr = framed.pending[1] === '\x1b' ? framed.pending.slice(1) : '';
+            return framed.text + '\uFFFD' + heldSgr;
+        }
+        if (!this.decoder) {
+            // UTF-8 the way desktop's TBuffer reads it: a malformed sequence is
+            // one replacement mark for as many bytes as its lead declared, not
+            // one per byte as the browser's decoder gives, so `line` and every
+            // column after it agree with desktop.
+            if (byteString.length === 0 && !(final && this.pendingBytes)) return '';
+            const utf8 = decodeUtf8Stream(this.pendingBytes + byteString, final);
+            this.pendingBytes = utf8.pending;
+            return utf8.text;
         }
         if (byteString.length === 0 && !final) return '';
         const bytes = new Uint8Array(byteString.length);
@@ -459,6 +545,16 @@ export class SessionCodec {
         }
         return new TextDecoder(this.currentEncoding, { fatal: false }).decode(bytes);
     }
+
+    /** Encode an out-of-band value (`sendMSDP`'s names and values) under the
+     *  current encoding — the outgoing half of {@link decodeOutOfBand}, and like
+     *  it UTF-8 under ASCII. Desktop encodes these through the game's encoding
+     *  as it does a `send`, so a GBK game gets GBK bytes rather than UTF-8. */
+    encodeOutOfBand(text: string): string {
+        if (this.currentEncoding === 'ascii') return toByteString(text);
+        return this.encodeOutgoing(text);
+    }
+
     /** Convert a user-typed JS string (UTF-16) into the Latin-1 byte-string the
      *  socket layer expects, using the currently negotiated outgoing encoding.
      *  UTF-8 goes through TextEncoder so multi-byte chars survive; the East
@@ -468,8 +564,8 @@ export class SessionCodec {
      *  truncation used to stand in for that, and was right only for the
      *  Latin-1 range — every Polish, Cyrillic, or Greek character above it went
      *  out as a byte meaning something else entirely.) A character the codepage
-     *  has no byte for becomes '?', as Qt's encoder does it — and the send path
-     *  warns before it comes to that. */
+     *  has no byte for becomes what desktop writes for one ({@link substitute})
+     *  — and the send path warns before it comes to that. */
     encodeOutgoing(text: string): string {
         if (this.currentEncoding === 'utf-8') {
             const bytes = new TextEncoder().encode(text);
@@ -483,13 +579,16 @@ export class SessionCodec {
         const multi = this.outgoingMultiByte;
         if (multi) {
             let out = '';
-            for (const ch of text) out += encodeMultiByteChar(ch, multi) ?? '?';
+            for (const ch of text) out += encodeMultiByteChar(ch, multi) ?? substitute(this.currentEncoding, multi, ch);
             return out;
         }
         const table = reverseTable(this.currentEncoding);
         if (!table) return text;
         let out = '';
-        for (const ch of text) out += String.fromCharCode(table.get(ch) ?? 0x3f /* '?' */);
+        for (const ch of text) {
+            const b = table.get(ch);
+            out += b === undefined ? substitute(this.currentEncoding, null, ch) : String.fromCharCode(b);
+        }
         return out;
     }
 }
@@ -520,7 +619,7 @@ export class CharsetHandler {
      *  is the option code, 42). Handles REQUEST (server lists charsets, we
      *  ACCEPT one or REJECT), ACCEPTED (server picked one of ours — switch
      *  codec), and REJECTED (server didn't like any of ours — stay put).
-     *  TTABLE-* subcommands are silently ignored; almost no MUD uses them. */
+     *  TTABLE-IS (a translation table) gets TTABLE-REJECTED, as in Mudlet. */
     handleSubneg(subneg: string): void {
         if (!this.enabled) return;
         if (subneg.length < 2) return;
@@ -544,6 +643,11 @@ export class CharsetHandler {
             const canonical = canonicalServerEncoding(name);
             const norm = canonical ? normalizeCharsetName(canonical) : null;
             if (norm && canonical) this.setEncoding(norm, canonical);
+        }
+        else if (sub === CHARSET_TTABLE_IS.charCodeAt(0)) {
+            // A translation table we have no use for. RFC 2066 requires an
+            // answer, and Mudlet gives TTABLE-REJECTED.
+            this.hooks.sendRaw(GMCP_IAC + GMCP_SB + OPT_CHARSET + CHARSET_TTABLE_REJECTED + GMCP_IAC + GMCP_SE);
         }
         // CHARSET_REJECTED — no action, keep current encoding.
     }

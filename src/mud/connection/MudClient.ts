@@ -25,12 +25,16 @@ import {
     MSSP_COMMAND_CODE,
     MXP_COMMAND_CODE,
     NEW_ENVIRON_COMMAND_CODE,
+    normalizeCharsetName,
+    ATCP_COMMAND_CODE,
     OPT_ATCP,
     OPT_TELNET_102,
+    parseAtcpMessage,
     TELNET_102_COMMAND_CODE,
     SessionCodec,
     toByteString,
     stripTelnetSequences,
+    type TextAheadSlot,
     TELNET_GA,
     TTYPE_COMMAND_CODE,
 } from "../protocol";
@@ -110,13 +114,6 @@ export interface MudClientOptions {
      *  NEW_ENVIRON_USERVAR. Mudlet exposes MNES and NEW-ENVIRON as two separate
      *  toggles over the same telnet option; Mudlet Web mirrors that. */
     newEnvironEnabled?: boolean;
-    /** Whether the link to the *game server* is TLS-encrypted, reported as the
-     *  NEW-ENVIRON `TLS` capability. Defaults to whether `url` is `wss://` — the
-     *  correct answer for a direct websocket-mode connection. In proxy (`mud`)
-     *  mode the caller passes the answer explicitly, because a `wss://` proxy URL
-     *  only secures the browser↔proxy hop: the proxy↔MUD leg is plaintext telnet
-     *  unless the profile enabled TLS (see connectionSecureTransport). */
-    secureTransport?: boolean;
     /** Whether to advertise screen-reader use, reported as the MTTS SCREEN
      *  READER bit and the NEW-ENVIRON `SCREEN_READER` capability
      *  (`setConfig("advertiseScreenReader", …)`). Default false. */
@@ -134,10 +131,10 @@ export interface MudClientOptions {
     nawsEnabled?: boolean;
     /** Mudlet's "Fix unnecessary linebreaks on GA servers"
      *  (`setConfig("fixUnnecessaryLinebreaks", …)`, host flag
-     *  `mUSE_IRE_DRIVER_BUGFIX`). Default false. When true *and* the session is
-     *  GA-driven, a single spurious leading newline is stripped from the start
-     *  of each GA-terminated data block — the IRE-server bug Mudlet patches in
-     *  `cTelnet::gotPrompt`. See LineAssembler. */
+     *  `mUSE_IRE_DRIVER_BUGFIX`). Default false. When true, a single spurious
+     *  leading newline is stripped from the start of each block of a read that
+     *  ends in GA/EOR — the IRE-server bug Mudlet patches in
+     *  `cTelnet::gotPrompt`. See LineAssembler.stripPromptBlockNewline. */
     fixUnnecessaryLinebreaks?: boolean;
     /** Mudlet's `Host::mUndoServerWrap` — rejoin the lines the game wrapped
      *  itself, so triggers and rendering see whole logical lines. Default false.
@@ -218,6 +215,81 @@ function bytesToLatin1(bytes: Uint8Array): string {
     return binary;
 }
 
+/** A read waiting in MudClient's inbound queue, at whichever stage it has
+ *  reached: as received, split into MCCP pieces (and the warnings between
+ *  them), or as text partly through the pipeline. */
+type InboundItem =
+    | { kind: 'read'; data: string; receivedAt?: number }
+    | { kind: 'notice'; notice: string }
+    | { kind: 'piece'; data: string; receivedAt?: number; original: string; split: boolean }
+    | { kind: 'text'; data: string; receivedAt?: number };
+
+/** Lines a slice of a large read hands the pipeline at a time. */
+const INBOUND_SLICE_LINES = 32;
+/** How long a slice runs before the event loop gets a turn while the user
+ *  has input waiting (where the browser can tell — isInputPending). */
+const INBOUND_SLICE_BUDGET_MS = 12;
+/** How long a slice runs before the event loop gets a turn regardless: what
+ *  timers and input wait at most during a flood.
+ *
+ *  Not the 12 ms it was. Every turn the event loop gets is a chance for the
+ *  browser to render, and a frame costs layout and paint over the console
+ *  however few lines it adds, so a 2000-line burst yielding every 12 ms paid
+ *  for a frame roughly every slice — a long burst into a long scrollback took
+ *  five times as long as one handled whole (#457). 50 ms is the long-task
+ *  threshold: the page still answers within a frame or three, and a burst
+ *  pays for a quarter of the frames. */
+const INBOUND_READ_BUDGET_MS = 50;
+
+/** Chromium's `navigator.scheduling.isInputPending()`: true when a key press
+ *  or click is queued behind the running task. False wherever it is missing. */
+function inputPending(): boolean {
+    const scheduling = (globalThis.navigator as { scheduling?: { isInputPending?: () => boolean } } | undefined)?.scheduling;
+    try {
+        return scheduling?.isInputPending?.() === true;
+    } catch {
+        return false;
+    }
+}
+
+/** Whether a slice that has run `elapsed` ms should give the event loop its
+ *  turn. Exported for the tests. */
+export function inboundSliceDue(elapsed: number, hasInput: () => boolean = inputPending): boolean {
+    if (elapsed >= INBOUND_READ_BUDGET_MS) return true;
+    return elapsed >= INBOUND_SLICE_BUDGET_MS && hasInput();
+}
+
+/** Where the `n`th line of `data` ends (just past its `\n`), or its length. */
+function afterLines(data: string, n: number): number {
+    let at = 0;
+    for (let i = 0; i < n; i++) {
+        const nl = data.indexOf('\n', at);
+        if (nl === -1) return data.length;
+        at = nl + 1;
+    }
+    return at;
+}
+
+/** Run `fn` as a task of its own, after whatever input and timers are
+ *  waiting. A MessageChannel rather than setTimeout(0), which browsers
+ *  stretch to 4 ms once timeouts nest. */
+let yieldChannel: MessageChannel | null = null;
+const yieldQueue: Array<() => void> = [];
+function yieldToEventLoop(fn: () => void): void {
+    if (typeof MessageChannel === 'undefined') {
+        setTimeout(fn, 0);
+        return;
+    }
+    if (!yieldChannel) {
+        yieldChannel = new MessageChannel();
+        yieldChannel.port1.onmessage = () => { yieldQueue.shift()?.(); };
+        // Node keeps a listening port's process alive; this one must not.
+        (yieldChannel.port1 as { unref?: () => void }).unref?.();
+    }
+    yieldQueue.push(fn);
+    yieldChannel.port2.postMessage(null);
+}
+
 /**
  * The MUD-facing transport: telnet over a WebSocket (direct or via the
  * telnet→WebSocket proxy). Owns the socket lifecycle and the outbound send
@@ -276,18 +348,12 @@ export class MudClient {
      *  "failed to connect" from "connection lost mid-session" in close events. */
     private opened = false;
 
-    /** True once we've sent the GMCP `Core.Hello` / `Core.Supports.Set`
-     *  handshake this session. Only a server's IAC DO GMCP consults it — an
-     *  IAC WILL GMCP always re-announces (see sendGmcpHandshake). Reset on
-     *  each connect(). */
-    private gmcpHelloSent = false;
-
     /** When the game command now awaiting a reply went out (`performance.now()`),
      *  or null when nothing is being timed. Mudlet's
      *  `cTelnet::begin/finishNetworkLatencyMeasurement`: on a server that marks
      *  its prompts with GA/EOR, the time from a command to the first read
-     *  off the socket after it is the network latency `getNetworkLatency()` reports, whether or
-     *  not the game answers GMCP `Core.Ping`. Timed from the first command of a
+     *  off the socket after it is the network latency `getNetworkLatency()` reports
+     *  — the only reading there is, as Mudlet sends no GMCP `Core.Ping`. Timed from the first command of a
      *  burst, so a queued speedwalk isn't credited with the replies to its
      *  earlier steps. */
     private latencyStartedAt: number | null = null;
@@ -307,6 +373,14 @@ export class MudClient {
      *  the several signals that can prove the game leg is up all funnel through
      *  {@link markEstablished}, and only the first of them counts. */
     private gameEstablished = false;
+    /** Fires while the game has been silent for {@link IDLE_PROBE_MS}; see
+     *  {@link probeIdleConnection}. */
+    private idleProbe: ReturnType<typeof setTimeout> | null = null;
+    /** `performance.now()` of the last game frame on the current socket. */
+    private lastInboundAt = 0;
+    /** True once the server has sent a telnet command (any IAC) on the current
+     *  socket — only then is an `IAC NOP` probe something it knows to ignore. */
+    private telnetSeen = false;
 
     commandEcho: boolean;
     private readonly mspParser = new MspParser();
@@ -342,7 +416,6 @@ export class MudClient {
             mxpEnabled = true,
             mnesEnabled = false,
             newEnvironEnabled = false,
-            secureTransport,
             screenReaderAdvertised = false,
             osc8HyperlinksEnabled = true,
             nawsEnabled = true,
@@ -371,7 +444,7 @@ export class MudClient {
         this.assembler = new LineAssembler(
             {
                 onChunk: (text, ts) => this.chunkProcessor.processChunk(text, ts, this),
-                onPrompt: (promptLine) => this.eventBus.emit('prompt', promptLine),
+                onPrompt: () => this.eventBus.emit('prompt'),
                 onIdleFlush: () => this.flushMessageBuffer(),
             },
             { promptTimeoutMs, fixUnnecessaryLinebreaks, undoServerWrap, undoServerWrapWidth },
@@ -393,11 +466,6 @@ export class MudClient {
             mnesEnabled,
             newEnvironEnabled,
             nawsEnabled,
-            // Fall back to the URL scheme when the caller doesn't say —
-            // correct for a direct websocket connection; proxy mode passes
-            // its own answer, since a wss:// proxy URL says nothing about
-            // whether the proxy↔game leg is encrypted.
-            secureTransport: secureTransport ?? /^wss:/i.test(url),
             screenReaderAdvertised,
             osc8HyperlinksEnabled,
             versionInTTYPE,
@@ -409,8 +477,9 @@ export class MudClient {
             eventBus,
             {
                 sendRaw: (data) => this.sendRaw(data),
-                onGmcpNegotiated: (offered) => this.sendGmcpHandshake(offered),
+                onGmcpNegotiated: () => this.sendGmcpHandshake(),
                 getEncoding: () => this.codec.encoding,
+                isMccpEnabled: () => this.mccpHandler.enabled,
                 onKaVirProtocolDetected: () => this.eventBus.emit('kavir.detected'),
             },
         );
@@ -428,18 +497,7 @@ export class MudClient {
             onEnvelope: ({ path, value }) => {
                 this.handleCharLogin(path, value);
                 (this.eventBus.emit as (event: string, ...args: unknown[]) => void)(`gmcp.${path}`, value);
-                // GMCP module names are case-insensitive by convention, and the
-                // ping tracker listens on a fixed lowercase event. Route the
-                // server's Core.Ping reply regardless of spelling — the spec's
-                // canonical reply is PascalCase `Core.Ping` with no body, which
-                // `gmcp.${path}` alone would emit as `gmcp.Core.Ping`.
-                if (path !== 'core.ping' && path.toLowerCase() === 'core.ping') {
-                    this.eventBus.emit('gmcp.core.ping', value);
-                }
                 this.eventBus.emit('gmcp', { path, value });
-            },
-            onMessage: (text, type) => {
-                this.messageBuffer.push({ text, type });
             },
             onClientGui: (payload) => {
                 this.eventBus.emit('clientGui', payload);
@@ -447,6 +505,7 @@ export class MudClient {
         });
 
         this.msdpStream = createMsdpStream({
+            decode: (bytes) => this.codec.decodeOutOfBand(bytes),
             onEnvelope: ({ path, value }) => {
                 (this.eventBus.emit as (event: string, ...args: unknown[]) => void)(`msdp.${path}`, value);
                 this.eventBus.emit('msdp', { path, value });
@@ -479,12 +538,35 @@ export class MudClient {
             else if (code === MXP_COMMAND_CODE) this.negotiator.handleMxpSubneg();
             else if (code === NEW_ENVIRON_COMMAND_CODE) this.negotiator.handleNewEnvironSubneg(subneg);
             else if (code === TELNET_102_COMMAND_CODE) this.handleChannel102Subneg(subneg);
+            else if (code === ATCP_COMMAND_CODE) this.handleAtcpSubneg(subneg);
         }, this.telnetParserOpts);
-        this.mccpHandler = new MccpHandler((data) => this.sendRaw(data));
+        // The option commands these two handlers send themselves are noted in
+        // the negotiator's option bitsets, which Mudlet keeps for every option
+        // it answers (they feed the STATUS reply and the repeat-offer checks).
+        const sendOptionRaw = (data: string): void => {
+            this.negotiator.noteOptionsSent(data);
+            this.sendRaw(data);
+        };
+        // MccpHandler answers every WILL COMPRESS2 it sees; Mudlet answers one
+        // only while the option is off (`!hisOptionState`), so a server
+        // re-offering compression it already has is not told DO again — an
+        // answer to an option already on can start a negotiation loop
+        // (mudlet-web#379).
+        this.mccpHandler = new MccpHandler((data) => {
+            if (data.length === 3 && data.charCodeAt(0) === 0xFF && data.charCodeAt(1) === 0xFD
+                && this.negotiator.isServerOptionOn(data.charCodeAt(2))) return;
+            sendOptionRaw(data);
+        }, () => {
+            // The end of a stream leaves both compression options off on
+            // desktop (hisOptionState reset in decompressBuffer), so a game
+            // offering compression again afterwards is told DO again.
+            this.negotiator.forgetServerOption(0x55);
+            this.negotiator.forgetServerOption(0x56);
+        });
         this.mccpHandler.enabled = mccpEnabled;
 
         this.echoHandler = new EchoHandler(
-            (data) => this.sendRaw(data),
+            sendOptionRaw,
             (maskInput) => {
                 this.eventBus.emit('telnet.echo', maskInput);
                 // The server released ECHO right after the masked line, so this
@@ -512,6 +594,8 @@ export class MudClient {
         if (this.charModeTimer !== null) clearTimeout(this.charModeTimer);
         this.charModeTimer = setTimeout(() => {
             this.charModeTimer = null;
+            // An ECHO release the game already sent may still be queued.
+            this.drainInbound();
             this.checkCharacterModePattern();
         }, CHARACTER_MODE_DETECT_MS);
     }
@@ -548,7 +632,7 @@ export class MudClient {
     }
 
     /** Mudlet `setConfig("fixUnnecessaryLinebreaks", …)`. Takes effect on the
-     *  next GA-driven block; never retroactive. */
+     *  next block that ends in a prompt marker; never retroactive. */
     setFixUnnecessaryLinebreaks(enabled: boolean): void {
         this.assembler.setFixUnnecessaryLinebreaks(enabled);
     }
@@ -612,6 +696,16 @@ export class MudClient {
     }
 
     connect(): void {
+        // What the last socket already delivered goes through first, as it
+        // would have before anything else could run on desktop. A trigger
+        // there that dialled already did what this call was asked to.
+        const before = this.socket;
+        this.drainInbound();
+        if (this.socket !== before) return;
+        this.dropQueuedReads();
+        // A disconnect() still waiting on its output is reported first, as
+        // cTelnet::connectIt's abort() of a closing socket does.
+        if (this.pendingDisconnect !== null) this.finishDisconnect();
         if (this.socket) {
             this.socket.onmessage = null;
             this.socket.onclose = null;
@@ -621,16 +715,18 @@ export class MudClient {
         this.mccpHandler.reset();
         this.echoHandler.reset();
         this.codec.reset();
+        this.pendingEncoding = null;
         this.assembler.reset();
         this.negotiator.reset();
         this.subnegRepair.reset();
         this.charModeDetected = false;
         this.cancelCharacterModeDetection();
-        this.gmcpHelloSent = false;
         this.latencyStartedAt = null;
         // Redialling re-runs the handshake, so the previous verdict is stale.
         this.tlsResolved = false;
         this.gameEstablished = false;
+        this.telnetSeen = false;
+        this.stopIdleProbe();
         if (this.tlsDeadline !== null) {
             clearTimeout(this.tlsDeadline);
             this.tlsDeadline = null;
@@ -647,6 +743,7 @@ export class MudClient {
             // sends bytes directly; decoding base64 on every frame was the bulk
             // of its (and our) per-message CPU cost.
             this.socket.binaryType = "arraybuffer";
+            const socket = this.socket;
 
             this.socket.onmessage = (event: MessageEvent<ArrayBuffer | string>) => {
                 const receivedAt = performance.now();
@@ -666,20 +763,12 @@ export class MudClient {
                     // …and for the same reason it proves the game leg is up,
                     // which is the fallback for a proxy too old to say so.
                     this.markEstablished();
+                    this.lastInboundAt = receivedAt;
                     const decodedData = bytesToLatin1(new Uint8Array(event.data));
-                    const data = this.subnegRepair.process(this.mccpHandler.processData(decodedData));
-                    if (debugTelnetEnabled()) {
-                        logTelnetNegotiation('raw', decodedData);
-                        if (data !== decodedData) logTelnetNegotiation('post-mccp', data);
-                    }
-                    this.negotiator.processFrame(data);
-                    this.echoHandler.processData(data);
-                    this.eventBus.emit('socket.incoming', data);
-                    try {
-                        this.processIncomingData(data, undefined, receivedAt);
-                    } catch (processingError) {
-                        console.error('Error during data processing:', processingError);
-                    }
+                    if (!this.telnetSeen && decodedData.includes('\xff')) this.telnetSeen = true;
+                    if (debugTelnetEnabled()) logTelnetNegotiation('raw', decodedData);
+                    this.inbound.push({ kind: 'read', data: decodedData, receivedAt });
+                    this.pumpInbound();
                 } catch (error) {
                     console.error('Error processing incoming message:', error);
                 }
@@ -690,6 +779,11 @@ export class MudClient {
             };
 
             this.socket.onclose = (event: CloseEvent) => {
+                // Everything the game sent before it closed is handled first —
+                // and if a trigger there disconnected or redialled, this
+                // socket's close has been dealt with already.
+                this.drainInbound();
+                if (this.socket !== socket) return;
                 // Closing without a single confirmed byte, while TLS was asked
                 // for, is the other face of the same ambiguity the deadline
                 // covers — report it now rather than waiting it out.
@@ -703,14 +797,14 @@ export class MudClient {
                 if (isAbnormalClose(event)) {
                     this.eventBus.emit('client.error', formatCloseError(event, this.opened, this.viaProxy));
                 }
-                this.eventBus.emit('client.disconnect');
-                this.eventBus.emit('client.disconnected');
+                this.emitDisconnect();
                 this.opened = false;
                 this.mccpHandler.reset();
                 this.echoHandler.reset();
                 this.pendingTelnet = "";
                 this.negotiator.clearMspNegotiated();
                 this.cancelCharacterModeDetection();
+                this.stopIdleProbe();
             };
 
             this.socket.onopen = (event: Event) => {
@@ -762,8 +856,7 @@ export class MudClient {
             // disconnect notice — which is what carries the error above into the
             // console — would never be posted. cTelnet is equivalent here: a
             // failed connectToHost still reaches slot_socketDisconnected.
-            this.eventBus.emit('client.disconnect');
-            this.eventBus.emit('client.disconnected');
+            this.emitDisconnect();
         }
     }
 
@@ -774,6 +867,8 @@ export class MudClient {
     private markEstablished(): void {
         if (this.gameEstablished) return;
         this.gameEstablished = true;
+        this.lastInboundAt = performance.now();
+        this.armIdleProbe(IDLE_PROBE_MS);
         this.eventBus.emit('client.connect');
         this.eventBus.emit('client.established');
     }
@@ -842,6 +937,22 @@ export class MudClient {
     }
 
     disconnect(): void {
+        // Reads still queued are handled before the disconnect, as they would
+        // already have been on desktop. A trigger calling disconnect() runs
+        // inside a slice, and the rest of its read is handled afterwards — as
+        // the rest of a read always has been. If a trigger in the drain
+        // disconnected or redialled, that stands.
+        const before = this.socket;
+        this.drainInbound();
+        if (this.socket !== before) return;
+        this.dropQueuedReads();
+        // A second disconnect() — or the teardown before a redial — while the
+        // first is still waiting on its output reports that one now, as Qt's
+        // abort() does to a socket in ClosingState.
+        if (this.pendingDisconnect !== null) {
+            this.finishDisconnect();
+            return;
+        }
         if (!this.socket) return;
         const socket = this.socket;
         // Idempotent on an already-torn-down socket. Without this, a second
@@ -860,6 +971,8 @@ export class MudClient {
         socket.onclose = null;
         socket.onerror = null;
         socket.onopen = null;
+        // Measured before close(), which some implementations settle at once.
+        const outputPending = socket.bufferedAmount > 0;
         socket.close();
         this.assembler.flush(Date.now(), true);
         // Let go of the socket rather than watching it finish closing. Every
@@ -870,19 +983,113 @@ export class MudClient {
         // that as still-connected. Qt hands cTelnet the UnconnectedState at
         // once, which is what makes a disconnect()ed profile injectable again.
         this.socket = null;
-        this.eventBus.emit('client.disconnect');
-        this.eventBus.emit('client.disconnected');
+        // `QAbstractSocket::disconnectFromHost` closes at once only when there
+        // is nothing left to write. With a command still on its way out — the
+        // usual `send("quit") disconnect()` — the socket lingers in
+        // ClosingState until the bytes are gone, and `disconnected()` (and
+        // with it sysDisconnectionEvent) arrives from the event loop, after
+        // the calling script has returned. A handler that reads a flag the
+        // caller sets on the next line (`quitting = true`) depends on that.
+        // `bufferedAmount` is exactly the browser's count of bytes queued but
+        // not yet handed to the network, so it answers the same question.
+        if (outputPending) {
+            this.pendingDisconnect = setTimeout(() => {
+                this.drainInbound();
+                // A redial from a trigger in the drain has reported it already.
+                if (this.pendingDisconnect !== null) this.finishDisconnect();
+            }, 0);
+            return;
+        }
+        this.finishDisconnect();
+    }
+
+    /** A disconnect() whose events are still waiting on unwritten output. */
+    private pendingDisconnect: ReturnType<typeof setTimeout> | null = null;
+
+    /** The tail of disconnect(), once the socket is really gone. */
+    private finishDisconnect(): void {
+        if (this.pendingDisconnect !== null) {
+            clearTimeout(this.pendingDisconnect);
+            this.pendingDisconnect = null;
+        }
+        this.emitDisconnect();
         this.opened = false;
         this.mccpHandler.reset();
         this.echoHandler.reset();
         this.pendingTelnet = '';
         this.negotiator.clearMspNegotiated();
         this.cancelCharacterModeDetection();
+        this.stopIdleProbe();
         this.latencyStartedAt = null;
+    }
+
+    private armIdleProbe(delay: number): void {
+        this.stopIdleProbe();
+        this.idleProbe = setTimeout(() => {
+            this.idleProbe = null;
+            this.probeIdleConnection();
+        }, delay);
+    }
+
+    private stopIdleProbe(): void {
+        if (this.idleProbe !== null) {
+            clearTimeout(this.idleProbe);
+            this.idleProbe = null;
+        }
+    }
+
+    /** Make a long-silent connection prove it is still there (issue #454). A
+     *  game host that dies without closing leaves the WebSocket looking healthy
+     *  — through a proxy the browser's leg really is — so nothing ever closes,
+     *  nothing reconnects, and the player's next command goes into the dead
+     *  socket. An `IAC NOP` costs the game nothing (telnet servers discard it),
+     *  but it puts bytes on every leg: a peer that has come back answers them
+     *  with a reset, one that is gone fails their retransmission, and either
+     *  way the socket errors and closes, which is the ordinary disconnect and
+     *  auto-reconnect path. It also keeps a NAT from forgetting a quiet flow.
+     *
+     *  This is the client's own check, for a direct `ws(s)://` endpoint or a
+     *  proxy without TCP keepalive. The bundled proxy keeps that watch on the
+     *  game socket itself (`proxy/gameSocket.ts`) and finds a dead peer in about
+     *  70 s — before this probe's first NOP, which would otherwise hold off its
+     *  keepalive by leaving data unacknowledged. */
+    private probeIdleConnection(): void {
+        const socket = this.socket;
+        if (!socket || socket.readyState !== WebSocket.OPEN || !this.gameEstablished) return;
+        const idle = performance.now() - this.lastInboundAt;
+        if (idle < IDLE_PROBE_MS) {
+            this.armIdleProbe(IDLE_PROBE_MS - idle);
+            return;
+        }
+        if (this.telnetSeen) {
+            try {
+                this.sendBytes(GMCP_IAC + TELNET_NOP);
+            } catch (error) {
+                console.error('Error sending idle probe:', error);
+            }
+        }
+        this.armIdleProbe(IDLE_PROBE_MS);
+    }
+
+    /** Raise the disconnect, then hand over the text the final flush left in
+     *  the message buffer. cTelnet raises sysDisconnectionEvent first and only
+     *  then is the unterminated last line printed and its triggers run — a
+     *  `"Server full, bye"` sent without a newline before the close still
+     *  reaches the screen, the buffer and the trigger engine, just after the
+     *  event. Before the notices `client.disconnected` posts, which follow it
+     *  on desktop too. */
+    private emitDisconnect(): void {
+        this.eventBus.emit('client.disconnect');
+        this.flushMessageBuffer();
+        this.eventBus.emit('client.disconnected');
     }
 
     /** Whether MSP is live on this connection (negotiated, not merely allowed
      *  by the profile config) — gates Mudlet's receiveMSP. */
+    isGmcpEnabled(): boolean {
+        return this.negotiator.isGmcpEnabled();
+    }
+
     isMspNegotiated(): boolean {
         return this.negotiator.isMspNegotiated();
     }
@@ -998,15 +1205,12 @@ export class MudClient {
      *  this hello, so without it GMCP effectively does nothing. Every server
      *  offer (IAC WILL GMCP) is answered with it, as Mudlet does: a server that
      *  turned GMCP off and on again — copyover, reboot — has dropped the module
-     *  list and would otherwise never send another packet. Mudlet sends nothing
-     *  on a server's IAC DO GMCP; Mudlet Web still announces there once per
-     *  connection, since a server that only ever asks would otherwise never
-     *  hear from us. Reports our own identity (see src/version.ts), matching
-     *  the TTYPE/MNES/MXP handshakes. */
-    private sendGmcpHandshake(offered: boolean): void {
-        if (!offered && this.gmcpHelloSent) return;
+     *  list and would otherwise never send another packet. A server's IAC DO
+     *  GMCP is answered with WILL alone, as Mudlet does — the handshake waits
+     *  for the server's own offer (mudlet-web#362). Reports our own identity
+     *  (see src/version.ts), matching the TTYPE/MNES/MXP handshakes. */
+    private sendGmcpHandshake(): void {
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
-        this.gmcpHelloSent = true;
         try {
             this.sendBytes(encodeGmcp('Core.Hello', {
                 client: CLIENT_NAME,
@@ -1027,7 +1231,7 @@ export class MudClient {
                 'Room 1',
                 'IRE.Rift 1',
                 'IRE.Composer 1',
-                'Client.Media 1',
+                'Client.Media 2',
                 'Char.Login 1',
             ]));
         } catch (error) {
@@ -1096,7 +1300,7 @@ export class MudClient {
             return false;
         }
         try {
-            this.sendBytes(encodeMsdp(variable, values));
+            this.sendBytes(encodeMsdp(variable, values, text => this.codec.encodeOutOfBand(text)));
             return true;
         } catch (error) {
             console.error('Error sending MSDP message:', error);
@@ -1107,8 +1311,11 @@ export class MudClient {
 
     /** Mudlet `sendATCP(message)`. Frames `IAC SB ATCP <message> IAC SE` (ATCP =
      *  telnet option 200, GMCP's predecessor) and sends it raw. Returns false
-     *  when the socket isn't open. */
+     *  when ATCP isn't negotiated or the socket isn't open. */
     sendATCP(message: string): boolean {
+        // Mudlet refuses unless the option is live (`isATCPEnabled`), so a
+        // send before negotiation or after the server's WONT goes nowhere.
+        if (!this.negotiator.isAtcpEnabled()) return false;
         // Transcoded to UTF-8 rather than to the session encoding — the same
         // divergence from Mudlet's `encodeAndCookBytes` that `encodeGmcpRaw`
         // documents, and for the same reason: ATCP bodies are GMCP-shaped. Without
@@ -1145,6 +1352,19 @@ export class MudClient {
         });
     }
 
+    /** An `IAC SB ATCP <message> IAC SE` body — Mudlet's ATCP branch of
+     *  `processTelnetCommand`. The message, decoded under the server encoding,
+     *  becomes one `atcp` table entry and event (`setATCPVariables`); an empty
+     *  one is ignored. `Auth.Request` is then answered with the hello. Like
+     *  desktop, neither depends on ATCP having been negotiated. */
+    private handleAtcpSubneg(subneg: string): void {
+        const body = subneg.slice(1);
+        if (body.length === 0) return;
+        const message = parseAtcpMessage(this.codec.decodeOutOfBand(body));
+        if (message) this.eventBus.emit('atcp', message);
+        if (body.startsWith('Auth.Request')) this.negotiator.sendAtcpHello();
+    }
+
     /** Frame an `IAC SB <opt> <payload> IAC SE` subnegotiation and send it.
      *  `payload` must already be a Latin-1 byte-string (each char → one byte)
      *  with any IAC handled — the framing is all this does, since ATCP and
@@ -1173,10 +1393,38 @@ export class MudClient {
 
     /** Mudlet `setServerEncoding(name)`. Switch the inbound decoder to `name`
      *  (any value from getServerEncodingsList()). Returns false — leaving the
-     *  current encoding untouched — when the name isn't one we can decode. */
+     *  current encoding untouched — when the name isn't one we can decode.
+     *
+     *  Asked for while a read's text is being decoded — by one of its
+     *  triggers — the switch waits for the next text to be decoded: TBuffer
+     *  reads cTelnet's encoding once, at the start of each translateToPlainText,
+     *  so the rest of the read keeps the encoding it arrived in. That next text
+     *  is the next read, or a feed the trigger makes of its own
+     *  ({@link adoptPendingEncoding}), which then applies to the rest of the
+     *  read as well. */
     setServerEncoding(name: string): boolean {
+        if (this.decodingRead) {
+            if (!normalizeCharsetName(String(name ?? ''))) return false;
+            this.pendingEncoding = String(name);
+            return true;
+        }
+        this.pendingEncoding = null;
         return this.charsetHandler.setServerEncoding(name);
     }
+
+    /** Apply a setServerEncoding() a trigger made part way through a read —
+     *  where TBuffer::translateToPlainText would next read the encoding. */
+    adoptPendingEncoding(): void {
+        const name = this.pendingEncoding;
+        if (name === null) return;
+        this.pendingEncoding = null;
+        this.charsetHandler.setServerEncoding(name);
+    }
+
+    /** True while a read's text is decoded and handed to its triggers. */
+    private decodingRead = false;
+    /** An encoding a trigger switched to while {@link decodingRead}. */
+    private pendingEncoding: string | null = null;
 
     /** Route an `IAC SB MSP ... IAC SE` body to the MSP parser and dispatch
      *  any parsed commands as `msp` events. Always runs when an MSP subneg
@@ -1197,6 +1445,18 @@ export class MudClient {
      *  The session calls this on every output-area resize. See TelnetNegotiator. */
     setWindowSize(cols: number, rows: number): void {
         this.negotiator.setWindowSize(cols, rows);
+    }
+
+    /** Report the main console's wrap column (Mudlet's `Host::mWrapAt`, 0 for
+     *  off), which caps the NAWS width and is the NEW-ENVIRON WORD_WRAP. */
+    setWrapAt(wrapAt: number): void {
+        this.negotiator.setWrapAt(wrapAt);
+    }
+
+    /** Report whether the main console draws its timestamp gutter, which comes
+     *  off the NAWS width as on desktop. */
+    setTimestampsShown(shown: boolean): void {
+        this.negotiator.setTimestampsShown(shown);
     }
 
     /** Mudlet `sendSocket(data)`. Sends literal bytes over the socket with no
@@ -1242,10 +1502,159 @@ export class MudClient {
         // processSocketData (cTelnet::loopbackTest), so negotiation is answered
         // exactly as the socket's would be — the replies go nowhere while
         // unconnected, which sendRaw()'s readyState guard already ensures.
-        data = this.subnegRepair.process(data);
-        this.negotiator.processFrame(data);
-        this.echoHandler.processData(data);
-        this.processIncomingData(data);
+        // That includes MCCP: desktop's loopbackTest() runs injected bytes
+        // through the same decompression as a socket read, so a script can
+        // switch a profile to a compressed stream and back.
+        // Queued socket reads arrived first, so they go first — unless this
+        // is a trigger in the middle of one, where the injected bytes are
+        // handled on the spot, as they always were.
+        this.drainInbound();
+        this.ingest(data);
+    }
+
+    /** A chunk of a replay. A replay holds what the game sent after
+     *  decompression, and desktop plays it back through a parser of its own
+     *  (cTelnet::slot_processReplayChunk) that knows nothing of MCCP, so
+     *  unlike {@link feedTelnet} this skips it. */
+    feedReplay(data: string): void {
+        this.drainInbound();
+        this.processIncomingData(this.subnegRepair.process(data));
+    }
+
+    /** One read from the game, or bytes injected as if they were one: split
+     *  where compression starts or ends, and each piece run through the
+     *  pipeline on its own. Desktop processes the plain text before an MCCP
+     *  start (gotRest) before it inflates anything, and the inflated text
+     *  before what follows the end of the stream, so a trigger on the last
+     *  line of one part never sees GMCP from the next (mudlet-web#384). The
+     *  MCCP warnings desktop posts while inflating land between the pieces,
+     *  where it posts them. Synchronous: the whole read is through when this
+     *  returns. Socket reads go through {@link pumpInbound} instead. */
+    private ingest(decodedData: string, receivedAt?: number): void {
+        this.runInbound([{ kind: 'read', data: decodedData, receivedAt }], false);
+    }
+
+    // ── Inbound queue ─────────────────────────────────────────────────────────
+    // A flood can arrive as one large read — thousands of lines once MCCP has
+    // inflated it — and every line runs every trigger, so handling a read in
+    // one go held the page (input, timers, painting) for seconds (#435).
+    // Socket reads are queued here instead and run in slices: a few dozen
+    // lines at a time, giving the event loop a turn once a slice has taken
+    // INBOUND_READ_BUDGET_MS (INBOUND_SLICE_BUDGET_MS with input waiting).
+    // Nothing changes order — the queue is the one way in, so lines,
+    // prompts, GMCP and what triggers send stay exactly in stream order —
+    // and a pause only ever falls between whole lines, with no partial line,
+    // held wrap line or half a telnet sequence pending: a point a read could
+    // have ended at anyway, so what runs in a pause is only what could run
+    // between two reads. Anything that has to see the stream up to date
+    // (close, disconnect, connect, feedTelnet, a replay) drains the queue
+    // first. A read of no more than INBOUND_SLICE_LINES lines — any ordinary
+    // one — is still handled whole before onmessage returns.
+    private readonly inbound: InboundItem[] = [];
+    /** A slice is running: a drain from inside one (a trigger calling
+     *  disconnect(), say) leaves the rest of the read to the slices. */
+    private inboundRunning = false;
+    private inboundScheduled = false;
+
+    /** Run a slice of the queued socket reads, and book the next if any are
+     *  left. */
+    private pumpInbound(): void {
+        if (this.inboundRunning) return;
+        this.inboundRunning = true;
+        let done = true;
+        try {
+            done = this.runInbound(this.inbound, true);
+        } finally {
+            this.inboundRunning = false;
+        }
+        if (!done && !this.inboundScheduled) {
+            this.inboundScheduled = true;
+            yieldToEventLoop(() => {
+                this.inboundScheduled = false;
+                try {
+                    this.pumpInbound();
+                } catch (error) {
+                    console.error('Error processing incoming message:', error);
+                }
+            });
+        }
+    }
+
+    /** Run every queued socket read now, unless a slice is already running. */
+    private drainInbound(): void {
+        if (this.inboundRunning || this.inbound.length === 0) return;
+        this.inboundRunning = true;
+        try {
+            this.runInbound(this.inbound, false);
+        } finally {
+            this.inboundRunning = false;
+        }
+    }
+
+    /** Forget the queued reads not yet begun, when a trigger in a slice lets
+     *  go of the socket: their onmessage would have found its handler gone.
+     *  The rest of the read the trigger is in carries on, as it always has. */
+    private dropQueuedReads(): void {
+        for (let i = this.inbound.length - 1; i >= 0; i--) {
+            if (this.inbound[i].kind === 'read') this.inbound.splice(i, 1);
+        }
+    }
+
+    /** Take reads off the head of `queue` and through the pipeline. In a
+     *  `slice`, text goes in INBOUND_SLICE_LINES lines at a time, and this
+     *  returns false — the rest still queued — once the slice's time is up
+     *  and the stream is at a clean break. */
+    private runInbound(queue: InboundItem[], slice: boolean): boolean {
+        const started = slice ? performance.now() : 0;
+        while (queue.length > 0) {
+            const item = queue[0];
+            if (item.kind === 'read') {
+                queue.shift();
+                const pieces = this.mccpHandler.processPieces(item.data);
+                // A read that yields no text still goes through, as one empty piece.
+                if (!pieces.some(piece => typeof piece === 'string')) pieces.push('');
+                const split = pieces.length !== 1 || pieces[0] !== item.data;
+                queue.unshift(...pieces.map((piece): InboundItem => typeof piece === 'string'
+                    ? { kind: 'piece', data: piece, receivedAt: item.receivedAt, original: item.data, split }
+                    : { kind: 'notice', notice: piece.notice }));
+                continue;
+            }
+            if (item.kind === 'notice') {
+                queue.shift();
+                this.eventBus.emit('client.warning', item.notice);
+                continue;
+            }
+            if (item.kind === 'piece') {
+                const data = this.subnegRepair.process(item.data);
+                if (debugTelnetEnabled() && (item.split || data !== item.original)) {
+                    logTelnetNegotiation('post-mccp', data);
+                }
+                if (item.receivedAt !== undefined) this.eventBus.emit('socket.incoming', data);
+                queue[0] = { kind: 'text', data, receivedAt: item.receivedAt };
+                continue;
+            }
+            let chunk = item.data;
+            const cut = slice ? afterLines(chunk, INBOUND_SLICE_LINES) : chunk.length;
+            if (cut < chunk.length) {
+                // Only the first slice of a piece stops the latency clock: a
+                // later one may come after a command the first one's triggers
+                // sent.
+                queue[0] = { kind: 'text', data: chunk.substring(cut) };
+                chunk = chunk.substring(0, cut);
+            } else {
+                queue.shift();
+            }
+            try {
+                this.processIncomingData(chunk, undefined, item.receivedAt);
+            } catch (processingError) {
+                console.error('Error during data processing:', processingError);
+            }
+            if (slice && queue.length > 0 && this.pendingTelnet === '' && this.assembler.idle
+                && inboundSliceDue(performance.now() - started)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     output(text?: string | AnsiAwareBuffer, type?: string, timestamp?: number): void {
@@ -1292,10 +1701,52 @@ export class MudClient {
         if (start < processable.length) this.processSegment(processable.substring(start), false, ts);
     }
 
-    /** Strip, decode and assemble one run of a frame. `hasPrompt` means the run
-     *  ends in an IAC GA/EOR. */
+    /** Negotiate, strip, decode and assemble one run of a frame. `hasPrompt`
+     *  means the run ends in an IAC GA/EOR. */
     private processSegment(processable: string, hasPrompt: boolean, ts: number): void {
-        const sanitized = stripTelnetSequences(processable, this.telnetOptionHandler).replace(/\r/g, '');
+        this.adoptPendingEncoding();
+        // Option negotiation is applied run by run, not for the whole frame up
+        // front: desktop handles the text up to each GA before the commands
+        // that follow it, so a WILL GMCP or WILL ECHO after a prompt must not
+        // be in effect while that prompt's triggers run (mudlet-web#384).
+        // The run holds only complete sequences — processIncomingData keeps an
+        // unfinished one back for the next frame.
+        this.negotiator.processFrame(processable);
+        this.echoHandler.processData(processable);
+        // A subnegotiation's handler — a CHARSET request, or a script's own
+        // for GMCP — can change the encoding mid-run. The text ahead of it was
+        // sent in the old encoding, so cTelnet::postHeldDataBeforeEncodingChange
+        // posts it before the change: the codec calls back here, and it is
+        // decoded and shown before the switch drops whatever it left held.
+        const textAhead: TextAheadSlot = { take: null };
+        let promptStartPosted = false;
+        // A trigger on the posted text may feed a run of its own.
+        const outerHook = this.codec.onBeforeEncodingChange;
+        this.codec.onBeforeEncodingChange = () => {
+            if (!textAhead.take) return;
+            let ahead = textAhead.take().replace(/\r/g, '');
+            if (ahead.length === 0) return;
+            // It may open a prompt, whose leading line feed the GA can then no
+            // longer see — so the fix-up is applied to it here instead, and
+            // not again at the GA.
+            const stripped = this.assembler.stripPostedPromptStart(ahead);
+            if (stripped !== null) {
+                ahead = stripped;
+                promptStartPosted = true;
+            }
+            this.decodeAndAssemble(ahead, false, ts);
+            this.flushMessageBuffer();
+        };
+        let sanitized: string;
+        try {
+            sanitized = stripTelnetSequences(processable, this.telnetOptionHandler, textAhead).replace(/\r/g, '');
+        } finally {
+            this.codec.onBeforeEncodingChange = outerHook;
+        }
+        // `fixUnnecessaryLinebreaks` works on the whole run, before it is
+        // decoded or split, because desktop decides it on the raw block at the
+        // GA — a run with no marker after it is never touched.
+        if (hasPrompt && !promptStartPosted) sanitized = this.assembler.stripPromptBlockNewline(sanitized);
         if (hasPrompt && debugGaEnabled()) {
             const marker = processable.endsWith(TELNET_GA) ? 'GA' : 'EOR';
             // eslint-disable-next-line no-console
@@ -1306,8 +1757,9 @@ export class MudClient {
         }
 
         // A trigger fires while its packet is still being decoded, and one that
-        // calls setServerEncoding() has to change how the REST of that packet
-        // reads, as it does in Mudlet (TBuffer settles the decoder per line).
+        // calls setServerEncoding() and then feeds a line of its own changes how
+        // the REST of that packet reads, as it does in Mudlet (the feed's
+        // translateToPlainText settles the decoder the outer read goes on with).
         // Triggers only run when the message buffer is flushed, so the packet is
         // decoded and flushed a line at a time up to the last byte an encoding
         // could read differently. Everything past that is ASCII, which every
@@ -1315,14 +1767,24 @@ export class MudClient {
         // ASCII tail of any other — still goes through in one piece.
         let lastHighByte = sanitized.length - 1;
         while (lastHighByte >= 0 && sanitized.charCodeAt(lastHighByte) < 0x80) lastHighByte--;
-        let start = 0;
-        for (let nl = sanitized.indexOf('\n'); nl !== -1 && nl < lastHighByte; nl = sanitized.indexOf('\n', start)) {
-            this.decodeAndAssemble(sanitized.substring(start, nl + 1), false, ts);
-            this.flushMessageBuffer();
-            start = nl + 1;
+        // What a trigger feeds in while this run is shown is a read of its own,
+        // not the continuation of this one's MXP mode switch.
+        const outerDecoding = this.decodingRead;
+        this.decodingRead = true;
+        try {
+            this.negotiator.keepingMxpDetectionTail(() => {
+                let start = 0;
+                for (let nl = sanitized.indexOf('\n'); nl !== -1 && nl < lastHighByte; nl = sanitized.indexOf('\n', start)) {
+                    this.decodeAndAssemble(sanitized.substring(start, nl + 1), false, ts);
+                    this.flushMessageBuffer();
+                    start = nl + 1;
+                }
+                this.decodeAndAssemble(start === 0 ? sanitized : sanitized.substring(start), hasPrompt, ts);
+                this.flushMessageBuffer();
+            });
+        } finally {
+            this.decodingRead = outerDecoding;
         }
-        this.decodeAndAssemble(start === 0 ? sanitized : sanitized.substring(start), hasPrompt, ts);
-        this.flushMessageBuffer();
     }
 
     private decodeAndAssemble(sanitized: string, hasPrompt: boolean, ts: number): void {
@@ -1377,6 +1839,14 @@ export class MudClient {
  *  greet — but bounded, because on some proxies a rejected certificate produces
  *  no error and no close at all, so silence is the only symptom there is. */
 const TLS_HANDSHAKE_TIMEOUT_MS = 12_000;
+
+/** How long the game may stay silent before the client probes the connection
+ *  with an `IAC NOP` (and again each time as long again passes). Past the
+ *  ~70 s the bundled proxy's keepalive takes, so the two don't overlap. */
+export const IDLE_PROBE_MS = 120_000;
+
+/** Telnet NOP (RFC 854). */
+const TELNET_NOP = '\xf1';
 
 /** How long ECHO+SGA must survive a submitted input line before it counts as
  *  character-at-a-time rather than a password mask — `cTelnet`'s
@@ -1436,7 +1906,7 @@ export function formatCloseError(event: CloseEvent, wasOpened: boolean, viaProxy
 }
 
 /**
- * Walk one frame's telnet stream the way the strip regex (TELNET_OPTION_REGEX)
+ * Walk one frame's telnet stream the way stripTelnetSequences
  * will consume it and report two things:
  *
  * - `complete`: where an unfinished telnet sequence starts at the end of the
@@ -1465,7 +1935,7 @@ function scanTelnetFrame(data: string): { complete: number; markers: number[] } 
         const cmd = data.charCodeAt(i + 1);
         let next: number;
         if (cmd === SB) {
-            // Same terminator the regex's lazy SB branch stops at.
+            // Same terminator stripTelnetSequences stops at.
             const se = data.indexOf('\xFF\xF0', i + 2);
             if (se === -1) return { complete: i, markers };
             next = se + 2;

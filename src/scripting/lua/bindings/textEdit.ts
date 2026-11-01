@@ -62,17 +62,28 @@ export function installTextEditBindings({ lua, api, channel, emitEvent }: Bindin
     });
     // Mudlet `copy([window])`. Copies the current selection (with formatting)
     // into the session clipboard for paste()/appendBuffer().
-    lua.global.set('copy', (name?: unknown) =>
-        api.copy(typeof name === 'string' ? name : undefined));
-    // Mudlet `cut()`. copy() plus the deletion of what was copied. No window
-    // argument in Mudlet — it only ever acts on the main console.
-    lua.global.set('cut', () => api.cut());
+    lua.global.set('copy', (name?: unknown) => {
+        api.copy(typeof name === 'string' ? name : undefined);
+    });
+    // Mudlet `cut([window])`. copy() plus the deletion of what was copied.
+    // Anything but a string still means the main console, as cut() long
+    // ignored its arguments; Bridge.lua answers the refusal for a name that
+    // finds no console.
+    lua.global.set('cut', (name?: unknown) => api.cut(typeof name === 'string' ? name : undefined));
+    // One string, as Bridge.lua only searches the code for the functions it calls.
+    lua.global.set('__clipboardLinkCommands', () => api.clipboardLinkCommands().join('\n'));
+    // The link commands a console's lines hold, and which of a list of them
+    // any console still shows — newline-joined, for the same reason.
+    lua.global.set('__consoleLinkCommands', (name?: unknown) =>
+        api.consoleLinkCommands(typeof name === 'string' ? name : undefined).join('\n'));
+    lua.global.set('__linkCommandsShown', (commands: unknown) =>
+        api.linkCommandsShown(String(commands ?? '').split('\n').filter(Boolean)).join('\n'));
     // Mudlet `paste([window])`. Pastes the clipboard at the cursor (or
     // appends at the end when the cursor is on the last line).
     lua.global.set('paste', (name?: unknown) =>
         api.paste(typeof name === 'string' ? name : undefined));
-    // Mudlet `appendBuffer([window])`. Appends the copied rich text as a new
-    // line to the named window/buffer (defaults to main).
+    // Mudlet `appendBuffer([window])`. Writes the copied rich text onto the end
+    // of the named window/buffer's last line and ends it (defaults to main).
     lua.global.set('appendBuffer', (name?: unknown) =>
         api.appendBuffer(typeof name === 'string' ? name : undefined));
     // createMapper has two calling conventions:
@@ -93,12 +104,15 @@ export function installTextEditBindings({ lua, api, channel, emitEvent }: Bindin
     lua.global.set('clearWindow',  (name?: string) => api.clearWindow(name));
     // hide/show/move/resize work on both labels and userwindows. Labels take
     // precedence: name uniqueness is shared across them, but createLabel can
-    // race with openUserWindow under the same string.
+    // race with openUserWindow under the same string. A scroll box, command
+    // line and text edit can share one name, which reaches them in the order
+    // windowType() names them.
     lua.global.set('hideWindow', (name: string) => {
         if (api.labels.has(name)) api.labels.hide(name);
+        else if (api.scrollBoxes.has(name)) api.scrollBoxes.hide(name);
         else if (api.cmdLines.has(name)) api.cmdLines.hide(name);
         else if (api.textEdits.has(name)) api.textEdits.hide(name);
-        else if (api.scrollBoxes.has(name)) api.scrollBoxes.hide(name);
+        else if (api.isBuffer(name)) api.setBufferVisible(name, false);
         else api.windows.hide(name);
     });
     // Mudlet showWindow(name) → bool. Returns true when the named label,
@@ -107,9 +121,11 @@ export function installTextEditBindings({ lua, api, channel, emitEvent }: Bindin
     lua.global.set('showWindow', (name: string) => {
         if (typeof name !== 'string' || !name) return false;
         if (api.labels.has(name)) return api.labels.show(name);
+        if (api.scrollBoxes.has(name)) return api.scrollBoxes.show(name);
         if (api.cmdLines.has(name)) return api.cmdLines.show(name);
         if (api.textEdits.has(name)) return api.textEdits.show(name);
-        if (api.scrollBoxes.has(name)) return api.scrollBoxes.show(name);
+        // A createBuffer buffer is a console desktop finds by name, too.
+        if (api.isBuffer(name)) return api.setBufferVisible(name, true);
         return api.windows.show(name);
     });
     // Geometry crosses into Mudlet as C++ ints, so a fractional pixel is
@@ -122,18 +138,31 @@ export function installTextEditBindings({ lua, api, channel, emitEvent }: Bindin
     lua.global.set('moveWindow', (name: string, x: unknown, y: unknown) => {
         const xn = px(x), yn = px(y);
         if (api.labels.has(name)) api.labels.move(name, xn, yn);
+        else if (api.scrollBoxes.has(name)) api.scrollBoxes.move(name, xn, yn);
         else if (api.cmdLines.has(name)) api.cmdLines.move(name, xn, yn);
         else if (api.textEdits.has(name)) api.textEdits.move(name, xn, yn);
-        else if (api.scrollBoxes.has(name)) api.scrollBoxes.move(name, xn, yn);
-        else if (api.windows.has(name)) api.windows.move(name, xn, yn);
+        else if (api.isBuffer(name)) api.moveBuffer(name, xn, yn);
+        else if (api.windows.has(name)) {
+            api.windows.floatForGeometryChange(name);
+            api.windows.move(name, xn, yn);
+        }
     });
     lua.global.set('resizeWindow', (name: string, w: unknown, h: unknown) => {
         const wn = px(w), hn = px(h);
         if (api.labels.has(name)) api.labels.resize(name, wn, hn);
+        else if (api.scrollBoxes.has(name)) api.scrollBoxes.resize(name, wn, hn);
         else if (api.cmdLines.has(name)) api.cmdLines.resize(name, wn, hn);
         else if (api.textEdits.has(name)) api.textEdits.resize(name, wn, hn);
-        else if (api.scrollBoxes.has(name)) api.scrollBoxes.resize(name, wn, hn);
-        else if (api.windows.has(name)) api.windows.resize(name, wn, hn);
+        else if (api.isBuffer(name)) api.resizeBuffer(name, wn, hn);
+        else if (api.windows.has(name)) {
+            api.windows.floatForGeometryChange(name);
+            api.windows.resize(name, wn, hn);
+            // The size it settles at is owed a sysUserWindowResizeEvent, which
+            // the panel's ResizeObserver would only report on a later turn —
+            // one a script blocking the event loop never lets come. Queued the
+            // way a new window's first report is.
+            api.windows.announceCreatedSize(name);
+        }
     });
     // Window state getters. Each returns null for "no such widget" so the
     // Bridge.lua wrapper can build Mudlet's (nil, errMsg) pair; geometry comes
@@ -149,7 +178,8 @@ export function installTextEditBindings({ lua, api, channel, emitEvent }: Bindin
     });
     lua.global.set('__getLabelText', (name: unknown) =>
         (typeof name === 'string' ? api.getLabelText(name) : null));
-    // Mudlet setWindow(windowName, name[, x, y, show]) → bool. Reparents a
+    // Mudlet setWindow(windowName, name[, x, y, show]) → bool, or the refusal
+    // message for a parent cycle (Bridge.lua makes it (nil, msg)). Reparents a
     // label / cmdline / scroll box / miniconsole into another window
     // ('main', a userwindow, or a scroll box). Geyser's setContainerWindow
     // and GUIUtils' setGaugeWindow drive this.
@@ -198,30 +228,31 @@ export function installTextEditBindings({ lua, api, channel, emitEvent }: Bindin
     // {0, 0, 0, 255} when no override is set).
     lua.global.set('__getBackgroundColor', (name?: unknown) => {
         const win = typeof name === 'string' && name && name !== 'main' ? name : undefined;
-        if (win && !api.labels.has(win) && !api.windows.has(win)) {
+        if (win && !api.labels.has(win) && !api.windows.has(win) && !api.isBuffer(win)) {
             return null;
         }
         const c = api.getBackgroundColor(win) ?? { r: 0, g: 0, b: 0, a: 255 };
         return [c.r, c.g, c.b, c.a];
     });
 
-    // Mudlet `setBackgroundImage` — overloaded across labels, miniconsoles,
-    // userwindows, and the main window. The GUIUtils.lua wrapper has
-    // already coerced any string mode ("center", "tile", …) into a number
-    // by the time this binding fires, so the second/third arg's runtime
-    // type is enough to disambiguate. All overload routing lives in
-    // ScriptingAPI.setBackgroundImage — keep the binding thin so the
-    // C++/Lua overload set stays in one place.
-    lua.global.set('setBackgroundImage', (a: unknown, b?: unknown, c?: unknown) => {
+    // Mudlet `setBackgroundImage([name,] path [, mode [, fullWindow]])` —
+    // overloaded across labels, miniconsoles, userwindows, and the main
+    // window. The GUIUtils.lua wrapper has already coerced any string mode
+    // ("center", "tile", …) into a number by the time this binding fires.
+    // As TLuaInterpreter::setBackgroundImage, a string second argument means
+    // the first is a name; otherwise the first is the path and what follows
+    // is the mode and the flag, for the main console. A refusal comes back
+    // as desktop's message, which Bridge.lua shapes into (nil, errMsg).
+    lua.global.set('setBackgroundImage', (a: unknown, b?: unknown, c?: unknown, d?: unknown) => {
         if (typeof a !== 'string') return false;
-        if (b === undefined) return api.setBackgroundImage(a);
-        if (c === undefined) {
-            if (typeof b === 'number') return api.setBackgroundImage(a, b);
-            if (typeof b === 'string') return api.setBackgroundImage(a, b);
-            return false;
-        }
-        if (typeof b !== 'string') return false;
-        return api.setBackgroundImage(a, b, Number(c));
+        const named = typeof b === 'string';
+        const mode = named ? c : b;
+        return api.setBackgroundImage(
+            named ? a : 'main',
+            named ? b : a,
+            mode === undefined ? undefined : Number(mode),
+            (named ? d : c) === true,
+        );
     });
 
     // Mudlet `resetBackgroundImage([windowName] [, fullWindow])`. No name →

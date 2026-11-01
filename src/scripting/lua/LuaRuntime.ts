@@ -1,38 +1,49 @@
 import {Lua, LuaReturn, LuaType, LUA_GLOBALSINDEX, LUA_REGISTRYINDEX, LuaThread} from 'wasmoon-lua5.1';
+
+// lauxlib's sentinels: luaL_ref's answer for nil, and "no reference" (which
+// luaL_unref ignores).
+const LUA_REFNIL = -1;
+const LUA_NOREF = -2;
 // Self-host the Lua interpreter WASM as a build asset. Without this, wasmoon
 // fetches liblua5.1.wasm from unpkg.com at runtime (its hardcoded default) —
 // a third-party supply-chain + availability risk for the executable that runs
 // all Lua scripting. The `?url` import makes Vite copy it into the bundle and
 // hand back a base-aware same-origin URL we pass as `customWasmUri` below.
 import luaWasmUrl from 'wasmoon-lua5.1/dist/liblua5.1.wasm?url';
-import {unzipSync, strFromU8} from 'fflate';
-import type {IScriptingRuntime, CaptureSpan, LuaGlobalEntry, VariableEdit} from '../IScriptingRuntime';
+import {strFromU8} from 'fflate';
+import type {IScriptingRuntime, CaptureSpan, LuaGlobalEntry, ScriptHandlerEntry, VariableEdit} from '../IScriptingRuntime';
 import type {ScriptingAPI} from '../ScriptingAPI';
 import type {ProfileVFS} from '../vfs/ProfileVFS';
 import {describeFsError} from '../vfs/fsErrors';
 import UTF8 from './utf8.lua?raw';
-import {findLuaPattern} from './utf8Patterns';
+import {findLuaPattern, findLuaPatternBytes, luaClassMatches} from './utf8Patterns';
 import {utf8CaseMap} from './utf8CaseMap';
-import {armor, unarmor} from './byteArmor';
+import {armor, LuaBytes, unarmor} from './byteArmor';
 import VFS_LUA from './VFS.lua?raw';
 import LUAGLOBAL from './LuaGlobal.lua?raw';
 import BRIDGE_LUA from './Bridge.lua?raw';
+import { buildArgContractLua } from './argContracts';
 import EXEC_LUA from './Exec.lua?raw';
+import WIDE_INTEGERS_LUA from './WideIntegers.lua?raw';
 import LUA_GLOBAL_SETUP from './LuaGlobalSetup.lua?raw';
 import LUASQL_LUA from './Luasql.lua?raw';
-import {encodeRowsToLuaSource} from './sqlRowEncoder';
+import {encodeLuaBytes, encodeRowToLuaSource} from './sqlRowEncoder';
 import YAJL_LUA from './Yajl.lua?raw';
+import LPEG_REGISTER_LUA from './Lpeg.lua?raw';
 import {setupRex} from './rex';
-import {setupYajl, type LuaValueTransform} from './yajl';
+import {setupYajl, type YajlBridge} from './yajl';
 import {parseImageSize} from './imageSize';
 import {parseQColor} from '../../ui/labels/qColor';
 import {isQtResourcePath, qtResourceBytes} from '../../assets/qt-resources';
-import {getSqliteClient, sqliteReady} from '../../db/sqliteClient';
+import {getSqliteClient, sqliteReady, type FileHost} from '../../db/sqliteClient';
 import {QT_CURSOR_NAME_TO_INT, QT_CURSOR_TO_CSS} from '../../ui/labels/cursorShapes';
-import {qtKeyToDomCode, qtModifiersToList, domCodeToQtKey, listToQtModifiers} from '../../mud/keybindings/qtKeys';
+import {qtKeyToDomCode, qtModifiersToList, domCodeToQtKey} from '../../mud/keybindings/qtKeys';
+import {permKeyCode} from '../../mud/keybindings/KeyEngine';
 import xterm256 from '../../mud/text/xterm256';
+import {getAnsi16Palette, onAnsiPaletteChange} from '../../mud/text/colors';
+import {cechoFastPaletteLua} from '../../mud/text/colorParsers';
 import {HttpService} from '../http/HttpService';
-import {normalizeUserUrl, userUrlInvalidReason} from '../http/userUrl';
+import {normalizeUserUrl, userUrlRefusal} from '../http/userUrl';
 import {TtsManager} from '../../ui/tts/TtsManager';
 import {GlobalEventChannel} from '../GlobalEventChannel';
 import {type MudletVariable, normalizeVariableTree} from '../../import/mudletVariables';
@@ -52,6 +63,8 @@ import {installSessionBindings} from './bindings/session';
 import {installUserWindowBindings} from './bindings/userWindows';
 import {MAPPER_WIDGET_ID} from '../../ui/windows/types';
 import {describeThrown} from '../../utils/describeThrown';
+import {installDesktopUtf8Read, installWellFormedPush} from './wellFormedStrings';
+import {readZipEntries, resolveLinkedDirectory, zipEntryComponents, zipExtractionProblem, type ZipEntry} from '../../import/zipEntries';
 
 // wasmoon doesn't re-export its opaque lua_State pointer type; derive it from
 // the public API so the raw lua_* bindings (see pushJsValue / registerRawGlobal)
@@ -73,9 +86,8 @@ interface ParkedDialogThread {
 
 // The globals one dispatch sets for the scripts it runs, and so the ones an
 // alias pass a script asked for has to hand back when it returns — see
-// LuaRuntime.pushNestedDispatchState. `namedCaptures` is on the list because
-// setMatches writes it alongside the other two; Mudlet has no such global and
-// parks only the three it does have.
+// LuaRuntime.pushNestedDispatchState. The three Mudlet parks; named groups
+// live only in `matches`, as on desktop, which has no `namedCaptures` global.
 // wasmoon pushes every integral JS number with lua_pushinteger, and lua_Integer
 // is 32 bits in this wasm build, so a whole number past int32 reached Lua as the
 // wraparound: a map zoom of 1e40 read back as 0, an elapsed time of 1e12 as
@@ -157,7 +169,7 @@ interface ParkedDialogThread {
     };
 }
 
-const NESTED_DISPATCH_GLOBALS = ['matches', 'multimatches', 'namedCaptures', 'command'] as const;
+const NESTED_DISPATCH_GLOBALS = ['matches', 'multimatches', 'command'] as const;
 
 // All *.lua and *.json files under mudlet-lua/ are served via the VFS at
 // /lua/<relative-path>. Adding a new file to the directory tree automatically
@@ -199,7 +211,14 @@ const SPEC_TEXT_FIXTURES = BUSTED_ENABLED
     ? (import.meta.glob('./specs/fixtures/**/*.{xml,lua,json,txt}', { query: '?raw', import: 'default', eager: true }) as Record<string, string>)
     : {};
 const SPEC_BINARY_FIXTURES = BUSTED_ENABLED
-    ? (import.meta.glob('./specs/fixtures/**/*.{mpackage,zip}', { query: '?inline', import: 'default', eager: true }) as Record<string, string>)
+    ? (import.meta.glob('./specs/fixtures/**/*.{mpackage,zip,png,dat}', { query: '?inline', import: 'default', eager: true }) as Record<string, string>)
+    : {};
+// The packages desktop compiles into its binary, which specs install by their
+// Qt resource path (`:/packages/<dir>/<file>.mpackage`) — the tutorial and
+// MedBootstrap, which no profile here gets by default. Busted builds only: the
+// app bundles just the archives defaultPackages.ts installs.
+const QT_PACKAGE_ARCHIVES = BUSTED_ENABLED
+    ? (import.meta.glob('../../import/defaults/*/*.mpackage', { query: '?inline', import: 'default', eager: true }) as Record<string, string>)
     : {};
 
 // VFS spec paths the busted runner can target (e.g. /lua/specs/StringUtils_spec.lua).
@@ -223,6 +242,76 @@ const bustedSpecVfsPaths = (): string[] =>
  * table is walked on the Lua side now (see `__mudlet_headers_to_string`), where
  * it is an ordinary `pairs` loop.
  */
+/**
+ * liolib's read("*n"): `fscanf(f, "%lf")` as glibc does it, over a file body
+ * held as a byte-string from `start`. Leading white space and a sign, then
+ * "inf"/"infinity", "nan", a hex float ("0x1F", "0x1.8p1") or a decimal one
+ * (".5", "5.", "1e5"). What it read stays read, failing or not, except the one
+ * character scanf pushes back; `value` is null when nothing converted.
+ */
+function scanNumber(text: string, start: number): { value: number | null; end: number } {
+    let i = start;
+    const at = (k: number) => text.charAt(k);
+    const isDigit = (c: string) => c >= '0' && c <= '9';
+    const isHex = (c: string) => /^[0-9a-fA-F]$/.test(c);
+    while (/^[ \t\n\v\f\r]$/.test(at(i))) i++;
+    let sign = 1;
+    if (at(i) === '+' || at(i) === '-') { if (at(i) === '-') sign = -1; i++; }
+    const word = (w: string): boolean => text.substring(i, i + w.length).toLowerCase() === w;
+    if (word('inf')) {
+        i += 3;
+        if (word('inity')) i += 5;
+        return { value: sign * Infinity, end: i };
+    }
+    if (word('nan')) {
+        i += 3;
+        const paren = /^\([0-9A-Za-z_]*\)/.exec(text.substring(i));
+        if (paren) i += paren[0].length;
+        return { value: NaN, end: i };
+    }
+    if (at(i) === '0' && (at(i + 1) === 'x' || at(i + 1) === 'X')) {
+        i += 2;
+        let mant = 0;
+        let exp = 0;
+        let digits = 0;
+        while (isHex(at(i))) { mant = mant * 16 + parseInt(at(i), 16); i++; digits++; }
+        if (at(i) === '.') {
+            i++;
+            while (isHex(at(i))) { mant = mant * 16 + parseInt(at(i), 16); exp -= 4; i++; digits++; }
+        }
+        if (digits > 0 && (at(i) === 'p' || at(i) === 'P')) {
+            let j = i + 1;
+            let esign = 1;
+            if (at(j) === '+' || at(j) === '-') { if (at(j) === '-') esign = -1; j++; }
+            let e = 0;
+            let edigits = 0;
+            while (isDigit(at(j))) { e = e * 10 + Number(at(j)); j++; edigits++; }
+            i = j;
+            if (edigits > 0) exp += esign * e;
+        }
+        return { value: sign * mant * Math.pow(2, exp), end: i };
+    }
+    const numStart = i;
+    let digits = 0;
+    while (isDigit(at(i))) { i++; digits++; }
+    if (at(i) === '.') {
+        i++;
+        while (isDigit(at(i))) { i++; digits++; }
+    }
+    if (digits === 0) return { value: null, end: i };
+    let mantEnd = i;
+    if (at(i) === 'e' || at(i) === 'E') {
+        let j = i + 1;
+        if (at(j) === '+' || at(j) === '-') j++;
+        if (isDigit(at(j))) {
+            while (isDigit(at(j))) j++;
+            mantEnd = j;
+        }
+        i = j;
+    }
+    return { value: sign * parseFloat(text.substring(numStart, mantEnd)), end: i };
+}
+
 function luaTableToHeaders(h: unknown): Record<string, string> | undefined {
     if (typeof h !== 'string' || !h) return undefined;
     const parts = h.split('');
@@ -275,8 +364,25 @@ function bytesToImageDataUrl(bytes: Uint8Array, path: string): string {
 // can't represent a table with both. `__mudlet_var_payload` is the descriptor
 // array (set from JS); iterated with pairs() so the 0-indexed table wasmoon makes
 // from a JS array doesn't matter.
+//
+// A number is read the way desktop reads it back, whichever C library wrote it:
+// trimmed and in any case, every spelling of NaN there is ("-nan", "nan(ind)",
+// msvcrt's "1.#IND"/"1.#QNAN"/"1.#SNAN") is NaN and "inf"/"1.#INF" infinity,
+// signed. Other text is 0, as QString::toDouble() gives — not a missing value.
+// A NaN key is dropped: Lua cannot index a table with one.
 const RESTORE_VARS_LUA = `
 local payload = __mudlet_var_payload
+local function savedNumber(text)
+  local s = tostring(text or ''):match('^%s*(.-)%s*$'):lower()
+  local sign, body = s:match('^([+-]?)(.*)$')
+  if body == 'inf' or body == 'infinity' or body == '1.#inf' then
+    return sign == '-' and -math.huge or math.huge
+  end
+  if body == 'nan' or body:match('^nan%(%w*%)$') or body == '1.#ind' or body == '1.#qnan' or body == '1.#snan' then
+    return 0 / 0
+  end
+  return tonumber(s) or 0
+end
 local function build(d)
   local vt = d.valueType
   if vt == 'table' then
@@ -285,15 +391,16 @@ local function build(d)
     if kids then
       for _, c in pairs(kids) do
         local key = c.name
-        if c.keyKind == 'number' then key = tonumber(key) end
-        t[key] = build(c)
+        if c.keyKind == 'number' then key = savedNumber(key)
+        elseif c.keyKind == 'boolean' then key = (key == 'true') end
+        if key ~= nil and key == key then t[key] = build(c) end
       end
     end
     return t
   elseif vt == 'boolean' then
     return d.value == 'true'
   elseif vt == 'number' then
-    return tonumber(d.value)
+    return savedNumber(d.value)
   else
     return d.value
   end
@@ -312,8 +419,25 @@ __mudlet_var_payload = nil
 // breaks reference cycles (e.g. a table that points back at an ancestor, or _G
 // itself) — cleared after each branch so a DAG (same table in sibling slots) is
 // still fully captured.
+//
+// A number is written with as many digits as it takes to read back the same
+// double — the shortest of %.15g, %.16g and %.17g that does, so 0.1 stays 0.1
+// where tostring()'s %.14g lost 1/3's last digits — and -0, the infinities and
+// NaN in the spellings the reader above takes back: "nan" rather than glibc's
+// "-nan", which QString::toDouble() reads as 0.
 const CAPTURE_VARS_LUA = `
 local names = __mudlet_save_list
+local function savedText(n)
+  if n ~= n then return 'nan' end
+  if n == math.huge then return 'inf' end
+  if n == -math.huge then return '-inf' end
+  if n == 0 then return (1 / n < 0) and '-0' or '0' end
+  for _, digits in ipairs({15, 16, 17}) do
+    local s = string.format('%.' .. digits .. 'g', n)
+    if tonumber(s) == n then return s end
+  end
+  return string.format('%.17g', n)
+end
 local function capture(v, seen)
   local t = type(v)
   if t == 'table' then
@@ -322,10 +446,10 @@ local function capture(v, seen)
     local children = {}
     for k, val in pairs(v) do
       local kt = type(k)
-      if kt == 'string' or kt == 'number' then
+      if kt == 'string' or kt == 'number' or kt == 'boolean' then
         local child = capture(val, seen)
         if child then
-          child.name = tostring(k)
+          child.name = kt == 'number' and savedText(k) or tostring(k)
           child.keyKind = kt
           children[#children + 1] = child
         end
@@ -336,7 +460,7 @@ local function capture(v, seen)
   elseif t == 'boolean' then
     return { valueType = 'boolean', value = tostring(v) }
   elseif t == 'number' then
-    return { valueType = 'number', value = tostring(v) }
+    return { valueType = 'number', value = savedText(v) }
   elseif t == 'string' then
     return { valueType = 'string', value = v }
   else
@@ -355,7 +479,7 @@ if names then
   end
 end
 __mudlet_save_list = nil
-return yajl.to_string(out)
+return __mudlet_json_encode(out)
 `;
 
 // Snapshot the set of global names that exist right after the runtime boots —
@@ -364,6 +488,47 @@ return yajl.to_string(out)
 // Mudlet, which only shows user-created variables). Run once at the end of init,
 // before any saved-variable restore or user script adds globals. The set's own
 // name starts with __mudlet so it's excluded from the view.
+// The two `error`s internal chunks are compiled with (LuaRuntime.INTERNAL_PROLOGUE).
+// __mudlet_c_error is lua_error: no position, whatever level it is asked for.
+// __mudlet_lual_error is luaL_error: the position of the first frame outside
+// Mudlet Web's own code — the script line that called into it — and none when
+// that frame is C (a pcall, say); level 0 still means none. A level that is
+// not a number gets the stock argument error, named 'error' because it is
+// called through a table field. Bound before any internal chunk, and with the
+// stock debug.getinfo, before Bridge.lua replaces it.
+const C_ERROR_LUA = `
+do
+  local raw = { error = error }
+  local getinfo = debug.getinfo
+  -- The stock getinfo, for internal chunks that emulate a C function's
+  -- luaL_argerror (Luasql.lua): they count their own frames, which the
+  -- Bridge.lua replacement folds into one C frame.
+  __mudlet_stock_getinfo = getinfo
+  function __mudlet_c_error(message, level)
+    if level ~= nil and tonumber(level) == nil then raw.error(message, level) end
+    raw.error(message, 0)
+  end
+  function __mudlet_lual_error(message, level)
+    if level ~= nil and tonumber(level) == nil then raw.error(message, level) end
+    local t = type(message)
+    if tonumber(level) == 0 or (t ~= 'string' and t ~= 'number') then raw.error(message, 0) end
+    local lvl = 2
+    while true do
+      local info = getinfo(lvl, 'Sl')
+      if info == nil then break end
+      if not (info.source == '=[C]' and info.what ~= 'C') then
+        if info.what ~= 'C' and info.currentline > 0 then
+          raw.error(info.short_src .. ':' .. info.currentline .. ': ' .. message, 0)
+        end
+        break
+      end
+      lvl = lvl + 1
+    end
+    raw.error(message, 0)
+  end
+end
+`;
+
 const CAPTURE_BASELINE_LUA = `
 __mudlet_baseline = {}
 for k in pairs(_G) do
@@ -419,7 +584,7 @@ for k, v in pairs(_G) do
     out[#out + 1] = e
   end
 end
-return yajl.to_string(out)
+return __mudlet_json_encode(out)
 `;
 
 // Apply one edit from the Variables view to the live `_G`: set a value, rename
@@ -540,33 +705,16 @@ function labelEventForLua(event: unknown): unknown {
     return { ...event, buttons: list };
 }
 
-export class LuaRuntime implements IScriptingRuntime {
+/** One change the VFS bindings made, as a file watch sees it: a write into a
+ *  file that was there ('modify'), a new entry ('create'), an entry gone —
+ *  removed, renamed away or replaced ('remove') — or its times changed
+ *  ('attrib'). See LuaRuntime.notifyVfsPathChange. */
+interface VfsPathChange {
+    path: string;
+    kind: 'modify' | 'create' | 'remove' | 'attrib';
+}
 
-    // Temp alias/trigger IDs → { kill fn, type }. Engines return unsub, not
-    // numeric IDs; the type lets exists(id, "alias"/"trigger") recognise
-    // script-created temp items the way Mudlet does.
-    // Script-created (temp) aliases and triggers, by the id handed back to Lua.
-    //  backs enableTrigger/disableTrigger/isActive with a numeric id —
-    // Mudlet toggles temp items exactly like saved ones, so the dispatch checks
-    // it before firing.
-    /** Script-created temp aliases/triggers by id. `dead` marks one killed but
-     *  not yet reaped: Mudlet frees a killed unit in the deferred cleanup it
-     *  runs at the end of a line, not at the kill, so until then it is still
-     *  findable while no longer firing — `exists` says 1, `isActive` says 0, and
-     *  a second kill finds a corpse and answers false. {@link reapKilledTempItems}
-     *  does the freeing. */
-    private readonly tempIds = new Map<number, {
-        kill: () => void; type: 'alias' | 'trigger'; enabled: boolean; dead?: boolean;
-        /** Mudlet's tempComplexRegexTrigger is the one temporary-trigger API
-         *  that takes a name of its own, and exists()/killTrigger() have to
-         *  reach the item by it. Absent for the rest, which are only ever known
-         *  by the id they were handed. */
-        name?: string;
-        /** Its script did not compile. Mudlet still makes the item, so that it
-         *  can be seen and repaired, but TAlias::setScript leaves it in a state
-         *  that neither fires nor reports active, however it is switched. */
-        uncompiled?: boolean;
-    }>();
+export class LuaRuntime implements IScriptingRuntime {
 
     // Tracks label callback ids per slot so re-binds can free the prior Lua-
     // registry slot via __mudlet_unregister_cb (avoids the leak the audit flagged
@@ -600,7 +748,7 @@ export class LuaRuntime implements IScriptingRuntime {
     // One entry per level of nesting: the registry refs holding the dispatch
     // globals a script was given before it asked for an alias pass of its own.
     // See pushNestedDispatchState.
-    private nestedDispatchStates: (number | null)[][] = [];
+    private nestedDispatchStates: (number | null | undefined)[][] = [];
     // Span of the whole regex match (Mudlet's `selectCaptureGroup(1)` target).
     // Null when the matcher can't produce one (e.g. a perm substring trigger
     // doesn't report a position) — selectCaptureGroup(1) then falls back to
@@ -615,19 +763,33 @@ export class LuaRuntime implements IScriptingRuntime {
      * `selectCaptureGroup` would otherwise select the text that has slid into
      * where the capture used to be. A capture that starts at or after the
      * insert moves whole; one the insert lands inside grows by it.
+     *
+     * For a `replace` of `replaced` characters at `at`
+     * (TLuaInterpreter::adjustCaptureGroupsForReplace) the capture that was
+     * exactly the replaced text keeps its start and takes the replacement's
+     * length, one starting after `at` moves, and the rest — an enclosing group
+     * that shares the start among them — stay as they were.
      */
-    shiftCaptureSpans(at: number, delta: number): void {
+    shiftCaptureSpans(at: number, delta: number, replaced?: number): void {
         if (!delta) return;
-        const shift = (span: CaptureSpan): void => {
-            if (span.start >= at) span.start += delta;
-            else if (at < span.start + span.length) span.length += delta;
-        };
+        const shift = replaced === undefined
+            ? (span: CaptureSpan): void => {
+                if (span.start >= at) span.start += delta;
+                else if (at < span.start + span.length) span.length += delta;
+            }
+            : (span: CaptureSpan): void => {
+                if (span.start === at && span.length === replaced) span.length += delta;
+                else if (span.start > at) span.start += delta;
+            };
         if (this.currentFullMatchSpan) shift(this.currentFullMatchSpan);
         for (const span of this.currentCaptureSpans) shift(span);
         for (const span of Object.values(this.currentNamedSpans)) shift(span);
     }
 
-    private _denyCurrentSend = false;
+    /** One entry per sysDataSendRequest dispatch on the stack, innermost
+     *  last: whether a handler denied THAT command. A send a handler makes
+     *  dispatches its own, so a deny is never spent by the wrong command. */
+    private _sendRequestDenies: boolean[] = [];
 
     /** The read-only `/lua/` namespace: bundled Mudlet Lua, and in busted builds
      *  the spec corpus and its fixtures. Values are Latin-1 byte-strings. */
@@ -693,10 +855,16 @@ export class LuaRuntime implements IScriptingRuntime {
     // immediately. Called from saveProfile() so user code can ensure SQL state
     // is durable before the default 500 ms debounce window elapses.
     private flushPendingSqlSnapshots: () => void = () => {};
-    // Same JSON→Lua remap yajl uses (1-indexed arrays, null sentinel).
-    // Captured here so setGmcpValue can shape incoming GMCP payloads
-    // identically to Mudlet's `gmcp` global.
-    private toLuaValue: LuaValueTransform = v => v;
+    // Stops color_table following the ANSI palette; set by setupAnsiColorTable,
+    // run by destroy().
+    private stopAnsiPaletteSync: () => void = () => {};
+    // Set by setupSqlBridge — closes every luasql connection this runtime
+    // opened. destroy() runs it before lua_close.
+    private closeSqlConnections: () => void = () => {};
+    // Pushes a JSON-decoded value exactly as yajl.to_value builds it (1-indexed
+    // arrays, the yajl.null userdata, inf/-0 intact). Mudlet fills `gmcp` and
+    // `msdp` through json_to_value = yajl.to_value, so the bridge must agree.
+    private yajl: YajlBridge | null = null;
 
     private constructor(
         private readonly lua: Lua,
@@ -712,6 +880,8 @@ export class LuaRuntime implements IScriptingRuntime {
         proxyUrlGetter: () => string | undefined = () => undefined,
     ): Promise<LuaRuntime> {
         const lua = await Lua.create({ customWasmUri: luaWasmUrl });
+        installWellFormedPush(lua.global.luaApi);
+        installDesktopUtf8Read(lua.global.luaApi as unknown as Parameters<typeof installDesktopUtf8Read>[0]);
         const rt = new LuaRuntime(lua, api, vfs, proxyUrlGetter);
         await rt.setup();
         return rt;
@@ -767,6 +937,7 @@ export class LuaRuntime implements IScriptingRuntime {
         // below take them through `bindings`.
         const dispatchCb = (cbId: number, label: string): void => this.dispatchCb(cbId, label);
         const releaseCb = (cbId: number): void => {
+            if (this.destroyed) return;
             try { this.lua.doStringSync(`__mudlet_unregister_cb(${cbId})`); } catch {}
         };
 
@@ -779,10 +950,14 @@ export class LuaRuntime implements IScriptingRuntime {
             dispatchCb,
             releaseCb,
             emitEvent: (name, args) => this.emitEvent(name, args),
-            pushNestedDispatchState: () => this.pushNestedDispatchState(),
+            pushNestedDispatchState: (parkCommand) => this.pushNestedDispatchState(parkCommand),
+            inDispatchPass: () => this.runningAliasScript || this.api.triggerPassActive,
             popNestedDispatchState: (depth) => this.popNestedDispatchState(depth),
+            buildingCaptureTables: () => this.buildingCaptureTables(),
             vfs: this.vfs,
+            readBuiltinBytes: (path) => this.readBuiltinBytes(path),
             overlayCmdLineActionCbIds: this.overlayCmdLineActionCbIds,
+            windowCmdLineActionCbIds: this.windowCmdLineActionCbIds,
             unregisterCb: (cbId) => this.unregisterCb(cbId),
             pushJsValue: (L, value, depth) => this.pushJsValue(L, value, depth),
             registerRawGlobal: (name, fn) => this.registerRawGlobal(name, fn),
@@ -874,6 +1049,9 @@ export class LuaRuntime implements IScriptingRuntime {
         // turns that into Mudlet's `true` / `nil, message`.
         this.lua.global.set('__loadProfile', (name: unknown) => this.api.loadProfile(String(name)));
         this.lua.global.set('__closeProfile', (name: unknown) => this.api.closeProfile(String(name)));
+        // Mudlet setActiveProfile(name) — null when the profile is open (and
+        // fronted, where a browser lets a page do that), or the refusal.
+        this.lua.global.set('__setActiveProfile', (name: unknown) => this.api.setActiveProfile(String(name)));
         // Mudlet getCharacterName() — the profile's saved login name, or '' when
         // none is set; Bridge.lua turns that into Mudlet's (nil, errMsg).
         this.lua.global.set('__mudlet_getCharacterName', () => this.api.getCharacterName());
@@ -967,9 +1145,14 @@ export class LuaRuntime implements IScriptingRuntime {
                 // profile VFS — see src/assets/qt-resources.
                 bytes = qtResourceBytes(p);
             } else {
-                if (!this.vfs) return false;
-                try { bytes = this.vfs.readBinaryFile(p); }
-                catch { return false; }
+                // The read-only /lua/ namespace first, as io.open sees it (the
+                // spec corpus keeps its fixture images there), then the profile.
+                bytes = this.readBuiltinBytes(p);
+                if (!bytes) {
+                    if (!this.vfs) return false;
+                    try { bytes = this.vfs.readBinaryFile(p); }
+                    catch { return false; }
+                }
             }
             if (!bytes) return false;
             const size = parseImageSize(bytes);
@@ -1185,14 +1368,34 @@ export class LuaRuntime implements IScriptingRuntime {
         // not part of what is read back.
         this.lua.global.set('__getLabelToolTip', (name: unknown) =>
             (typeof name === 'string' ? this.api.labels.get(name)?.tooltip ?? '' : ''));
+        // The accessibility primitives behind setLabelAccessibleName/Role and
+        // setLabelLiveRegion and their getters. Bridge.lua checks the name and
+        // the value first, as TLuaInterpreter does, so these only act.
+        this.lua.global.set('__mudlet_setLabelAccessibleName', (name: string, text: string) =>
+            this.api.labels.setAccessibleName(name, String(text)));
+        this.lua.global.set('__mudlet_getLabelAccessibleName', (name: string) =>
+            this.api.labels.getAccessibleName(name) ?? '');
+        // '' is the role the callbacks decide, which the label holds as unset.
+        this.lua.global.set('__mudlet_setLabelAccessibleRole', (name: string, role: string) =>
+            this.api.labels.setAccessibleButton(name, role === 'button' ? true : role === 'text' ? false : undefined));
+        this.lua.global.set('__mudlet_getLabelAccessibleRole', (name: string) =>
+            this.api.labels.getAccessibleRole(name) ?? 'text');
+        this.lua.global.set('__mudlet_setLabelLiveRegion', (name: string, mode: string) =>
+            this.api.labels.setLiveRegion(name, mode as 'off' | 'polite' | 'assertive'));
+        this.lua.global.set('__mudlet_getLabelLiveRegion', (name: string) =>
+            this.api.labels.getLiveRegion(name) ?? 'off');
         // Runtime clickthrough toggle. Flips pointer-events live; the click
         // handler set via setLabelClickCallback stays installed either way.
-        this.lua.global.set('enableClickthrough', (name: unknown) => {
-            if (typeof name === 'string') this.api.labels.setClickThrough(name, true);
-        });
-        this.lua.global.set('disableClickthrough', (name: unknown) => {
-            if (typeof name === 'string') this.api.labels.setClickThrough(name, false);
-        });
+        // True once set, or the refusal for a label that is not there, which
+        // Bridge.lua makes desktop's (nil, message).
+        const clickthrough = (name: unknown, on: boolean): true | string => {
+            const label = String(name);
+            if (!this.api.labels.has(label)) return `label name '${label}' not found`;
+            this.api.labels.setClickThrough(label, on);
+            return true;
+        };
+        this.lua.global.set('enableClickthrough', (name: unknown) => clickthrough(name, true));
+        this.lua.global.set('disableClickthrough', (name: unknown) => clickthrough(name, false));
         // Mudlet raiseWindow(name) / lowerWindow(name) — works on labels and
         // userwindows. For labels, each call bumps z past every other raised
         // label (or below every other lowered one). For userwindows, the call
@@ -1217,6 +1420,9 @@ export class LuaRuntime implements IScriptingRuntime {
             // (see TextEditManager), so there is no stacking order to change.
             if (this.api.textEdits.has(name)) return true;
             if (this.api.windows.has(name)) { this.api.windows.bringToFront(name); return true; }
+            // A createBuffer buffer is found too; never drawn, it has no
+            // stacking order to change.
+            if (this.api.isBuffer(name)) return true;
             if (mapperNamed(name)) { this.api.windows.bringToFront(MAPPER_WIDGET_ID); return true; }
             // A bare Geyser container identity (no real widget of its own —
             // e.g. Adjustable.Container's raiseAll() raises self.name before
@@ -1234,6 +1440,7 @@ export class LuaRuntime implements IScriptingRuntime {
             // (see TextEditManager), so there is no stacking order to change.
             if (this.api.textEdits.has(name)) return true;
             if (this.api.windows.has(name)) { this.api.windows.sendToBack(name); return true; }
+            if (this.api.isBuffer(name)) return true;
             if (mapperNamed(name)) { this.api.windows.sendToBack(MAPPER_WIDGET_ID); return true; }
             return false;
         };
@@ -1491,13 +1698,6 @@ export class LuaRuntime implements IScriptingRuntime {
             return this.api.addSupportedTelnetOption(n);
         });
 
-        // Mudlet `pauseSounds([channel])`. Stops all in-flight sound effects
-        // (Web Audio source nodes can't truly pause), optionally filtered by
-        // tag. Music isn't affected — stopMusic covers that path.
-        this.lua.global.set('pauseSounds', (channel?: unknown) => {
-            this.api.sounds.pauseSounds(typeof channel === 'string' ? channel : undefined);
-        });
-
         // Mudlet `startLogging(state)`. Toggle the persistent session logger
         // for this profile. ProfileSession owns the SessionLogger lifecycle;
         // the API forwards through a registered toggler.
@@ -1522,45 +1722,60 @@ export class LuaRuntime implements IScriptingRuntime {
         // since it needs access to the line's AnsiAwareBuffer (the trigger
         // engine itself only sees plain text). Self-expires after
         // `expirationCount` fires.
-        this.lua.global.set('__mudlet_tempColorTrigger', (fg: unknown, bg: unknown, cbId: number, expirationCount?: number) => {
+        this.lua.global.set('__mudlet_tempColorTrigger', (fg: unknown, bg: unknown, cbId: number, expirationCount?: number, uncompiled?: unknown) => {
             const wantFg = Number(fg);
             const wantBg = Number(bg);
             const max = (typeof expirationCount === 'number' && expirationCount > 0) ? expirationCount : -1;
-            const id = this.api.allocateItemId();
             let fires = 0;
-            let killed = false;
+            const triggers = this.api.triggers;
             // Empty-string substring trigger fires once per line; the colour
             // check gates it as the engine's `accept`, so a line of the wrong
             // colour counts as a miss rather than a match that did nothing —
-            // which is what lets a stay-open window fire on it.
-            const unsub = this.api.triggers.addTemp('', (matches) => {
-                if (killed || this.tempIds.get(id)?.enabled === false) return;
+            // which is what lets a stay-open window fire on it. Its switch, its
+            // kill and a body that did not compile are the engine's to honour
+            // (see TriggerEngine.createTemp).
+            const id: number = triggers.createTemp('', (matches) => {
                 // matches[1] is the coloured RUN, not the whole line — the
                 // empty-substring pattern this rides on has no match text of
                 // its own, so the colour lookup supplies it. A fire with no
                 // matches at all is a stay-open window (setTriggerStayOpen)
                 // firing on a line it did not match, with nothing captured.
-                const run = matches.length === 0 ? null : this.api.currentLineColorMatch(wantFg, wantBg);
-                this.setMatches(run === null ? [] : [run]);
+                // Every run of the colour on the line is a match of its own, as
+                // TTrigger::match_color_pattern collects them all: `matches` is
+                // {run1, run2, …}.
+                const runs = matches.length === 0 ? [] : this.api.currentLineColorRuns(wantFg, wantBg);
+                const texts = runs.map(r => r.text);
+                // Each run's position goes with it, so selectCaptureGroup(1)
+                // selects the run it names rather than finding nothing. They
+                // are read off the line as it is now, as the colours are.
+                const prevSpans = this.currentCaptureSpans;
+                const prevNamed = this.currentNamedSpans;
+                const prevMatches = this.currentMatches;
+                const prevFullMatchSpan = this.currentFullMatchSpan;
+                if (runs.length > 0) {
+                    this.currentMatches = texts;
+                    this.currentFullMatchSpan = { start: runs[0].start, length: runs[0].text.length };
+                    this.currentCaptureSpans = runs.slice(1).map(r => ({ start: r.start, length: r.text.length }));
+                    this.currentNamedSpans = {};
+                }
+                this.setMatches(texts);
                 try {
                     dispatchCb(cbId, 'tempColorTrigger');
                 } finally {
-                    if (run !== null) this.clearCaptureGlobals();
+                    if (runs.length > 0) this.clearCaptureGlobals();
+                    this.currentMatches = prevMatches;
+                    this.currentCaptureSpans = prevSpans;
+                    this.currentNamedSpans = prevNamed;
+                    this.currentFullMatchSpan = prevFullMatchSpan;
                 }
                 fires++;
-                if (max > 0 && fires >= max) {
-                    killed = true;
-                    unsub();
-                    releaseCb(cbId);
-                    this.tempIds.delete(id);
-                }
+                if (max > 0 && fires >= max) triggers.killTemp(id);
             }, 'substring', {
-                // Named after its id, as every temp trigger is, so
-                // setTriggerStayOpen(tostring(id), n) finds it.
-                name: String(id),
-                accept: () => this.api.currentLineColorMatch(wantFg, wantBg) !== null,
+                id: this.api.allocateItemId(),
+                accept: () => uncompiled !== true && this.api.currentLineColorMatch(wantFg, wantBg) !== null,
+                uncompiled: uncompiled === true,
+                onFree: () => releaseCb(cbId),
             });
-            this.tempIds.set(id, { kill: () => { unsub(); releaseCb(cbId); }, type: 'trigger', enabled: true });
             return id;
         });
 
@@ -1588,25 +1803,31 @@ export class LuaRuntime implements IScriptingRuntime {
         // body (e.g. `Core.Supports.Add ["Char 1"]`), framed by IAC SB GMCP …
         // IAC SE. The optional second `what` arg is concatenated with a space
         // separator (Mudlet behaviour) so scripts can pass the package name
-        // and payload separately.
+        // and payload separately. An empty `what` adds nothing, not a lone
+        // space: Mudlet appends the separator only `if (!what.empty())`.
         this.lua.global.set('sendGMCP', (message: unknown, what?: unknown) => {
             const body = String(message ?? '');
-            const tail = what != null ? ' ' + String(what) : '';
+            const whatText = what != null ? String(what) : '';
+            const tail = whatText !== '' ? ' ' + whatText : '';
             this.api.sendGmcp(body + tail);
         });
         // Mudlet `sendMSDP(variable [, value, ...])`. The Bridge.lua wrapper
         // packs the variadic values into a \x01-delimited string (wasmoon's
         // varargs handling is unreliable); we split them back here. Frames as
-        // IAC SB MSDP MSDP_VAR var [MSDP_VAL val]... IAC SE.
-        this.lua.global.set('__mudlet_sendMSDP', (variable: unknown, valuesStr?: unknown) => {
+        // IAC SB MSDP MSDP_VAR var [MSDP_VAL val]... IAC SE. The value count
+        // travels separately because the packed string can't tell "no values"
+        // from one empty value - and Mudlet frames `sendMSDP("X", "")` with an
+        // empty VAL, not without one.
+        this.lua.global.set('__mudlet_sendMSDP', (variable: unknown, valuesStr?: unknown, count?: unknown) => {
             const v = String(variable ?? '');
             if (!v) return false;
             const s = valuesStr != null ? String(valuesStr) : '';
-            const values = s.length === 0 ? [] : s.split('\x01');
+            const n = typeof count === 'number' ? count : (s.length === 0 ? 0 : -1);
+            const values = n === 0 ? [] : s.split('\x01');
             return this.api.sendMSDP(v, values);
         });
-        // Mudlet `sendSocket(data)`: send literal bytes over the socket, no
-        // telnet/encoding processing.
+        // Mudlet `sendSocket(data [, parseTelnetCodes])`: send literal bytes over
+        // the socket, no telnet/encoding processing.
         // `sendSocket` itself is a Bridge.lua wrapper over __mudlet_sendSocket,
         // which adds Mudlet's type check and (nil, errMsg) failure return.
         // Mudlet getServerEncoding/setServerEncoding/getServerEncodingsList —
@@ -1638,7 +1859,9 @@ export class LuaRuntime implements IScriptingRuntime {
         this.lua.global.set('__mudlet_sendTelnetChannel102', (b1: unknown, b2: unknown) =>
             this.api.sendTelnetChannel102(
                 String.fromCharCode(Number(b1) & 0xff, Number(b2) & 0xff)));
-        this.lua.global.set('__mudlet_sendSocket', (data: unknown) => this.api.sendSocket(String(data ?? '')));
+        // Armored by the Bridge.lua wrapper: the data is bytes, not text.
+        this.lua.global.set('__mudlet_sendSocket', (data: unknown, parse: unknown) =>
+            this.api.sendSocket(unarmor(String(data ?? '')), parse === true));
         /** Whether the session currently has a live connection — drives the
          *  "not connected to game server" guards Mudlet applies before sending
          *  ATCP/GMCP/MSDP. */
@@ -1669,7 +1892,27 @@ export class LuaRuntime implements IScriptingRuntime {
             let bytes: Uint8Array;
             try { bytes = this.vfs.readBinaryFile(p); }
             catch { return [false, `Cannot read file "${p}"`]; }
-            const err = this.api.loadReplay(bytes);
+            // Playback reads each chunk again as it comes up, from the file as
+            // it is by then (see MudSession.loadReplayData). The bytes are only
+            // read again when something has written the file since — once a
+            // chunk, a whole-file read would cost the whole file per chunk.
+            // Resolved now: Mudlet holds the file it opened, so an lfs.chdir()
+            // during playback must not point the rest of it at another file.
+            const vfs = this.vfs;
+            const abs = vfs.resolvePath(p);
+            let current = bytes;
+            let seen = vfs.writeGeneration(abs);
+            const readAt = (position: number, length: number): Uint8Array => {
+                const generation = vfs.writeGeneration(abs);
+                if (generation !== seen) {
+                    // Throws when the file has gone, which plays on from what
+                    // was loaded; tried again at the next chunk.
+                    current = vfs.readBinaryFile(abs);
+                    seen = generation;
+                }
+                return current.subarray(position, position + length);
+            };
+            const err = this.api.loadReplay(bytes, readAt);
             return err ? [false, `unable to start replay, reason: '${err}'`] : [true, ''];
         });
         // Mudlet `receiveMSP(text)`: parse an MSP payload and dispatch its
@@ -1678,19 +1921,22 @@ export class LuaRuntime implements IScriptingRuntime {
         // wrapper, matching Mudlet's order (enabled first, then type).
         this.lua.global.set('__mudlet_receiveMSP', (data: unknown) => this.api.receiveMSP(String(data ?? '')));
         this.lua.global.set('__mudlet_is_msp_enabled', () => this.api.isMspNegotiated());
+        this.lua.global.set('__mudlet_is_gmcp_enabled', () => this.api.isGmcpEnabled());
         // Mudlet `disconnect()`: drop the current connection.
         this.lua.global.set('disconnect', () => { this.api.disconnect(); });
         // Mudlet `closeMudlet()`: Mudlet Web closes the active profile — disconnect
-        // and return to the connection screen.
+        // and return to the connection screen — once the calling script is done.
         this.lua.global.set('closeMudlet', () => { this.api.closeMudlet(); });
         // Mudlet `resetProfile()`: reload the whole profile (UI cleared, fresh
         // Lua VM, scripts re-run). The engine defers the actual reinit since it
         // closes this very lua_State — see ScriptingEngine.resetProfile.
-        this.lua.global.set('resetProfile', () => { this.api.resetProfile(); });
+        // True once armed, as Host::resetProfile_phase1 answers; false for a
+        // reset already in progress or one refused during teardown.
+        this.lua.global.set('resetProfile', () => this.api.resetProfile());
         // Mudlet `exportAreaImage(areaID, filePath [, zLevel])`: render the area
         // to a PNG in the profile VFS. Returns a 0-indexed [ok, pathOrErr] array
         // that Bridge.lua unpacks into Mudlet's (bool[, errMsg]) multi-return.
-        this.lua.global.set('__mudlet_exportAreaImage', (areaId: unknown, filePath: unknown, zLevel?: unknown): [boolean, string] => {
+        this.lua.global.set('__mudlet_exportAreaImage', (areaId: unknown, filePath: unknown, zLevel?: unknown): [boolean, string, boolean?] => {
             const aid = Number(areaId);
             if (!Number.isFinite(aid)) return [false, 'exportAreaImage: areaID must be a number'];
             // A BOOLEAN z level means "every z level", and only `true` can mean
@@ -1701,7 +1947,7 @@ export class LuaRuntime implements IScriptingRuntime {
                 if (!zLevel) {
                     return [false, 'exportAreaImage: zLevel parameter when boolean must be true to export all Z levels'];
                 }
-                return this.api.exportAreaImage(Math.trunc(aid), String(filePath ?? ''), undefined);
+                return this.api.exportAreaImage(Math.trunc(aid), String(filePath ?? ''), true);
             }
             const z = zLevel != null && zLevel !== '' ? Number(zLevel) : undefined;
             return this.api.exportAreaImage(
@@ -1710,19 +1956,26 @@ export class LuaRuntime implements IScriptingRuntime {
                 z != null && Number.isFinite(z) ? Math.trunc(z) : undefined,
             );
         });
-        // Mudlet `clearVisitedLinks()`: forgets which clickable links have been
-        // visited (Mudlet greys visited echoLink targets). Mudlet Web tracks no
-        // visited-link state, so there is nothing to clear — a true no-op.
-        this.lua.global.set('clearVisitedLinks', () => {});
+        // Mudlet `clearVisitedLinks(labelName)`: forgets which of a label's
+        // links were clicked, so they take the link colour again.
+        this.lua.global.set('clearVisitedLinks', (name: unknown) =>
+            this.api.labels.clearVisitedLinks(String(name ?? '')));
         // Mudlet `connectToServer(host, port [, save])`: (re)connect through the
         // proxy; `save` persists host/port onto the active connection.
         // Argument validation and the invalid-port (nil, errMsg) return live in
         // the Bridge.lua wrapper, matching Mudlet's contract.
         this.lua.global.set('__mudlet_connectToServer', (host: unknown, port?: unknown, save?: unknown) =>
             this.api.connectToServer(String(host ?? ''), port === undefined ? 23 : Number(port), !!save));
-        // Cancels the in-flight sysDataSendRequest dispatch. Only meaningful while
-        // a sysDataSendRequest handler is on the stack — flag is reset before each send.
-        this.lua.global.set('denyCurrentSend', () => { this._denyCurrentSend = true; });
+        // Cancels the command the innermost sysDataSendRequest dispatch is
+        // vetting. Outside one there is no such command: desktop answers nil and
+        // a message and stops nothing, so a stray deny cannot swallow whatever
+        // command happens to come next.
+        this.lua.global.set('__mudlet_denyCurrentSend', () => {
+            const top = this._sendRequestDenies.length - 1;
+            if (top < 0) return false;
+            this._sendRequestDenies[top] = true;
+            return true;
+        });
 
         // -- Command bar, command lines, and their context menu --
         installCommandLineBindings(bindings);
@@ -1739,26 +1992,31 @@ export class LuaRuntime implements IScriptingRuntime {
         // sysUnzipError(zipPath, destDir) on failure. fflate's unzip uses Web
         // Workers internally on platforms that support them, falling back to
         // a chunked main-thread decode otherwise.
-        // Answers true and nothing else: the unzip has not happened yet when it
-        // returns, so there is nothing to report but "started". Mudlet pushes the
-        // same true unconditionally (a failure can only be told through the
-        // event), and a script that branches on the return needs it — this used
-        // to return nothing at all, which Lua reads as nil.
-        this.lua.global.set('unzipAsync', (zipPath: string, destDir: string) => {
-            this.runUnzipAsync(String(zipPath ?? ''), String(destDir ?? ''));
-            return true;
-        });
+        // Answers true once the unzip is under way: it has not happened yet
+        // when it returns, so a failure to read or decode the zip can only be
+        // told through the event. The one refusal that comes back is the one
+        // desktop makes before it starts — an extract directory it cannot
+        // create — as `nil, message`: the raw binding hands back the message
+        // in place of true, and Bridge.lua turns it into the pair.
+        this.lua.global.set('unzipAsync', (zipPath: string, destDir: string) =>
+            this.runUnzipAsync(String(zipPath ?? ''), String(destDir ?? '')) ?? true);
 
         // ── File watches ──────────────────────────────────────────────────────
         // Mudlet addFileWatch(path)/removeFileWatch(path). Watches are matched
         // by resolved absolute path; the VFS mutation hooks above fire
-        // sysPathChanged(path) when a watched file or any descendant of a
-        // watched directory changes.
-        this.lua.global.set('addFileWatch', (path: unknown): boolean => {
+        // sysPathChanged(path) by QFileSystemWatcher's rules (see
+        // notifyVfsPathChange).
+        //
+        // A path already watched is not added twice — QFileSystemWatcher's
+        // addPath answers false for it — which the Bridge wrapper passes on
+        // as false, not as the missing-path refusal.
+        this.lua.global.set('addFileWatch', (path: unknown): boolean | 'watched' => {
             const vfs = this.vfs;
             if (!vfs || typeof path !== 'string' || !path) return false;
             if (!vfs.exists(path)) return false;
-            this.watchedPaths.add(vfs.resolvePath(path));
+            const abs = vfs.resolvePath(path);
+            if (this.watchedPaths.has(abs)) return 'watched';
+            this.watchedPaths.add(abs);
             return true;
         });
 
@@ -1820,7 +2078,12 @@ export class LuaRuntime implements IScriptingRuntime {
                 }
             }
             const written = this.api.saveProfileXml(dir, name);
-            if (!written.ok) return [false, `saveProfile: ${written.err}`];
+            // Desktop's wording once the save has a file to name — empty while
+            // another save runs — and the bare reason for an argument it refused.
+            if (!written.ok) {
+                return [false, written.path === undefined ? written.err
+                    : `Couldn't save '${this.api.profileName}' to '${written.path}' because: ${written.err}`];
+            }
             vfs.flush().catch(err => {
                 const msg = err instanceof Error ? err.message : String(err);
                 console.warn('[saveProfile] vfs flush failed:', err);
@@ -1841,47 +2104,60 @@ export class LuaRuntime implements IScriptingRuntime {
 
         // ── Timers ────────────────────────────────────────────────────────────
         this.lua.global.set('__mudlet_tempTimer', (seconds: number, cbId: number, repeating?: boolean) => {
+            // A __gc finaliser run by lua_close() can still call tempTimer.
+            // The timer engine outlives this state (a reset reuses it), so a
+            // timer made now would fire into a state that is gone.
+            if (this.destroyed) return null;
             const isRepeat = repeating ?? false;
             return this.api.timers.addTemp(seconds, () => {
                 dispatchCb(cbId, 'tempTimer');
                 if (!isRepeat) releaseCb(cbId);
             }, isRepeat);
         });
-        // Mudlet `killTimer(idOrName)`: numeric id kills a temp timer; a name
-        // string removes a permanent timer (and any group sharing the name).
-        this.lua.global.set('killTimer', (idOrName: number | string) =>
-            typeof idOrName === 'string'
-                ? this.api.killByName('timer', idOrName)
-                : this.api.timers.killTimer(idOrName));
+        // Mudlet `killTimer(idOrName)`: TimerUnit::killTimer looks the argument
+        // up by *name*, and a temp timer's name is the id tempTimer returned —
+        // so `killTimer(tostring(id))` kills it just as `killTimer(id)` does.
+        // The name has to be the id's exact spelling ("05" names nothing).
+        // Permanent timers can't be killed (killByName refuses them).
+        this.lua.global.set('killTimer', (idOrName: number | string) => {
+            if (typeof idOrName !== 'string') return this.api.timers.killTimer(idOrName);
+            const n = Number(idOrName);
+            if (Number.isInteger(n) && String(n) === idOrName && this.api.timers.hasTemp(n)) {
+                return this.api.timers.killTimer(n);
+            }
+            return this.api.killByName('timer', idOrName);
+        });
 
         // ── Aliases ───────────────────────────────────────────────────────────
-        this.lua.global.set('__mudlet_tempAlias', (pattern: string, cbId: number, uncompiled?: boolean) => {
-            const id = this.api.allocateItemId();
-            const unsub = this.api.aliases.addTemp(pattern, (m: RegExpMatchArray) => {
-                const entry = this.tempIds.get(id);
-                if (entry?.enabled === false || entry?.uncompiled) return;
+        // For the script entries Lua makes itself (raiseEvent's handlers):
+        // sets whether the running script is an alias's, answering what it was.
+        this.lua.global.set('__mudlet_set_alias_script', (aliasScript: unknown): boolean => {
+            const was = this.runningAliasScript;
+            this.runningAliasScript = aliasScript === true;
+            return was;
+        });
+        // The alias engine holds the alias's switch, its kill and whether its
+        // body compiled (see PatternEngine.createTemp).
+        this.lua.global.set('__mudlet_tempAlias', (pattern: string, cbId: number, uncompiled?: boolean) =>
+            this.api.aliases.createTemp(pattern, (m: RegExpMatchArray) => {
                 // Named groups go onto the same `matches` table as the numbered
                 // ones, which is how Mudlet presents them (setCaptureNameGroups
                 // feeds the same table setCaptureGroups does).
                 this.setMatches(Array.from(m), undefined, m.groups as Record<string, string> | undefined);
                 try {
-                    dispatchCb(cbId, 'tempAlias');
+                    this.asAliasScript(() => dispatchCb(cbId, 'tempAlias'));
                 } finally {
                     this.clearCaptureGlobals();
                 }
-            });
-            this.tempIds.set(id, { kill: () => { unsub(); releaseCb(cbId); }, type: 'alias', enabled: true, uncompiled: !!uncompiled });
-            return id;
-        });
-        this.lua.global.set('killAlias', (idOrName: number | string) => {
-            // A temp item named by the script (tempComplexRegexTrigger) is
-            // reachable by that name, and is what Mudlet kills first — only a
-            // permanent item answers a name no temporary one carries.
-            const tempId = this.tempItemId(idOrName, 'alias');
-            if (tempId !== null && this.tempIds.has(tempId)) return this.killTempItem(tempId, 'alias');
-            if (typeof idOrName === 'string') return this.api.killByName('alias', idOrName);
-            return this.killTempItem(idOrName, 'alias');
-        });
+            }, {
+                id: this.api.allocateItemId(),
+                uncompiled: !!uncompiled,
+                onFree: () => releaseCb(cbId),
+            }));
+        // Mudlet `killAlias(name)` — a number is read as its string form, the
+        // name a temp alias carries (its id). See ScriptingEngine.killByName.
+        this.lua.global.set('killAlias', (idOrName: number | string) =>
+            this.api.killByName('alias', String(idOrName)));
 
         // ── Triggers ──────────────────────────────────────────────────────────
         // Mudlet semantics:
@@ -1894,25 +2170,38 @@ export class LuaRuntime implements IScriptingRuntime {
         // to one of the JS bindings below.
         const installTempTrigger = (
             pattern: string, cbId: number, kind: 'regex' | 'substring' | 'startOfLine' | 'exactMatch' | 'prompt',
-            expirationCount: number | undefined, label: string, name?: string,
+            expirationCount: number | undefined, label: string, name?: string, uncompiled?: unknown,
+            noScript?: unknown,
         ) => {
-            const id = this.api.allocateItemId();
+            // Its body did not compile: made, numbered and reachable like any
+            // other, but it never fires and isActive() says 0 — the engine
+            // holds that, with the trigger's switch and its kill.
+            const triggers = this.api.triggers;
             const max = (typeof expirationCount === 'number' && expirationCount > 0) ? expirationCount : -1;
             let fires = 0;
-            let killed = false;
-            let unsub: () => void = () => {};
-            const kill = () => {
-                if (killed) return;
-                killed = true;
-                unsub();
-                releaseCb(cbId);
-                this.tempIds.delete(id);
+            const opts = {
+                id: this.api.allocateItemId(),
+                // Mudlet names a trigger made by tempTrigger() and friends
+                // after its id, unless the call carried a name of its own.
+                name,
+                uncompiled: uncompiled === true,
+                onFree: () => releaseCb(cbId),
             };
-            // Mudlet names a trigger made by tempTrigger() and friends after its
-            // id, unless the call carried a name of its own — which is what the
-            // runaway report has to print.
-            unsub = this.api.triggers.addTemp(pattern, (matches, spans, namedGroups) => {
-                if (killed || this.tempIds.get(id)?.enabled === false) return;
+            // An empty pattern makes a trigger that never fires: Mudlet
+            // compacts blank patterns out as it compiles a trigger (only a
+            // prompt pattern may be blank — TTrigger::setRegexCodeList), so
+            // `tempTrigger("")` and friends make a trigger, return its id, and
+            // never fire. Here '' would match every line. The id stays live
+            // for killTrigger/enableTrigger exactly as for any other.
+            if (pattern === '' && kind !== 'prompt') return triggers.createTemp('', () => {}, 'none', opts);
+            const id: number = triggers.createTemp(pattern, (matches, spans, namedGroups) => {
+                if (noScript === true) {
+                    // An empty script is never called, so the `matches` the
+                    // last script left stand (TTrigger::execute)
+                    fires++;
+                    if (max > 0 && fires >= max) triggers.killTemp(id);
+                    return;
+                }
                 const prevSpans = this.currentCaptureSpans;
                 const prevNamed = this.currentNamedSpans;
                 const prevMatches = this.currentMatches;
@@ -1938,69 +2227,57 @@ export class LuaRuntime implements IScriptingRuntime {
                 // A body that returns true is asking for one more fire, so the
                 // trigger only goes when it stops asking: Mudlet increments
                 // mExpiryCount on a truthy return and decrements it after the
-                // match, leaving the count where it was.
+                // match, leaving the count where it was. Expiry is a kill:
+                // deactivate() + markCleanup(), freed with the line's corpses.
                 if (!renewed) fires++;
-                if (max > 0 && fires >= max) kill();
-            }, kind, { name: name ?? String(id), onStopped: kill });
-            this.tempIds.set(id, { kill, type: 'trigger', enabled: true, name });
+                if (max > 0 && fires >= max) triggers.killTemp(id);
+            }, kind, opts);
             return id;
         };
-        this.lua.global.set('__mudlet_tempTrigger', (pattern: string, cbId: number, expirationCount?: number) =>
-            installTempTrigger(pattern, cbId, 'substring', expirationCount, 'tempTrigger'));
-        this.lua.global.set('__mudlet_tempRegexTrigger', (pattern: string, cbId: number, expirationCount?: number, name?: unknown) =>
+        this.lua.global.set('__mudlet_tempTrigger', (pattern: string, cbId: number, expirationCount?: number, uncompiled?: unknown, noScript?: unknown) =>
+            installTempTrigger(pattern, cbId, 'substring', expirationCount, 'tempTrigger', undefined, uncompiled, noScript));
+        this.lua.global.set('__mudlet_tempRegexTrigger', (pattern: string, cbId: number, expirationCount?: number, name?: unknown, uncompiled?: unknown, noScript?: unknown) =>
             installTempTrigger(pattern, cbId, 'regex', expirationCount, 'tempRegexTrigger',
-                typeof name === 'string' && name ? name : undefined));
-        this.lua.global.set('__mudlet_tempExactMatchTrigger', (pattern: string, cbId: number, expirationCount?: number) =>
-            installTempTrigger(pattern, cbId, 'exactMatch', expirationCount, 'tempExactMatchTrigger'));
-        this.lua.global.set('__mudlet_tempBeginOfLineTrigger', (pattern: string, cbId: number, expirationCount?: number) =>
-            installTempTrigger(pattern, cbId, 'startOfLine', expirationCount, 'tempBeginOfLineTrigger'));
+                typeof name === 'string' && name ? name : undefined, uncompiled, noScript));
+        this.lua.global.set('__mudlet_tempExactMatchTrigger', (pattern: string, cbId: number, expirationCount?: number, uncompiled?: unknown, noScript?: unknown) =>
+            installTempTrigger(pattern, cbId, 'exactMatch', expirationCount, 'tempExactMatchTrigger', undefined, uncompiled, noScript));
+        this.lua.global.set('__mudlet_tempBeginOfLineTrigger', (pattern: string, cbId: number, expirationCount?: number, uncompiled?: unknown, noScript?: unknown) =>
+            installTempTrigger(pattern, cbId, 'startOfLine', expirationCount, 'tempBeginOfLineTrigger', undefined, uncompiled, noScript));
         // tempPromptTrigger(fn[, expirationCount]) — fires on every line the
         // server flags as a prompt (GA/EOR). No pattern; the empty string is a
         // placeholder the 'prompt' kind ignores.
-        this.lua.global.set('__mudlet_tempPromptTrigger', (cbId: number, expirationCount?: number) =>
-            installTempTrigger('', cbId, 'prompt', expirationCount, 'tempPromptTrigger'));
+        this.lua.global.set('__mudlet_tempPromptTrigger', (cbId: number, expirationCount?: number, uncompiled?: unknown) =>
+            installTempTrigger('', cbId, 'prompt', expirationCount, 'tempPromptTrigger', undefined, uncompiled));
         // tempLineTrigger(from, howMany, fn) — position-based, no pattern. Fires
         // on `howMany` lines starting `from` lines ahead (from=1 = next line),
         // then self-expires. The TriggerEngine handles the line countdown; here
         // we mirror it with a `fires` counter so the callback is released after
         // the final fire (or earlier via killTrigger).
-        this.lua.global.set('__mudlet_tempLineTrigger', (from: unknown, howMany: unknown, cbId: number) => {
-            const id = this.api.allocateItemId();
-            const total = Math.max(1, Math.trunc(Number(howMany)) || 1);
-            let fires = 0;
-            let killed = false;
-            let unsub: () => void = () => {};
-            const kill = () => {
-                if (killed) return;
-                killed = true;
-                unsub();
-                releaseCb(cbId);
-                this.tempIds.delete(id);
-            };
-            unsub = this.api.triggers.addTempLine(Number(from), Number(howMany), () => {
-                if (killed || this.tempIds.get(id)?.enabled === false) return;
+        this.lua.global.set('__mudlet_tempLineTrigger', (from: unknown, howMany: unknown, cbId: number, uncompiled?: unknown) =>
+            // The engine counts the lines and retires the trigger after the
+            // last of them, as TTrigger::match does with mLineDelta.
+            this.api.triggers.createTempLine(Number(from), Number(howMany), () => {
                 // A line trigger has no pattern and so no captures, and Mudlet
                 // changes "matches" only for a fire with captures
                 // (TLuaInterpreter::setMatches) — the script is handed the
                 // table the previous fire left in place, not one of its own.
                 dispatchCb(cbId, 'tempLineTrigger');
-                fires++;
-                if (fires >= total) kill();
-            });
-            this.tempIds.set(id, { kill, type: 'trigger', enabled: true });
-            return id;
-        });
+            }, {
+                id: this.api.allocateItemId(),
+                uncompiled: uncompiled === true,
+                onFree: () => releaseCb(cbId),
+            }));
         this.lua.global.set('killTrigger', (idOrName: number | string) => {
-            // A temp item named by the script (tempComplexRegexTrigger) is
-            // reachable by that name, and is what Mudlet kills first — only a
-            // permanent item answers a name no temporary one carries.
-            const tempId = this.tempItemId(idOrName, 'trigger');
-            if (tempId !== null && this.tempIds.has(tempId)) return this.killTempItem(tempId, 'trigger');
-            if (typeof idOrName === 'string') return this.api.killByName('trigger', idOrName);
-            // A tempComplexRegexTrigger lives in the tree, not the temp
-            // registry, so its id is a node id — try that before giving up.
-            if (this.api.removeTemporaryTrigger(idOrName)) return true;
-            return this.killTempItem(idOrName, 'trigger');
+            const triggers = this.api.triggers;
+            // By id: the temp trigger handed that id, or failing that one an
+            // XML package brought in as isTempTrigger="yes" (a store node).
+            if (typeof idOrName === 'number') {
+                if (triggers.hasTemp(idOrName)) return triggers.killTemp(idOrName);
+                return this.api.removeTemporaryTrigger(idOrName);
+            }
+            // By name (see ScriptingEngine.killByName). A temp trigger's name
+            // is its id unless tempComplexRegexTrigger gave it one.
+            return this.api.killByName('trigger', idOrName);
         });
 
         // ── Keys ──────────────────────────────────────────────────────────────
@@ -2008,7 +2285,7 @@ export class LuaRuntime implements IScriptingRuntime {
         // boardModifier bitmask (default 0 = no modifier); keyCode is a
         // Qt::Key int. The Bridge.lua wrapper resolves the optional-modifier
         // overload before passing here.
-        this.lua.global.set('__mudlet_tempKey', (modifier: number, key: string | number, cbId: number, source?: string) => {
+        this.lua.global.set('__mudlet_tempKey', (modifier: number, key: string | number, cbId: number, source?: string, uncompiled?: unknown) => {
             const mods = qtModifiersToList(modifier);
             const keyCode = qtKeyToDomCode(key, modifier);
             // Keep the raw Qt key/modifier so getKeyCode() can report them back
@@ -2017,7 +2294,7 @@ export class LuaRuntime implements IScriptingRuntime {
             this.api.warnReservedTempKey(keyCode, mods, typeof source === 'string' && source ? source : undefined);
             return this.api.keys.addTemp(keyCode, mods, () => {
                 dispatchCb(cbId, 'tempKey');
-            }, { keyCode: qtKey, modifier });
+            }, { keyCode: qtKey, modifier, uncompiled: uncompiled === true, onFree: () => releaseCb(cbId) });
         });
         this.lua.global.set('killKey', (idOrName: number | string) =>
             typeof idOrName === 'string'
@@ -2033,15 +2310,12 @@ export class LuaRuntime implements IScriptingRuntime {
             }
             let info = this.api.keys.getKeyCode(arg);
             // A numeric id can also name a PERMANENT key (the id permKey
-            // returned); the key engine indexes those by name only.
-            if (!info && typeof arg === 'number') {
-                const node = this.api.keyNodeByNumericId(arg);
-                if (node) {
-                    info = {
-                        keyCode: domCodeToQtKey(node.key) ?? 0,
-                        modifiers: listToQtModifiers(node.modifiers),
-                    };
-                }
+            // returned), which the key engine indexes by name only — and it
+            // holds neither key groups nor switched-off keys, which still have
+            // a key code to answer with.
+            if (!info) {
+                const node = this.api.savedKeyNode(arg);
+                if (node) info = permKeyCode(node);
             }
             if (!info) {
                 return [null, typeof arg === 'number'
@@ -2158,14 +2432,15 @@ export class LuaRuntime implements IScriptingRuntime {
         // success/error via sysXxxHttp* events. The JS bindings below just kick
         // off the background request; the (true, url) tuple is added by the
         // Bridge.lua wrappers that call these `__` primitives.
-        // Mudlet refuses a malformed url locally — QUrl::fromUserInput(...) then
-        // !isValid() — and returns (nil, "<fn>: url is invalid, reason: ...")
-        // without issuing a request. Report the reason here (a real parser lives
-        // on this side) and let the Bridge.lua wrappers shape the tuple. The
-        // scheme test mirrors fromUserInput's leniency: a bare "localhost/x" is
-        // a valid url that means http://localhost/x.
-        this.lua.global.set('__mudlet_url_invalid_reason', (url: unknown) =>
-            userUrlInvalidReason(String(url ?? '')) ?? false);
+        // Mudlet refuses a malformed url, or one that is not http or https (or a
+        // local file, for downloadFile), locally — and returns (nil, "url is
+        // invalid, reason: ...") without issuing a request. Report the reason
+        // here (a real parser lives on this side) and let the Bridge.lua
+        // wrappers shape the tuple. The scheme test mirrors fromUserInput's
+        // leniency: a bare "localhost/x" is a valid url that means
+        // http://localhost/x.
+        this.lua.global.set('__mudlet_url_invalid_reason', (url: unknown, allowLocalFile: unknown) =>
+            userUrlRefusal(String(url ?? ''), allowLocalFile === true) ?? false);
         // What the url means once fromUserInput has read it — the string the
         // request goes to and the one Mudlet hands back as the second return.
         this.lua.global.set('__mudlet_normalize_url', (url: unknown) => normalizeUserUrl(String(url ?? '')));
@@ -2279,16 +2554,29 @@ export class LuaRuntime implements IScriptingRuntime {
         });
 
         this.installSafeFunctionTostring();
+        // 64-bit integer semantics for string.format, tonumber and table.insert
+        // (wasm32's lua_Integer and long are 32 bits). First of the
+        // Lua chunks, so nothing captures an unwrapped original as an upvalue.
+        this.lua.doStringSync(WIDE_INTEGERS_LUA);
 
         // Bootstrap chunks run sync — none of them yield. setupRex needs an
         // await for one-time PCRE wasm init; sqliteReady gates the SQL bridge
         // until the sqlite module has finished loading.
-        this.lua.doStringSync(BRIDGE_LUA);
-        await setupRex(this.lua);
-        this.lua.doStringSync(EXEC_LUA);
+        this.runInternalChunk(C_ERROR_LUA, 'none');
+        this.runInternalChunk(BRIDGE_LUA, 'mudlet');
+        await setupRex(this.lua, code => this.runInternalChunk(code, 'lual'));
+        this.runInternalChunk(EXEC_LUA, 'mudlet');
+        // Desktop's raise-on-wrong-type argument contracts (issue #277), wrapped
+        // over the finished bindings before the bundled mudlet-lua tree captures them.
+        // Internal, so the wrappers read as C; luaL_error-positioned at the caller.
+        this.runInternalChunk(buildArgContractLua(), 'lual');
         this.installNativeUtf8Find();
         this.lua.global.set('__mudlet_utf8_casemap', utf8CaseMap);
+        this.installUtf8Natives();
         this.execModule(UTF8, 'utf8', 'utf8');
+        // Desktop loads it as `utf8 = require "lua-utf8"`, and luautf8
+        // registers itself as "utf8" too, so both names require.
+        this.execInternal('package.loaded["lua-utf8"] = utf8; package.loaded["utf8"] = utf8', 'utf8-register');
 
         // Built-in Lua files served read-only via the VFS at /lua/<relative-path>.
         // Derived from mudlet-lua/ directory; keys mirror the paths LuaGlobal.lua
@@ -2330,37 +2618,44 @@ export class LuaRuntime implements IScriptingRuntime {
             builtins.set(`/lua/specs/${p.slice('./specs/'.length)}`,
                 atob(uri.slice(uri.indexOf(',') + 1)));
         }
+        for (const [p, uri] of Object.entries(QT_PACKAGE_ARCHIVES)) {
+            builtins.set(`:/packages/${p.slice('../../import/defaults/'.length)}`,
+                atob(uri.slice(uri.indexOf(',') + 1)));
+        }
         // Kept so anything reading a /lua/ path from the JS side — the package
         // installer, which takes bytes rather than going through Lua's io — sees
         // the same read-only namespace Lua does.
         this.builtinFiles = builtins;
         this.setupVFS(this.vfs, builtins);
-        this.exec(VFS_LUA, 'VFS');
-        this.exec(LUA_GLOBAL_SETUP, 'lua-globals-setup');
+        this.execInternal(VFS_LUA, 'VFS');
+        this.execInternal(LUA_GLOBAL_SETUP, 'lua-globals-setup', 'mudlet');
         await sqliteReady;
         this.setupSqlBridge();
-        this.exec(LUASQL_LUA, 'Luasql');
-        this.toLuaValue = setupYajl(this.lua).transform;
-        this.exec(YAJL_LUA, 'Yajl');
+        this.execInternal(LUASQL_LUA, 'Luasql');
+        this.yajl = setupYajl(this.lua, (name, fn) => this.registerRawGlobal(name, fn));
+        // lua-yajl raises with lua_error throughout (Yajl.lua passes level 0
+        // everywhere), hence the `mudlet` flavour of error.
+        this.execInternal(YAJL_LUA, 'Yajl', 'mudlet');
+        // Desktop loads it as `yajl = require "yajl"`, so the name requires.
+        this.execInternal('package.loaded.yajl = yajl', 'yajl-register');
         // lpeg (Mudlet 4.21 bundles the C library). The browser has no C lpeg, so
         // we register the pure-Lua LuLPeg port under package.loaded["lpeg"]. This
         // MUST run before LuaGlobal.lua, whose `if package.loaded["lpeg"] then lpeg
-        // = require "lpeg" end` guard publishes the global. dofile (not require) —
-        // bundled modules sit in the VFS at /lua/... but /lua isn't on package.path
-        // outside busted builds, so LuaGlobal.lua loads its own 3rdparty/* the same
-        // way. pcall-guarded so a load failure leaves lpeg nil (the prior
-        // behaviour) rather than aborting runtime setup.
-        this.exec(
-            `do local ok, mod = pcall(dofile, "/lua/3rdparty/lulpeg.lua")
-                 if ok and mod then package.loaded["lpeg"] = mod
-                 else print("[mudlet] lpeg (LuLPeg) failed to load: " .. tostring(mod)) end
-             end`,
-            'lpeg-register',
-        );
+        // = require "lpeg" end` guard publishes the global. Read and compiled here
+        // rather than required — bundled modules sit in the VFS at /lua/... but
+        // /lua isn't on package.path outside busted builds — and compiled as
+        // Mudlet Web's own code, since desktop's lpeg is C. pcall-guarded so a
+        // load failure leaves lpeg nil rather than aborting runtime setup.
+        //
+        // LuLPeg predates LPeg 1.1, which is what desktop links (the lpeg rock):
+        // there `version` is the string "LPeg 1.1.0" rather than a function, and
+        // utfR(from, to) matches one UTF-8 character in a codepoint range. utfR
+        // is built here out of byte ranges.
+        this.execInternal(LPEG_REGISTER_LUA, 'lpeg-register');
+        this.setupAnsiColorTable();
         this.exec(LUAGLOBAL, 'LuaGlobal');
         this.installMudletLuaOverrides();
         this.installFastColorEcho();
-        this.setupAnsiColorTable();
         // Record the default namespace so the Variables view can hide built-ins.
         // Must run after the bundle but before any user global is added.
         this.exec(CAPTURE_BASELINE_LUA, 'baseline-globals');
@@ -2391,15 +2686,25 @@ export class LuaRuntime implements IScriptingRuntime {
      * wasmoon's habit of stringifying a bound global into its entire JS source.
      * Lua 5.1's `print` reads the global at call time, so it follows along.
      *
+     * It counts its arguments rather than naming one: a named parameter turns
+     * `tostring()` into `tostring(nil)` and answers "nil", where stock Lua
+     * raises "bad argument #1 to 'tostring' (value expected)" — with no
+     * position, as luaL_argerror gives a C function — and a buggy
+     * `tostring(select(2, ...))` has to fail here as it does on desktop.
+     *
      * Installed after every `global.set` above and before Bridge.lua, so no
      * bundled or user chunk can capture the unsafe version as an upvalue.
      */
     private installSafeFunctionTostring(): void {
-        this.lua.doStringSync(
+        this.runInternalChunk(
             `do
   local raw = tostring
   local getmt, setmt = debug.getmetatable, debug.setmetatable
-  function tostring(v)
+  function tostring(...)
+    if select('#', ...) == 0 then
+      error("bad argument #1 to 'tostring' (value expected)", 0)
+    end
+    local v = ...
     if type(v) ~= 'function' then return raw(v) end
     local mt = getmt(v)
     if mt == nil then return raw(v) end
@@ -2410,6 +2715,7 @@ export class LuaRuntime implements IScriptingRuntime {
     return 'function: (unknown)'
   end
 end`,
+            'none',
         );
     }
 
@@ -2559,25 +2865,61 @@ end`,
     //   * it only accelerates func == "echo"; insertText/echoLink/echoPopup and
     //     the label-HTML path route through the untouched original.
     // The bundled GUIUtils.lua is not modified. Runs after LuaGlobal.lua.
+    //
+    // The fast path stands in for xEcho's calls to the global `echo`, so it is
+    // taken only while that global is still the stock one: desktop's colour
+    // echoes go through whatever `echo` a script installed (a wrapper that
+    // upper-cases, logs, redirects), and with one in place every colour echo
+    // goes the Lua way and calls it (mudlet-web#374). The builtins it uses are
+    // bound once here, so a script's own global `select` or `type` reaches
+    // xEcho's own code exactly as on desktop and nothing more.
     private installFastColorEcho(): void {
         this.exec(
             `do
   local fast = __mudletFastColorEcho
   local orig_xEcho = xEcho
+  local stockEcho = echo
+  local select, type, tostring = select, type, tostring
   local styleKind = { Decimal = 'decho', Color = 'cecho', Hex = 'hecho' }
+  -- The palette the native cecho resolves names with. Mudlet's xEcho reads the
+  -- live color_table per tag, so any tag whose color_table entry no longer
+  -- matches it (a script set color_table.red = {...}) goes the Lua way.
+  local builtin = ${cechoFastPaletteLua()}
+  local gmatch = string.gmatch
+  local function paletteIntact(str)
+    local ct = color_table
+    if type(ct) ~= 'table' then return false end
+    for name in gmatch(str, '<([%w_]+)>') do
+      if name ~= 'r' and name ~= 'reset' then
+        local c, b = ct[name], builtin[name]
+        if not (c and b and c[1] == b[1] and c[2] == b[2] and c[3] == b[3]) then
+          return false
+        end
+      end
+    end
+    return true
+  end
   function xEcho(style, func, ...)
-    if func == 'echo' then
+    if func == 'echo' and _G.echo == stockEcho then
       local kind = styleKind[style]
       if kind then
         local n = select('#', ...)
         local a, b = ...
         local win, str
-        if n >= 2 and type(a) == 'string' and type(b) == 'string' then
-          win, str = a, b
+        -- As the original xEcho reads it: any second argument is the text,
+        -- whatever its type, so cecho("win", 42) echoes 42 into "win". Only a
+        -- number has a text the fast path can take as it is; anything else
+        -- goes the Lua way.
+        if n >= 2 and type(a) == 'string' and b then
+          if type(b) == 'string' then
+            win, str = a, b
+          elseif type(b) == 'number' then
+            win, str = a, tostring(b)
+          end
         elseif n >= 1 and type(a) == 'string' then
           win, str = 'main', a
         end
-        if str ~= nil and fast(kind, win, str) then return end
+        if str ~= nil and (kind ~= 'cecho' or paletteIntact(str)) and fast(kind, win, str) then return true end
       end
     end
     return orig_xEcho(style, func, ...)
@@ -2592,123 +2934,98 @@ __mudletFastColorEcho = nil`,
     // C++ does this; GUIUtils.lua only fills the *named* colours. ansi2decho,
     // closestColor and the colour-conversion helpers all read color_table
     // ["ansi_NNN"], so without these they produce wrong output. Sourced from
-    // Mudlet Web's own xterm256 palette (shared with the ANSI renderer, so the table
-    // matches what's actually drawn) and only set where unset, so a runtime/theme
-    // override survives. Must run after LuaGlobal.lua creates color_table.
+    // Mudlet Web's own xterm256 palette (shared with the ANSI renderer, so the
+    // table matches what's actually drawn).
+    //
+    // Run before LuaGlobal.lua, in desktop's order: the Host constructor fills a
+    // fresh color_table with the sixteen ANSI entries (updateAnsi16ColorsInTable)
+    // and then ansi_016 to ansi_255 (updateExtendedAnsiColorsInTable), and only
+    // after that does loadGlobal() let GUIUtils.lua add the named colours. The
+    // order is observable: closestColor — and so decho2cecho and friends — picks
+    // between equally near names by which one pairs() reaches first, and Lua
+    // 5.1's pairs() order follows the keys inserted and the order they went in.
     private setupAnsiColorTable(): void {
-        const triples = xterm256.map(hex => {
+        // The sixteen ANSI entries follow the palette actually in force — the
+        // profile's own colours, and whatever the server redefines with
+        // `ESC]P`/`ESC]R` — as desktop's do: Host calls
+        // updateAnsi16ColorsInTable when the profile loads and on every one of
+        // those changes, so `<ansi_red>` paints the colour the game's red does.
+        this.updateAnsi16ColorsInTable();
+        this.stopAnsiPaletteSync = onAnsiPaletteChange(() => this.updateAnsi16ColorsInTable());
+        const triples = xterm256.slice(16).map(hex => {
             const r = parseInt(hex.slice(1, 3), 16);
             const g = parseInt(hex.slice(3, 5), 16);
             const b = parseInt(hex.slice(5, 7), 16);
             return `{${r},${g},${b}}`;
         }).join(',');
-        // The 16 base colours also get Mudlet's named aliases, in BOTH the
-        // snake_case (ansi_light_red) and camelCase (ansiLightRed) conventions
-        // Mudlet ships — keyed to indices 0..15. cecho/hecho conversions and
-        // cecho2string reference these names.
-        const named = [
-            'black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white',
-            'light_black', 'light_red', 'light_green', 'light_yellow',
-            'light_blue', 'light_magenta', 'light_cyan', 'light_white',
-        ].flatMap((name, i) => {
-            const camel = 'ansi' + name.split('_').map(w => w[0].toUpperCase() + w.slice(1)).join('');
-            return [
-                `  if not color_table["ansi_${name}"] then color_table["ansi_${name}"] = p[${i + 1}] end`,
-                `  if not color_table["${camel}"] then color_table["${camel}"] = p[${i + 1}] end`,
-            ];
-        }).join('\n');
         this.exec(
             `do
   color_table = color_table or {}
   local p = {${triples}}
-  for i = 0, ${xterm256.length - 1} do
-    local k = string.format("ansi_%03d", i)
-    if not color_table[k] then color_table[k] = p[i + 1] end
+  for i = 16, ${xterm256.length - 1} do
+    color_table[string.format("ansi_%03d", i)] = p[i - 15]
   end
-${named}
 end`,
             'ansi-color-table',
         );
     }
 
-    /**
-     * True when a script-created (temp) alias/trigger with this id is live and of
-     * the given type. Backs exists(id, "alias"/"trigger") for temp items, which
-     * don't live in the persisted store the way permanent items do.
-     */
-    tempItemExists(id: number, type: string): boolean {
-        return this.tempIds.get(id)?.type === type;
-    }
-
-    /** A live temp item of `type` carrying this Mudlet-supplied name — how
-     *  exists()/killTrigger() reach a tempComplexRegexTrigger. */
-    tempItemIdByName(name: string, type: string): number | null {
-        for (const [id, entry] of this.tempIds) {
-            if (entry.type === type && !entry.dead && entry.name === name) return id;
-        }
-        return null;
-    }
+    private static readonly ANSI16_NAMES = [
+        'black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white',
+        'light_black', 'light_red', 'light_green', 'light_yellow',
+        'light_blue', 'light_magenta', 'light_cyan', 'light_white',
+    ];
 
     /**
-     * killAlias/killTrigger with a numeric id, for a script-created item.
+     * TLuaInterpreter::updateAnsi16ColorsInTable: write the sixteen ANSI colours
+     * in force into `color_table` under all three of their names (`ansi_001`,
+     * `ansi_red`, `ansiRed`), each a fresh `{r, g, b}`. Unconditional — the
+     * entries describe the palette, so they replace whatever was there.
      *
-     * The item is unsubscribed and its callback released straight away — it must
-     * not fire again, including later in the very line pass that killed it — but
-     * the entry stays in the map, marked dead, until {@link reapKilledTempItems}.
-     * That is Mudlet's deferred cleanup: until the line ends, the corpse is still
-     * findable, which is what lets a second kill report `false` rather than
-     * mistaking the id for one that never existed.
+     * Raw table writes on the main state rather than a Lua chunk: this runs
+     * whenever the palette moves, which can be in the middle of a script (a
+     * `feedTriggers` carrying `ESC]P`), and it must neither dispatch anything
+     * nor be able to fail half-way.
      */
-    /** Resolve a killTrigger/killAlias argument to a live temp item's id: the
-     *  number itself, or the name a tempComplexRegexTrigger was given. */
-    tempItemId(idOrName: number | string, type: 'alias' | 'trigger'): number | null {
-        if (typeof idOrName === 'number') return idOrName;
-        const byName = this.tempItemIdByName(idOrName, type);
-        if (byName !== null) return byName;
-        return /^\d+$/.test(idOrName) ? Number(idOrName) : null;
-    }
-
-    private killTempItem(id: number, type: 'alias' | 'trigger'): boolean {
-        const entry = this.tempIds.get(id);
-        if (!entry || entry.type !== type || entry.dead) return false;
-        entry.kill();
-        entry.enabled = false;
-        entry.dead = true;
-        // kill() removes the entry (that is how expiry retires an item), so put
-        // the corpse back for the reap to find.
-        this.tempIds.set(id, entry);
-        return true;
-    }
-
-    /**
-     * Free every temp alias/trigger killed since the last call, or only those of
-     * `type` when given.
-     *
-     * Mudlet cleans up per unit, at the end of whatever pass that unit runs:
-     * aliases when nested expandAlias processing unwinds, triggers when the line
-     * finishes. Passing the type keeps those independent, so an alias pass can't
-     * reap a trigger the current line is still walking past.
-     */
-    reapKilledTempItems(type?: 'alias' | 'trigger'): void {
-        for (const [id, entry] of this.tempIds) {
-            if (entry.dead && (type === undefined || entry.type === type)) this.tempIds.delete(id);
+    private updateAnsi16ColorsInTable(): void {
+        if (this.inert) return;
+        const api = this.lua.global.luaApi;
+        const L = this.lua.global.address;
+        this.syncGlobalsFromRunning();
+        const top = api.lua_gettop(L);
+        try {
+            api.lua_pushstring(L, 'color_table');
+            api.lua_rawget(L, LUA_GLOBALSINDEX);
+            if (api.lua_type(L, -1) !== LuaType.Table) {
+                // `color_table = color_table or {}` — but a script that put
+                // something truthy other than a table there keeps it.
+                if (api.lua_toboolean(L, -1)) return;
+                api.lua_settop(L, top);
+                api.lua_createtable(L, 0, 0);
+                api.lua_pushvalue(L, -1);
+                this.rawSetGlobal('color_table');
+            }
+            const palette = getAnsi16Palette();
+            for (let i = 0; i < 16; i++) {
+                const hex = palette[i];
+                const rgb = [1, 3, 5].map(o => parseInt(hex.slice(o, o + 2), 16));
+                const name = LuaRuntime.ANSI16_NAMES[i];
+                const camel = 'ansi' + name.split('_').map(w => w[0].toUpperCase() + w.slice(1)).join('');
+                for (const key of [`ansi_${String(i).padStart(3, '0')}`, `ansi_${name}`, camel]) {
+                    api.lua_pushstring(L, key);
+                    api.lua_createtable(L, 3, 0);
+                    for (let c = 0; c < 3; c++) {
+                        api.lua_pushnumber(L, rgb[c]);
+                        api.lua_rawseti(L, -2, c + 1);
+                    }
+                    api.lua_rawset(L, -3);
+                }
+            }
+        } catch (e) {
+            if (!this.markFatal(e)) throw e;
+        } finally {
+            if (!this.inert) api.lua_settop(L, top);
         }
-    }
-
-    /** enableTrigger/disableTrigger/enableAlias/disableAlias with a numeric id.
-     *  False when no temp item of that id is live — a killed one is still
-     *  findable until the reap, but re-enabling it would resurrect it. */
-    setTempItemEnabled(id: number, enabled: boolean): boolean {
-        const entry = this.tempIds.get(id);
-        if (!entry || entry.dead) return false;
-        entry.enabled = enabled;
-        return true;
-    }
-
-    /** Whether a live temp item is enabled — backs isActive(id, type). */
-    tempItemEnabled(id: number): boolean {
-        const entry = this.tempIds.get(id);
-        return entry?.enabled === true && !entry.uncompiled;
     }
 
     // ── busted bridge (VITE_BUSTED builds only) ──────────────────────────────
@@ -2783,6 +3100,9 @@ end`);
             this.api.pumpHyperlinkReveals();
             // And the size a user window just opened arrives at.
             this.api.pumpCreatedWindowSizes();
+            // And the map repaint updateMap() or centerview() asked for, which
+            // is what runs the registerMapInfo contributors.
+            this.api.pumpMapPaint();
             if (Date.now() >= deadline) return true;
             // Let real time advance a little so pending timers come due, without
             // overshooting the caller's deadline.
@@ -2832,183 +3152,289 @@ end`);
     }
 
     // ── luasql.sqlite3 bridge ────────────────────────────────────────────────
-    // Exposes globals consumed by Luasql.lua: __sql_open / __sql_exec /
-    // __sql_close / __sql_escape. All synchronous — sqlite runs on the main
-    // thread, so Lua doesn't need to yield Promises.
+    // The globals Luasql.lua is built on. All synchronous — sqlite runs on the
+    // main thread, so Lua doesn't need to yield Promises. sqliteClient.ts owns
+    // the connections and their databases; this layer maps paths onto the
+    // profile VFS and carries values across the wasmoon bridge as BYTES:
+    //   - SQL text arrives armored (__mudlet_armor), so a latin1 or binary
+    //     literal reaches sqlite unchanged instead of UTF-8-decoded to U+FFFD.
+    //   - Results return as Lua source (sqlRowEncoder), every string a literal
+    //     of \DDD escapes: one crossing per result, and pure ASCII on the wire.
     //
-    // VFS round-trip: on open we preload from the ProfileVFS via
-    // sqlite3_deserialize; the VFS file is the source of truth. After each
-    // mutation we schedule a debounced snapshot (setTimeout) back to the same
-    // VFS path so a tight INSERT loop coalesces into one write.
-    //
-    // Row arrays are 1-indexed for Lua: wasmoon's pushTable iterates
-    // Object.keys, so a sparse JS array with index 0 absent and 1..n populated
-    // lands in Lua as a clean 1-indexed sequence.
+    // Persistence: a database's committed state is written back to its VFS
+    // path once its writes settle (coalesced — see SNAPSHOT_DELAY_MS in
+    // sqliteClient.ts), before anything reads that file (the VFS read barrier
+    // — a backup script copying Database_x.db right after db:add must get the
+    // row it just added, as it does from desktop's file), on saveProfile(),
+    // when the page hides or unloads, when this runtime goes, and when its last
+    // connection closes. The other way round, a write to or removal of the
+    // file through the VFS reaches the open connections (the write observer).
     private setupSqlBridge(): void {
         const sql = getSqliteClient();
+        const vfs = this.vfs;
+        // Connections this runtime opened: destroy() closes them (rolling back
+        // what they never committed) instead of leaving them in the
+        // page-lifetime client for the next runtime to trip over.
+        const owned = new Set<number>();
 
-        const toLuaArray = <T>(arr: T[]): T[] => {
-            const r: T[] = [];
-            for (let i = 0; i < arr.length; i++) r[i + 1] = arr[i];
-            return r;
+        const bytesOf = (byteString: string): Uint8Array => {
+            const out = new Uint8Array(byteString.length);
+            for (let i = 0; i < byteString.length; i++) out[i] = byteString.charCodeAt(i) & 0xff;
+            return out;
         };
+        const PREFIX = bytesOf('LuaSQL: ');
+        const failSrc = (message: Uint8Array): string => {
+            const full = new Uint8Array(PREFIX.length + message.length);
+            full.set(PREFIX);
+            full.set(message, PREFIX.length);
+            return `return nil,${encodeLuaBytes(full)}`;
+        };
+        const listSrc = (items: (Uint8Array | null)[]): string =>
+            '{' + items.map(v => (v ? encodeLuaBytes(v) : 'nil')).join(',') + '}';
 
-        const SNAPSHOT_DEBOUNCE_MS = 500;
-        const dbPaths = new Map<number, string>();
-        const pendingTimers = new Map<number, ReturnType<typeof setTimeout>>();
+        // Nothing here may touch the sqlite module itself: if its wasm failed to
+        // load, the runtime must still start, with only db:* and luasql
+        // failing (connect answers nil plus the reason). The hooks below only
+        // walk the client's own maps, which stay empty in that case.
+        this.flushPendingSqlSnapshots = () => sql.flushAll();
 
-        const snapshotNow = (dbId: number): void => {
-            const path = dbPaths.get(dbId);
-            if (!path || !this.vfs) return;
+        // A database's committed bytes go to its file, and on to the backing
+        // store at once: writeBinaryFile alone only reaches the VFS's RAM
+        // cache, and a page closed before some later flush would lose a commit
+        // desktop already had on disk.
+        let persisting = false;
+        const persistTo = (key: string) => (bytes: Uint8Array): void => {
+            if (!vfs) return;
+            persisting = true;
             try {
-                const bytes = sql.exportFile(dbId);
-                // sqlite3_js_db_export returns an empty Uint8Array for an
-                // in-memory DB with no committed pages (a bare connect+close
-                // with no DDL/DML). Writing 0 bytes would poison the VFS path:
-                // the next __sql_open would read it back and reject it as too
-                // small for a SQLite header. Skip the write instead.
-                if (bytes.byteLength === 0) return;
-                this.vfs.writeBinaryFile(path, bytes);
-            } catch (e) {
-                console.warn('[sql snapshot]', path, e);
+                vfs.writeBinaryFile(key, bytes);
+            } finally {
+                persisting = false;
             }
+            void vfs.flush?.();
         };
 
-        const scheduleSnapshot = (dbId: number): void => {
-            if (!this.vfs) return;
-            // The very first write goes out immediately: DB.lua's
-            // db:_isActiveDBName (which db:close and db:create both consult)
-            // tests io.exists on the database path, so a database that only
-            // existed in memory read back as "not open" until the debounce
-            // fired half a second later.
-            const path = dbPaths.get(dbId);
-            if (path && !this.vfs.exists(path)) { snapshotNow(dbId); return; }
-            const prev = pendingTimers.get(dbId);
-            if (prev) clearTimeout(prev);
-            const t = setTimeout(() => {
-                pendingTimers.delete(dbId);
-                snapshotNow(dbId);
-            }, SNAPSHOT_DEBOUNCE_MS);
-            pendingTimers.set(dbId, t);
-        };
-
-        this.flushPendingSqlSnapshots = () => {
-            for (const [dbId, t] of pendingTimers) {
-                clearTimeout(t);
-                snapshotNow(dbId);
-            }
-            pendingTimers.clear();
-        };
-
-        this.lua.global.set('__sql_open', (path: unknown): number => {
-            const p = String(path);
-            // Reuse a still-open connection to the same path. DB.lua's db:create
-            // → db:_migrate reconnects mid-session (adding a column, changing
-            // _violations) by overwriting db.__conn WITHOUT closing the previous
-            // handle. Opening a fresh :memory: DB each time would both strand the
-            // rows written since the last snapshot (Lua runs synchronously, so
-            // the debounced VFS snapshot hasn't fired) and leak the old handle.
-            // The live in-memory DB already holds the current committed state, so
-            // hand the same dbId back; the VFS is consulted only on a cold open.
-            const live = sql.liveId(p);
-            if (live != null) return live;
-            let preload: Uint8Array | undefined;
-            if (this.vfs && this.vfs.exists(p)) {
-                let raw: Uint8Array;
+        // What sqlite needs to open a database a statement names (ATTACH,
+        // VACUUM INTO): the profile file, read as __sql_open reads one.
+        const readForSql = (key: string): Uint8Array | null | false => {
+            if (!vfs) return false;
+            const st = vfs.stat(key);
+            if (st?.type === 'dir') return false;
+            if (st) {
                 try {
-                    raw = this.vfs.readBinaryFile(p);
+                    return new Uint8Array(vfs.readBinaryFile(key));
+                } catch {
+                    return false;
+                }
+            }
+            const parent = key.substring(0, key.lastIndexOf('/')) || '/';
+            return vfs.stat(parent)?.type === 'dir' ? null : false;
+        };
+
+        const fileHost: FileHost | null = vfs ? {
+            resolve: name => vfs.resolvePath(name),
+            read: readForSql,
+            persist: (abs, bytes) => persistTo(abs)(bytes),
+        } : null;
+        if (!sql.unavailable() && vfs && fileHost) {
+            vfs.setReadBarrier?.(abs => sql.flush(abs));
+            sql.setFileHost(fileHost);
+            // A change made to a database's file from outside sqlite reaches the
+            // connections on it, as it does on desktop where the file IS the
+            // database: bytes written over it are its new contents, and a file
+            // removed or renamed away leaves them on the unlinked file.
+            vfs.setWriteObserver?.((abs, kind) => {
+                if (persisting) return;
+                if (kind === 'remove') {
+                    sql.fileRemoved(abs);
+                } else if (sql.isLive(abs)) {
+                    try {
+                        sql.fileReplaced(abs, () => new Uint8Array(vfs.readBinaryFile(abs)));
+                    } catch (e) {
+                        console.warn('[sql] could not reload', abs, e);
+                    }
+                }
+            });
+        }
+
+        // A write still waiting to be written out when the page goes. Hidden
+        // counts too: a backgrounded tab is the one a mobile browser or the OS
+        // kills without a pagehide, and its timers may not run before then.
+        const onUnload = () => sql.flushAll();
+        const onHidden = () => {
+            if (document.visibilityState === 'hidden') sql.flushAll();
+        };
+        if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+            window.addEventListener('pagehide', onUnload);
+            window.addEventListener('beforeunload', onUnload);
+        }
+        if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+            document.addEventListener('visibilitychange', onHidden);
+        }
+
+        this.closeSqlConnections = () => {
+            // Everything still waiting goes out while this runtime's VFS is
+            // still there to take it — a database shared with another profile's
+            // connection is not torn down by the close below, and would
+            // otherwise sit on its timer past this profile's VFS unmounting.
+            sql.flushAll();
+            for (const id of owned) sql.close(id);
+            owned.clear();
+            if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+                window.removeEventListener('pagehide', onUnload);
+                window.removeEventListener('beforeunload', onUnload);
+            }
+            if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+                document.removeEventListener('visibilitychange', onHidden);
+            }
+            if (vfs) {
+                vfs.setReadBarrier?.(null);
+                vfs.setWriteObserver?.(null);
+            }
+            if (fileHost) sql.releaseFileHost(fileHost);
+        };
+
+        this.lua.global.set('__sql_version', sql.version() ?? undefined);
+
+        // env:connect. A number is the new connection; a string is why it could
+        // not be opened, in sqlite's words.
+        this.lua.global.set('__sql_open', (path: unknown, readOnly: unknown): number | string => {
+            const p = String(path);
+            const ro = readOnly === true;
+            const CANTOPEN = 'unable to open database file';
+            const unavailable = sql.unavailable();
+            if (unavailable) return unavailable;
+            if (p.includes(':memory:')) {
+                try {
+                    const id = sql.openMemory();
+                    owned.add(id);
+                    return id;
                 } catch (e) {
-                    throw new Error(`VFS read of '${p}' failed: ${e instanceof Error ? e.message : String(e)}`);
-                }
-                // Normalize to a fresh, byteOffset=0, standalone Uint8Array —
-                // ZenFS may return a Buffer slice that spans only part of an
-                // underlying ArrayBuffer.
-                const fresh = new Uint8Array(raw.byteLength);
-                fresh.set(raw);
-                // 0-byte file: treat as if the DB doesn't exist yet. snapshotNow
-                // now skips empty exports, but older sessions or interrupted runs
-                // may have left a 0-byte file behind that would otherwise jam
-                // every future open of this path.
-                if (fresh.byteLength === 0) {
-                    console.warn(`[__sql_open] '${p}' exists as 0 bytes — opening as fresh database`);
-                } else if (fresh.byteLength < 512) {
-                    throw new Error(`VFS file '${p}' is ${fresh.byteLength} bytes, too small to be a SQLite database`);
-                } else {
-                    // Quick header sniff — SQLite files start with "SQLite format 3\0".
-                    const HDR = 'SQLite format 3\0';
-                    let headerOk = true;
-                    for (let i = 0; i < HDR.length; i++) {
-                        if (fresh[i] !== HDR.charCodeAt(i)) { headerOk = false; break; }
-                    }
-                    if (!headerOk) {
-                        throw new Error(`VFS file '${p}' is not a SQLite database (bad header). First bytes: ${Array.from(fresh.subarray(0, 16)).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
-                    }
-                    preload = fresh;
+                    return e instanceof Error ? e.message : String(e);
                 }
             }
-            const dbId = sql.open(p, preload);
-            dbPaths.set(dbId, p);
-            return dbId;
-        });
-
-        this.lua.global.set('__sql_exec', (dbId: unknown, sqlText: unknown) => {
-            const id = Number(dbId);
-            try {
-                const r = sql.exec(id, String(sqlText));
-                if (r.kind === 'rows') {
-                    // Return rows as a Lua source literal instead of a nested
-                    // JS array. wasmoon's pushTable crosses the JS↔WASM boundary
-                    // once per cell — for a fetch of N rows × M columns that's
-                    // N*M crossings, which dominates large-result paths. By
-                    // emitting `{{...},{...},...}` and letting Lua's loadstring
-                    // parse it, we replace N*M boundary crossings with one
-                    // string push plus an in-wasm parse.
-                    const rowsSrc = encodeRowsToLuaSource(r.rows as unknown[][]);
-                    const cols1 = toLuaArray(r.columns);
-                    return {kind: 'rows', rowsSrc, columns: cols1};
+            let key = p;
+            let preload: Uint8Array | undefined;
+            let persist: ((bytes: Uint8Array) => void) | undefined;
+            if (vfs) {
+                key = vfs.resolvePath(p);
+                const st = vfs.stat(key);
+                if (st?.type === 'dir') return CANTOPEN;
+                if (!sql.isLive(key)) {
+                    if (st) {
+                        try {
+                            // A fresh, byteOffset-0 copy: ZenFS may hand back a
+                            // slice of a larger buffer.
+                            preload = new Uint8Array(vfs.readBinaryFile(key));
+                        } catch {
+                            return CANTOPEN;
+                        }
+                    } else {
+                        // sqlite3_open_v2 creates the file there and then — an
+                        // empty one, which DB.lua's io.exists check relies on —
+                        // and cannot when its directory is missing.
+                        const parent = key.substring(0, key.lastIndexOf('/')) || '/';
+                        if (ro || vfs.stat(parent)?.type !== 'dir') return CANTOPEN;
+                        try {
+                            vfs.writeBinaryFile(key, new Uint8Array(0));
+                        } catch {
+                            return CANTOPEN;
+                        }
+                    }
                 }
-                // Any non-query (INSERT/UPDATE/DELETE/DDL) — schedule a debounced
-                // VFS snapshot. Coalesces a tight db:add loop into one write.
-                scheduleSnapshot(id);
-                return {kind: 'changes', changes: r.changes};
-            } catch (e) {
-                return {kind: 'error', message: e instanceof Error ? e.message : String(e)};
+                persist = persistTo(key);
             }
-        });
-
-        // Declared column types for Luasql.lua's cursor:getcoltypes(). A
-        // missing one (an expression column) stays a hole in the Lua table.
-        this.lua.global.set('__sql_coltypes', (dbId: unknown, sqlText: unknown) => {
-            const types = sql.columnDeclTypes(Number(dbId), String(sqlText));
-            return types ? toLuaArray(types.map(t => t ?? undefined)) : null;
-        });
-
-        this.lua.global.set('__sql_close', (dbId: unknown): boolean => {
-            const id = Number(dbId);
             try {
-                const t = pendingTimers.get(id);
-                if (t) { clearTimeout(t); pendingTimers.delete(id); }
-                snapshotNow(id);
-                sql.close(id);
-                dbPaths.delete(id);
-                return true;
+                const id = sql.open(key, preload, {readOnly: ro, persist});
+                owned.add(id);
+                return id;
             } catch {
-                return false;
+                return CANTOPEN;
             }
         });
 
-        this.lua.global.set('__sql_escape', (s: unknown): string => sql.escape(String(s ?? '')));
+        // conn:execute. A number is sqlite3_changes(); otherwise Lua source for
+        // either `nil, "LuaSQL: <why>"` or a cursor's id, column names and
+        // declared types.
+        this.lua.global.set('__sql_exec', (dbId: unknown, armoredSql: unknown): number | string => {
+            const id = Number(dbId);
+            let r;
+            try {
+                r = sql.luasqlExec(id, bytesOf(unarmor(String(armoredSql))));
+            } catch (e) {
+                return failSrc(bytesOf(e instanceof Error ? e.message : String(e)));
+            }
+            if (r.kind === 'changes') {
+                sql.markDirty(id);
+                return r.changes;
+            }
+            if (r.kind === 'error') return failSrc(r.message);
+            if (r.wrote) sql.markDirty(id);
+            return `return ${r.cursorId},${listSrc(r.columns)},${listSrc(r.declTypes)}`;
+        });
+
+        // cur:fetch, one step: Lua source for the row, for `nil` once the rows
+        // run out, or for `nil, "LuaSQL: <why>"`. Either of the last two means
+        // the cursor is gone.
+        this.lua.global.set('__sql_cursor_fetch', (cursorId: unknown): string => {
+            try {
+                const r = sql.cursorFetch(Number(cursorId));
+                if (r.kind === 'row') return `return ${encodeRowToLuaSource(r.row)}`;
+                return r.kind === 'done' ? 'return nil' : failSrc(r.message);
+            } catch (e) {
+                return failSrc(bytesOf(e instanceof Error ? e.message : String(e)));
+            }
+        });
+
+        this.lua.global.set('__sql_cursor_close', (cursorId: unknown): void => {
+            sql.cursorClose(Number(cursorId));
+        });
+
+        // Fixed transaction-control SQL (COMMIT, ROLLBACK;BEGIN, ...): nil, or
+        // sqlite's error text armored.
+        this.lua.global.set('__sql_script', (dbId: unknown, text: unknown): string | null => {
+            const id = Number(dbId);
+            let err: Uint8Array | null;
+            try {
+                err = sql.script(id, String(text));
+            } catch (e) {
+                return armor(e instanceof Error ? e.message : String(e));
+            }
+            if (err) return armor(String.fromCharCode(...err));
+            sql.markDirty(id);
+            return null;
+        });
+
+        this.lua.global.set('__sql_lastid', (dbId: unknown): number => sql.lastInsertRowid(Number(dbId)));
+
+        this.lua.global.set('__sql_close', (dbId: unknown): void => {
+            const id = Number(dbId);
+            owned.delete(id);
+            sql.close(id);
+        });
     }
 
     // ── VFS bridge ───────────────────────────────────────────────────────────
 
     /**
-     * Fire sysPathChanged for any addFileWatch subscription whose path equals
-     * `changedPath` or is an ancestor directory of it. Mudlet's QFileSystemWatcher
-     * reports the *watched* path (not the inner file) for directory watches, so
-     * we do the same — handlers comparing `path == watchedPath` round-trip.
+     * Fire sysPathChanged for the addFileWatch subscriptions a set of VFS
+     * changes touches, by the rules desktop's QFileSystemWatcher (inotify)
+     * follows:
+     *
+     * - A watched *file* reports any change to it ('modify', 'attrib'), and
+     *   its removal — after which the watch is gone, as the watcher drops a
+     *   path whose inode was deleted or moved away: a file recreated under
+     *   the same name reports nothing, and removeFileWatch answers false.
+     * - A watched *directory* reports its direct children being created,
+     *   removed or renamed, or their attributes changing (lfs.touch) — not a
+     *   write into a child that already exists, and nothing from further
+     *   down the tree. Removing the directory itself reports and drops it.
+     *
+     * The *watched* path is what is reported, not the child, so handlers
+     * comparing `path == watchedPath` round-trip. Each watch reports at most
+     * once per batch.
      */
-    private notifyVfsPathChange(changedPath: string): void {
+    private notifyVfsPathChange(...changes: VfsPathChange[]): void {
         if (this.watchedPaths.size === 0) return;
         // Deferred, because a watch reports a change it *noticed*, not one it
         // took part in. Mudlet's QFileSystemWatcher learns about a write after
@@ -3021,17 +3447,28 @@ end`);
         // mid-call.
         //
         // The watch set is read when the timer fires, not now, so a watch
-        // removed in between correctly reports nothing.
+        // removed in between correctly reports nothing — and a watch the
+        // change itself ends is dropped then too, as the watcher drops it
+        // when it reads the deletion, not when the file goes.
         this.deferToTimerQueue(() => {
             if (this.inert) return;
-            if (this.watchedPaths.has(changedPath)) {
-                this.emitEvent('sysPathChanged', [changedPath]);
-            }
-            for (const watched of this.watchedPaths) {
-                if (watched !== changedPath && changedPath.startsWith(watched + '/')) {
-                    this.emitEvent('sysPathChanged', [watched]);
+            const fired: string[] = [];
+            const report = (watched: string) => {
+                if (!fired.includes(watched)) fired.push(watched);
+            };
+            for (const { path, kind } of changes) {
+                if (this.watchedPaths.has(path)) {
+                    if (kind === 'remove') {
+                        report(path);
+                        this.watchedPaths.delete(path);
+                    } else if (kind !== 'create') {
+                        report(path);
+                    }
                 }
+                const parent = path.substring(0, path.lastIndexOf('/')) || '/';
+                if (parent !== path && kind !== 'modify' && this.watchedPaths.has(parent)) report(parent);
             }
+            for (const watched of fired) this.emitEvent('sysPathChanged', [watched]);
         });
     }
 
@@ -3061,6 +3498,17 @@ end`);
             content: string;
             pos: number;
             dirty: boolean;
+            /** The file position `content` starts at. An append handle does
+             *  not read the file it opens: `content` holds only what it has
+             *  written, behind the `base` bytes already in the file, until an
+             *  "a+" handle reads and {@link loadAppended} fills it in. 0 for
+             *  every other handle. */
+            base: number;
+            /** An append handle that has not read the file it was opened on. */
+            unread: boolean;
+            /** Append modes: where in `content` the bytes this handle wrote
+             *  begin — all close has to add to the file. */
+            appendFrom: number;
         }
 
         const handles = new Map<number, Handle>();
@@ -3089,6 +3537,20 @@ end`);
                 ? builtins.get(filename)!
                 : bytesToLatin1(vfs!.readBinaryFile(filename));
 
+        const isAppend = (h: Handle): boolean => h.mode === 'a' || h.mode === 'a+';
+        /** Put the file an "a+" handle was opened on in front of what it has
+         *  written, the first time it reads: appending never needs the old
+         *  bytes, and reading the whole file on every open made each line a
+         *  log appends cost more the longer the log was (mudlet-web#439). */
+        const loadAppended = (h: Handle): void => {
+            if (!h.unread) return;
+            h.unread = false;
+            const existing = vfs && vfs.exists(h.path) ? readAsLatin1(h.path) : '';
+            h.appendFrom = existing.length;
+            h.content = existing + h.content;
+            h.base = 0;
+        };
+
         this.lua.global.set('__vfs_err__', () => lastError);
         this.lua.global.set('__vfs_errno__', () => lastErrno);
         this.lua.global.set('__vfs_exists__', (path: string) =>
@@ -3101,6 +3563,7 @@ end`);
                 let content = '';
                 let resolvedPath = filename;
                 let dirty = false;
+                let base = 0;
 
                 if (builtins.has(filename)) {
                     if (m !== 'r') { setError(`cannot open '${filename}': read-only`); return null; }
@@ -3114,6 +3577,12 @@ end`);
                         }
                         content = readAsLatin1(filename);
                     } else {
+                        // fopen() refuses a name no desktop file system could
+                        // hold; the write itself would only fail at close.
+                        if (vfs.nameTooLong(filename)) {
+                            setError(`${filename}: File name too long`, 36);
+                            return null;
+                        }
                         // Creating a file never creates its directory: stock
                         // Lua's fopen fails, and Mudlet scripts (table.save
                         // included, which goes through io.open) rely on that
@@ -3134,8 +3603,18 @@ end`);
                             return null;
                         }
                     }
+                    // An append handle starts behind what the file holds; it
+                    // only needs the size (see Handle.base).
                     if (m === 'a' || m === 'a+') {
-                        if (vfs.exists(filename)) content = readAsLatin1(filename);
+                        const size = vfs.stat(filename)?.size;
+                        base = size ?? 0;
+                        // fopen(f, "a") creates a missing file then and there,
+                        // so `io.open(f, "a"):close()` is how scripts make sure
+                        // a file exists. Close only ever appends to it.
+                        if (size === undefined) {
+                            vfs.writeBinaryFile(resolvedPath, new Uint8Array(0));
+                            this.notifyVfsPathChange({ path: resolvedPath, kind: 'create' });
+                        }
                     }
                     dirty = m === 'w' || m === 'w+';
                 } else {
@@ -3148,8 +3627,13 @@ end`);
                     path: resolvedPath,
                     mode: m,
                     content,
-                    pos: m.startsWith('a') ? content.length : 0,
+                    // glibc starts "a" at the end, but "a+" at the start —
+                    // reads come from there, only writes go to the end.
+                    pos: m === 'a' ? base : 0,
                     dirty,
+                    base,
+                    unread: m === 'a' || m === 'a+',
+                    appendFrom: 0,
                 });
                 return id;
             } catch (e) {
@@ -3158,13 +3642,43 @@ end`);
             }
         });
 
+        // io.tmpfile(): a "w+" handle with no file behind it, so its contents
+        // live only as long as the handle — the unnamed file tmpfile(3) makes.
+        this.lua.global.set('__vfs_io_tmpfile__', (): number => {
+            const id = nextId++;
+            handles.set(id, { path: '', mode: 'w+', content: '', pos: 0, dirty: false, base: 0, unread: false, appendFrom: 0 });
+            return id;
+        });
+
+        // io.stdout / io.stderr. Desktop writes those to its own process's
+        // streams, which a player never sees; here they go to the browser
+        // console, a line at a time.
+        const stdioPending: Record<number, string> = { 1: '', 2: '' };
+        this.lua.global.set('__mudlet_stdio_write', (fd: number, armored: string): void => {
+            const stream = fd === 2 ? 2 : 1;
+            const bytes = unarmor(String(armored ?? '\x02'));
+            const buf = new Uint8Array(bytes.length);
+            for (let i = 0; i < bytes.length; i++) buf[i] = bytes.charCodeAt(i) & 0xff;
+            let text = stdioPending[stream] + new TextDecoder('utf-8').decode(buf);
+            let nl = text.indexOf('\n');
+            while (nl !== -1) {
+                const line = text.substring(0, nl);
+                if (stream === 2) console.error(line); else console.log(line);
+                text = text.substring(nl + 1);
+                nl = text.indexOf('\n');
+            }
+            stdioPending[stream] = text;
+        });
+
         this.lua.global.set('__vfs_io_read__', (id: number, fmt: string | number): string | number | null => {
             const h = handles.get(id);
             if (!h) { setError('invalid file handle'); return null; }
             if (h.mode === 'w' || h.mode === 'a') { setError('file is write-only'); return null; }
+            loadAppended(h);
 
             if (typeof fmt === 'number') {
-                if (fmt === 0) return armor('');
+                // liolib's test_eof: "" while there is something left to read.
+                if (fmt === 0) return h.pos < h.content.length ? armor('') : null;
                 const chunk = h.content.substring(h.pos, h.pos + fmt);
                 if (chunk.length === 0) return null;
                 h.pos += chunk.length;
@@ -3194,10 +3708,9 @@ end`);
                 return armor(rest);
             }
             if (f === 'n') {
-                const m = h.content.substring(h.pos).match(/^\s*(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/);
-                if (!m) return null;
-                h.pos += m[0].length;
-                return parseFloat(m[1]);
+                const r = scanNumber(h.content, h.pos);
+                h.pos = r.end;
+                return r.value;
             }
             return null;
         });
@@ -3207,12 +3720,20 @@ end`);
             if (!h) return 'invalid file handle';
             if (h.mode === 'r') return 'file is read-only';
             const data = unarmor(armored);
-            if (h.mode === 'a' || h.mode === 'a+') {
+            // Append modes write at the end whatever the position (O_APPEND),
+            // and leave the position there.
+            if (isAppend(h)) {
                 h.content += data;
-            } else {
-                h.content = h.content.substring(0, h.pos) + data + h.content.substring(h.pos + data.length);
-                h.pos += data.length;
+                h.pos = h.base + h.content.length;
+                h.dirty = true;
+                return null;
             }
+            // A write past the end leaves a hole, which reads back as NULs.
+            const before = h.pos > h.content.length
+                ? h.content + '\0'.repeat(h.pos - h.content.length)
+                : h.content.substring(0, h.pos);
+            h.content = before + data + h.content.substring(h.pos + data.length);
+            h.pos += data.length;
             h.dirty = true;
             return null;
         });
@@ -3224,9 +3745,11 @@ end`);
             let newPos: number;
             if ((whence ?? 'cur') === 'set') newPos = o;
             else if ((whence ?? 'cur') === 'cur') newPos = h.pos + o;
-            else if (whence === 'end') newPos = h.content.length + o;
+            else if (whence === 'end') newPos = h.base + h.content.length + o;
             else { setError('invalid whence'); return null; }
-            h.pos = Math.max(0, Math.min(newPos, h.content.length));
+            // fseek: before the start is EINVAL; past the end is allowed.
+            if (newPos < 0) { setError('Invalid argument', 22); return null; }
+            h.pos = newPos;
             return h.pos;
         });
 
@@ -3234,9 +3757,16 @@ end`);
             const h = handles.get(id);
             if (!h) return 'invalid file handle';
             try {
-                if (h.dirty && vfs) {
-                    vfs.writeBinaryFile(h.path, latin1ToBytes(h.content));
-                    this.notifyVfsPathChange(h.path);
+                // An empty path is io.tmpfile()'s handle: nothing to write back.
+                if (h.dirty && vfs && h.path !== '') {
+                    // fopen() creates the file on desktop; here it first
+                    // appears on close, which is when its directory hears of it.
+                    const existed = vfs.exists(h.path);
+                    // An append handle adds what it wrote; it never held the
+                    // rest of the file to write back.
+                    if (isAppend(h)) vfs.appendBinaryFile(h.path, latin1ToBytes(h.content.substring(h.appendFrom)));
+                    else vfs.writeBinaryFile(h.path, latin1ToBytes(h.content));
+                    this.notifyVfsPathChange({ path: h.path, kind: existed ? 'modify' : 'create' });
                 }
                 handles.delete(id);
                 return null;
@@ -3250,7 +3780,7 @@ end`);
             if (!vfs) { setError('no profile VFS'); return false; }
             const abs = vfs.resolvePath(path);
             // remove(3): a file, or an empty directory.
-            try { vfs.remove(path); this.notifyVfsPathChange(abs); return true; }
+            try { vfs.remove(path); this.notifyVfsPathChange({ path: abs, kind: 'remove' }); return true; }
             catch (e) { failWith(e, path); return false; }
         });
 
@@ -3259,12 +3789,40 @@ end`);
             const oldAbs = vfs.resolvePath(oldPath);
             const newAbs = vfs.resolvePath(newPath);
             try {
-                vfs.rename(oldPath, newPath);
-                this.notifyVfsPathChange(oldAbs);
-                if (oldAbs !== newAbs) this.notifyVfsPathChange(newAbs);
+                // A target already there is replaced: its inode goes, as a
+                // removed file's does.
+                const replaced = oldAbs !== newAbs && vfs.exists(newPath);
+                vfs.rename(oldPath, newPath, { posix: true });
+                if (oldAbs !== newAbs) {
+                    this.notifyVfsPathChange(
+                        { path: oldAbs, kind: 'remove' },
+                        { path: newAbs, kind: replaced ? 'remove' : 'create' },
+                    );
+                }
                 return true;
             }
             catch (e) { failWith(e, oldPath); return false; }
+        });
+
+        // os.tmpname(): Lua 5.1 on desktop uses mkstemp, so the name it returns
+        // is a file that already exists, empty, in /tmp — ready for io.open.
+        // /tmp here is in the VFS's in-memory root, outside every profile, and
+        // so as temporary as the real one.
+        this.lua.global.set('__vfs_os_tmpname__', (): string | null => {
+            if (!vfs) { setError('no profile VFS'); return null; }
+            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+            try {
+                vfs.mkdir('/tmp');
+                for (let attempt = 0; attempt < 100; attempt++) {
+                    let suffix = '';
+                    for (let i = 0; i < 6; i++) suffix += chars[Math.floor(Math.random() * chars.length)];
+                    const name = `/tmp/lua_${suffix}`;
+                    if (vfs.exists(name)) continue;
+                    vfs.writeBinaryFile(name, new Uint8Array(0), { createParents: false });
+                    return name;
+                }
+            } catch { /* fall through to the failure */ }
+            return null;
         });
 
         this.lua.global.set('__vfs_lfs_chdir__', (path: string): boolean => {
@@ -3281,7 +3839,7 @@ end`);
             const abs = vfs.resolvePath(path);
             // Non-recursive, as lfs.mkdir is: a missing parent or an existing
             // path is an error, not something to paper over.
-            try { vfs.mkdir(path, { recursive: false }); this.notifyVfsPathChange(abs); return true; }
+            try { vfs.mkdir(path, { recursive: false }); this.notifyVfsPathChange({ path: abs, kind: 'create' }); return true; }
             catch (e) { failWith(e); return false; }
         });
 
@@ -3289,7 +3847,7 @@ end`);
             if (!vfs) { setError('no profile VFS'); return false; }
             const abs = vfs.resolvePath(path);
             // Non-recursive, as lfs.rmdir is: only an empty directory goes.
-            try { vfs.rmdir(path, { recursive: false }); this.notifyVfsPathChange(abs); return true; }
+            try { vfs.rmdir(path, { recursive: false }); this.notifyVfsPathChange({ path: abs, kind: 'remove' }); return true; }
             catch (e) { failWith(e); return false; }
         });
 
@@ -3298,7 +3856,7 @@ end`);
             const abs = vfs.resolvePath(path);
             try {
                 vfs.touch(path, new Date(atime * 1000), new Date(mtime * 1000));
-                this.notifyVfsPathChange(abs);
+                this.notifyVfsPathChange({ path: abs, kind: 'attrib' });
                 return true;
             }
             catch (e) { failWith(e); return false; }
@@ -3349,14 +3907,72 @@ end`);
             };
         });
 
+        // lfs.symlinkattributes: lstat, so a symbolic link reports as itself.
+        this.lua.global.set('__vfs_lfs_lstat__', (path: string): object | null => {
+            if (builtins.has(path)) {
+                const content = builtins.get(path)!;
+                return {
+                    type: 'file', size: content.length, modification: 0, access: 0, change: 0,
+                    permissions: 'r--r--r--', dev: 0, ino: 0, nlink: 1, uid: 0, gid: 0, rdev: 0,
+                    blocks: Math.ceil(content.length / 512), blksize: 4096,
+                };
+            }
+            if (!vfs) {
+                setError(`cannot obtain information from file '${path}': No such file or directory`, 2);
+                return null;
+            }
+            try {
+                const s = vfs.lstat(path);
+                return {
+                    type: s.type,
+                    size: s.size,
+                    modification: Math.floor(s.mtime.getTime() / 1000),
+                    access: Math.floor(s.atime.getTime() / 1000),
+                    change: Math.floor(s.ctime.getTime() / 1000),
+                    permissions: permissionString(s.mode),
+                    dev: s.dev,
+                    ino: s.ino,
+                    nlink: s.nlink,
+                    uid: s.uid,
+                    gid: s.gid,
+                    rdev: s.rdev,
+                    blocks: s.blocks,
+                    blksize: s.blksize,
+                };
+            } catch (e) {
+                const d = describeFsError(e);
+                setError(`cannot obtain information from file '${path}': ${d.message}`, d.errno ?? null);
+                return null;
+            }
+        });
+
+        this.lua.global.set('__vfs_lfs_readlink__', (path: string): string | null => {
+            if (!vfs) { setError('No such file or directory', 2); return null; }
+            try { return vfs.readlink(path); }
+            catch (e) { failWith(e); return null; }
+        });
+
+        this.lua.global.set('__vfs_lfs_link__', (target: string, path: string, symbolic: boolean): boolean => {
+            if (!vfs) { setError('no profile VFS'); return false; }
+            try {
+                vfs.link(target, path, symbolic === true);
+                this.notifyVfsPathChange({ path: vfs.resolvePath(path), kind: 'create' });
+                return true;
+            } catch (e) { failWith(e); return false; }
+        });
+
         // ── zip (the lua-zip rock Mudlet preloads) ───────────────────────────
         // Mudlet ships brimworks' lua-zip as a required rock on every platform,
         // so bundled code — LuaGlobal's unzip(), and any package doing its own
         // unpacking — takes `zip` for granted and indexes it without a guard.
         // fflate is already here for package installs, so the archive side costs
         // nothing but the handle bookkeeping.
-        const archives = new Map<number, Record<string, Uint8Array>>();
+        // Entries are kept in archive order and read one at a time, the way
+        // libzip serves them: brimworks' stat(i)/open(i) walk by index, and one
+        // entry that will not read is reported without losing the rest.
+        const archives = new Map<number, ZipEntry[]>();
         let nextArchive = 1;
+        let readError = '';
 
         this.lua.global.set('__zip_open__', (path: string): number | null => {
             // Builtins first, and read as BYTES rather than re-encoded: a
@@ -3366,23 +3982,30 @@ end`);
             const bytes = this.readBuiltinBytes(path)
                 ?? (() => { try { return vfs?.readBinaryFile(path) ?? null; } catch { return null; } })();
             if (!bytes) return null;
-            let entries: Record<string, Uint8Array>;
-            try { entries = unzipSync(bytes); }
-            catch { return null; }
+            const entries = readZipEntries(bytes);
+            if (!entries) return null;
             const id = nextArchive++;
             archives.set(id, entries);
             return id;
         });
 
         this.lua.global.set('__zip_names__', (id: number): string[] =>
-            Object.keys(archives.get(Number(id)) ?? {}));
+            (archives.get(Number(id)) ?? []).map(e => e.name));
 
-        // Armored exactly as the io bindings are: an entry is bytes, and the
-        // wasmoon string bridge truncates at NUL and mangles 0x80-0xFF.
-        this.lua.global.set('__zip_read__', (id: number, name: string): string | null => {
-            const entry = archives.get(Number(id))?.[String(name)];
-            return entry === undefined ? null : armor(bytesToLatin1(entry));
+        this.lua.global.set('__zip_sizes__', (id: number): number[] =>
+            (archives.get(Number(id)) ?? []).map(e => e.size));
+
+        // The entry at a 1-based index, armored exactly as the io bindings are:
+        // an entry is bytes, and the wasmoon string bridge truncates at NUL and
+        // mangles 0x80-0xFF. Null when it cannot be read; __zip_error__ says why.
+        this.lua.global.set('__zip_read__', (id: number, index: number): string | null => {
+            const entry = archives.get(Number(id))?.[Number(index) - 1];
+            if (!entry) { readError = 'Invalid argument'; return null; }
+            try { return armor(bytesToLatin1(entry.read())); }
+            catch (e) { readError = e instanceof Error ? e.message : String(e); return null; }
         });
+
+        this.lua.global.set('__zip_error__', (): string => readError);
 
         this.lua.global.set('__zip_close__', (id: number): void => {
             archives.delete(Number(id));
@@ -3395,7 +4018,19 @@ end`);
         // Mudlet's own chunk name for a script, so an error reads as
         // [string "Script: name"]:LINE: exactly as it does there — package
         // authors and the install report quote it.
-        this.execInner(code, name, `Script: ${name}`);
+        try {
+            this.execInner(code, name, `Script: ${name}`);
+        } catch (e) {
+            // permScript names the type of a body's non-message error object
+            // ("error object is a table value"), as TLuaInterpreter does; the
+            // text the error arrives with by then is its tostring(). __exec
+            // notes the type of the error the run it just finished ended with.
+            const type = this.inert ? null : this.lua.global.get('__mudlet_exec_error_type');
+            if (typeof type === 'string' && e instanceof Error) {
+                (e as Error & { luaErrorObjectType?: string }).luaErrorObjectType = type;
+            }
+            throw e;
+        }
     }
 
     syntaxError(code: string, chunkName: string): string | null {
@@ -3471,6 +4106,31 @@ end`);
         return result === '' ? null : result;
     }
 
+    withCaptures(
+        matches: (string | undefined)[],
+        captureSpans: CaptureSpan[] | undefined,
+        namedSpans: Record<string, CaptureSpan> | undefined,
+        fullMatchSpan: CaptureSpan | undefined,
+        fn: () => void,
+    ): void {
+        const prevMatches = this.currentMatches;
+        const prevSpans = this.currentCaptureSpans;
+        const prevNamedSpans = this.currentNamedSpans;
+        const prevFullMatchSpan = this.currentFullMatchSpan;
+        this.currentMatches = matches;
+        this.currentCaptureSpans = captureSpans ?? [];
+        this.currentNamedSpans = namedSpans ?? {};
+        this.currentFullMatchSpan = fullMatchSpan ?? null;
+        try {
+            fn();
+        } finally {
+            this.currentMatches = prevMatches;
+            this.currentCaptureSpans = prevSpans;
+            this.currentNamedSpans = prevNamedSpans;
+            this.currentFullMatchSpan = prevFullMatchSpan;
+        }
+    }
+
     runWithMatches(
         code: string,
         name: string,
@@ -3529,24 +4189,41 @@ end`);
         if (this.inert) return;
         const api = this.lua.global.luaApi;
         const L = this.lua.global.address;
-        if (multimatches !== undefined) {
-            if (multimatches.length === 0) return;
-            api.lua_createtable(L, multimatches.length, 0);
-            for (let i = 0; i < multimatches.length; i++) {
-                // Each row gets the names its own line defined, alongside the
-                // numbered captures — the same table shape as .
-                this.pushMatchesTable(L, multimatches[i], multiNamedGroups?.[i]);
-                api.lua_rawseti(L, -2, i + 1);
+        // Every push below can run a __gc finaliser, and one that starts an
+        // alias or trigger pass would replace the capture globals mid-build, so
+        // those passes are refused until it ends (TLuaInterpreter::
+        // pushMatchesTable's mCaptureBuildDepth). Counted, not flagged: a
+        // finaliser can run a script whose own fire builds tables inside this.
+        this.captureBuildDepth++;
+        try {
+            if (multimatches !== undefined) {
+                if (multimatches.length === 0) return;
+                api.lua_createtable(L, multimatches.length, 0);
+                for (let i = 0; i < multimatches.length; i++) {
+                    // Each row gets the names its own line defined, alongside the
+                    // numbered captures — the same table shape as .
+                    this.pushMatchesTable(L, multimatches[i], multiNamedGroups?.[i]);
+                    api.lua_rawseti(L, -2, i + 1);
+                }
+                this.assignGlobal('multimatches');
+                return;
             }
-            this.rawSetGlobal('multimatches');
-            return;
+            if (matches.length === 0) return;
+            this.pushMatchesTable(L, matches, namedGroups);
+            this.assignGlobal('matches');
+        } finally {
+            this.captureBuildDepth--;
         }
-        if (matches.length === 0) return;
-        this.pushMatchesTable(L, matches, namedGroups);
-        this.rawSetGlobal('matches');
-        // Mudlet also exposes a separate `namedCaptures` table; keep parity.
-        this.pushJsValue(L, namedGroups ?? {});
-        this.rawSetGlobal('namedCaptures');
+    }
+
+    /** Nesting of {@link setMatches}' table builds — see the note there. */
+    private captureBuildDepth = 0;
+
+    /** Mudlet's TLuaInterpreter::buildingCaptureTables: true while
+     *  `matches`/`multimatches` are being built, when only a __gc finaliser can
+     *  be running Lua — and an alias or trigger pass it starts is turned away. */
+    buildingCaptureTables(): boolean {
+        return this.captureBuildDepth > 0;
     }
 
     /** Whether {@link setMatches} handed the scripts anything for these
@@ -3579,11 +4256,9 @@ end`);
         const L = this.lua.global.address;
         const top = api.lua_gettop(L);
         this.pushUnusedEmptyMatches();
-        this.rawSetGlobal('matches');
+        this.assignGlobal('matches');
         api.lua_createtable(L, 0, 0);
-        this.rawSetGlobal('multimatches');
-        api.lua_createtable(L, 0, 0);
-        this.rawSetGlobal('namedCaptures');
+        this.assignGlobal('multimatches');
         api.lua_settop(L, top);
     }
 
@@ -3609,8 +4284,9 @@ end`);
     /**
      * Store the value on top of the stack as the global `name`, raw.
      *
-     * This is how a dispatch hands the scripts it runs their own `command`,
-     * `line`, `matches` and `multimatches`, and it runs with the whole dispatch
+     * This is how a dispatch hands the scripts it runs their own `command` and
+     * `line` (`matches` and `multimatches` go through {@link assignGlobal},
+     * as desktop's do), and it runs with the whole dispatch
      * on the JS stack below it. `lua_setglobal` honours a metatable on the
      * globals table, so a `__newindex` a package installed there runs from
      * inside this call on the first write of a name that is absent — and a Lua
@@ -3631,6 +4307,45 @@ end`);
         api.lua_insert(L, -2);
         api.lua_rawset(L, LUA_GLOBALSINDEX);
     }
+
+    /**
+     * Store the value on top of the stack as the global `name` by assignment,
+     * popping it — how desktop's setMatches and clearCaptureGroups hand out
+     * `matches` and `multimatches` (lua_setglobal), so a `__newindex` on the
+     * globals table sees each write of a name it does not hold.
+     *
+     * The assignment runs in Bridge.lua's `mudlet.assignGlobal` under
+     * lua_pcall, never as a lua_setglobal from here: see {@link rawSetGlobal}
+     * for what a raising metamethod does to a write made from JS. A handler
+     * that raises is reported, and the value is then stored raw, so the
+     * scripts of the fire still get their captures.
+     */
+    private assignGlobal(name: string): void {
+        const api = this.lua.global.luaApi;
+        const L = this.lua.global.address;
+        this.syncGlobalsFromRunning();
+        const value = api.lua_gettop(L);
+        api.lua_getfield(L, LUA_REGISTRYINDEX, LuaRuntime.ASSIGN_GLOBAL_KEY);
+        if (api.lua_type(L, -1) !== LuaType.Function) {
+            api.lua_pop(L, 1);
+            this.rawSetGlobal(name);
+            return;
+        }
+        api.lua_pushvalue(L, LUA_GLOBALSINDEX);
+        api.lua_pushstring(L, name);
+        api.lua_pushvalue(L, value);
+        if (api.lua_pcall(L, 3, 0, 0) === LuaReturn.Ok) {
+            api.lua_settop(L, value - 1);
+            return;
+        }
+        const message = api.lua_type(L, -1) === LuaType.String
+            ? api.lua_tolstring(L, -1, null) ?? ''
+            : `(error object is a ${api.lua_typename(L, api.lua_type(L, -1))} value)`;
+        api.lua_settop(L, value);
+        this.rawSetGlobal(name);
+        this.api.printError(`[${name}] ${message}`);
+    }
+    private static readonly ASSIGN_GLOBAL_KEY = 'mudlet.assignGlobal';
 
     /**
      * Park the dispatch state the calling script is holding, and answer the
@@ -3654,8 +4369,11 @@ end`);
      * The JS mirror of the same state (`currentMatches` and the capture spans
      * `selectCaptureGroup` reads) needs nothing here: every dispatch entry
      * point already saves and restores it around the script it runs.
+     *
+     * `command` is parked only for an alias script by default; feedTriggers
+     * never parks it (see the binding).
      */
-    pushNestedDispatchState(): number {
+    pushNestedDispatchState(parkCommand = this.runningAliasScript): number {
         if (this.inert) return -1;
         const api = this.lua.global.luaApi;
         const L = this.lua.global.address;
@@ -3664,6 +4382,12 @@ end`);
         // Every Lua call is made before the entry goes onto the stack: an entry
         // that is not parked yet cannot be handed to the wrong caller by a pop.
         const refs = NESTED_DISPATCH_GLOBALS.map(name => {
+            // Only an alias script has its own `command` handed back. Anywhere
+            // else it keeps the last command expanded, which packages such as
+            // Repeater read afterwards (TLuaInterpreter::expandAlias). A fed
+            // line never parks it: what the fed triggers expand is the last
+            // command sent, and the caller reads that (feedTriggers).
+            if (name === 'command' && !parkCommand) return undefined;
             api.lua_pushstring(L, name);
             api.lua_rawget(L, LUA_GLOBALSINDEX);
             // luaL_ref answers LUA_REFNIL for a nil value, and reading that ref
@@ -3698,20 +4422,117 @@ end`);
         // would answer.
         NESTED_DISPATCH_GLOBALS.forEach((name, i) => {
             const ref = refs[i];
+            if (ref === undefined) return;
+            if (name === 'command') {
+                // What the nested pass left in `command` is kept for
+                // settleCommandAfterAliasPass — unless no pass ran and nothing
+                // set it since the last restore, as when expandAlias("") matches
+                // nothing, in which case the earlier one stands.
+                api.lua_pushstring(L, name);
+                api.lua_rawget(L, LUA_GLOBALSINDEX);
+                let keepEarlier = false;
+                if (this.passCommandRef !== LUA_NOREF) {
+                    api.lua_rawgeti(L, LUA_REGISTRYINDEX, this.restoredCommandRef);
+                    keepEarlier = api.lua_rawequal(L, -1, -2) !== 0;
+                    api.lua_pop(L, 1);
+                }
+                if (keepEarlier) api.lua_pop(L, 1);
+                else {
+                    api.luaL_unref(L, LUA_REGISTRYINDEX, this.passCommandRef);
+                    this.passCommandRef = api.luaL_ref(L, LUA_REGISTRYINDEX);
+                }
+            }
             api.lua_pushstring(L, name);
             if (ref === null) api.lua_pushnil(L);
             else api.lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
             api.lua_rawset(L, LUA_GLOBALSINDEX);
+            if (name === 'command') {
+                // The value just put back, for the same comparison next time; the
+                // ref moves here, so the release below must not free it.
+                api.luaL_unref(L, LUA_REGISTRYINDEX, this.restoredCommandRef);
+                this.restoredCommandRef = ref === null ? LUA_REFNIL : ref;
+                refs[i] = undefined;
+            }
         });
         api.lua_settop(L, top);
         this.releaseNestedDispatchState(refs);
     }
 
-    private releaseNestedDispatchState(refs: (number | null)[]): void {
+    private releaseNestedDispatchState(refs: (number | null | undefined)[]): void {
         const api = this.lua.global.luaApi;
         for (const ref of refs) {
-            if (ref !== null) api.luaL_unref(this.lua.global.address, LUA_REGISTRYINDEX, ref);
+            if (ref != null) api.luaL_unref(this.lua.global.address, LUA_REGISTRYINDEX, ref);
         }
+    }
+
+    /**
+     * While an alias pass runs, what `command` ends it holding unless a script
+     * changes it (the last command expanded), and the value the last restore of
+     * an alias script's own command put back. TLuaInterpreter::mPassCommand.
+     */
+    private passCommandRef = LUA_NOREF;
+    private restoredCommandRef = LUA_NOREF;
+
+    /** Whether the script running now is an alias's: expandAlias() hands
+     *  `command` back to that one only. TLuaInterpreter::mRunningAliasScript. */
+    private runningAliasScript = false;
+    /** Claimed by the next entry into Lua — see {@link asAliasScript}. */
+    private nextEntryIsAliasScript = false;
+
+    /** Run `fn`, whose entry into Lua is an alias's script — the role of
+     *  desktop's `ScriptCallerScope(*this, true)` around TAlias::execute.
+     *  Every other entry runs as a non-alias caller. */
+    asAliasScript<T>(fn: () => T): T {
+        this.nextEntryIsAliasScript = true;
+        try {
+            return fn();
+        } finally {
+            this.nextEntryIsAliasScript = false;
+        }
+    }
+
+    /**
+     * Start an alias pass for `command` (AliasUnit::processDataStream →
+     * TLuaInterpreter::setExpandedCommand): `command` holds it, and whatever an
+     * enclosing pass kept for {@link settleCommandAfterAliasPass} is out of date.
+     */
+    setExpandedCommand(command: string): void {
+        if (this.inert) return;
+        const api = this.lua.global.luaApi;
+        const L = this.lua.global.address;
+        api.luaL_unref(L, LUA_REGISTRYINDEX, this.passCommandRef);
+        api.luaL_unref(L, LUA_REGISTRYINDEX, this.restoredCommandRef);
+        this.passCommandRef = this.restoredCommandRef = LUA_NOREF;
+        this.setCommand(command);
+    }
+
+    /**
+     * End of an alias pass, at every depth. An alias script had its own
+     * `command` back while it ran, but what is read once the pass is over is the
+     * last command expanded — or whatever a script set it to, which survives.
+     * TLuaInterpreter::settleCommandAfterAliasPass.
+     */
+    settleCommandAfterAliasPass(): void {
+        const passRef = this.passCommandRef;
+        const restoredRef = this.restoredCommandRef;
+        this.passCommandRef = this.restoredCommandRef = LUA_NOREF;
+        if (this.inert || passRef === LUA_NOREF) return;
+        const api = this.lua.global.luaApi;
+        const L = this.lua.global.address;
+        const top = api.lua_gettop(L);
+        this.syncGlobalsFromRunning();
+        api.lua_pushstring(L, 'command');
+        api.lua_rawget(L, LUA_GLOBALSINDEX);
+        api.lua_rawgeti(L, LUA_REGISTRYINDEX, restoredRef);
+        const untouched = api.lua_rawequal(L, -1, -2) !== 0;
+        api.lua_settop(L, top);
+        if (untouched) {
+            api.lua_pushstring(L, 'command');
+            api.lua_rawgeti(L, LUA_REGISTRYINDEX, passRef);
+            api.lua_rawset(L, LUA_GLOBALSINDEX);
+        }
+        api.luaL_unref(L, LUA_REGISTRYINDEX, passRef);
+        api.luaL_unref(L, LUA_REGISTRYINDEX, restoredRef);
     }
 
     /** Push a 1-indexed Lua table of capture strings (`matches[1]` = whole match),
@@ -3738,6 +4559,77 @@ end`);
 
     private exec(code: string, name: string): void {
         this.execInner(code, name);
+    }
+
+    /**
+     * The chunk name every piece of Mudlet Web's own Lua is compiled under —
+     * Bridge.lua, the io/lfs/utf8/yajl/luasql/rex/lpeg shims, and the one-line
+     * entry chunks JS runs. Desktop implements all of that in C, so Lua reports
+     * it as `[C]` there; Bridge.lua's error/debug.getinfo/debug.traceback use
+     * this name to show it the same way (see the top of Bridge.lua).
+     */
+    static readonly INTERNAL_CHUNK = '=[C]';
+
+    /**
+     * The standard library as it stood when an internal chunk loaded, bound as
+     * locals of that chunk, so Mudlet Web's own Lua never looks these up in the
+     * globals table at call time. Desktop's API is C and reaches none of them
+     * through Lua globals, so a script's own global `select` (a "select target"
+     * helper), `type` or `unpack = nil` must leave `send`, `echo`,
+     * `tempTrigger` and the rest working (mudlet-web#374). The tables are bound
+     * too, which still follows a script that changes a function inside one, as
+     * desktop's Lua-side code does. Part of {@link INTERNAL_PROLOGUE}, so it
+     * stays on the chunk's first line.
+     */
+    private static readonly BUILTIN_LOCALS =
+        'local select, type, unpack, tonumber, getfenv, setfenv, pairs, ipairs, next, '
+        + 'rawget, rawset, rawequal, getmetatable, setmetatable, pcall, xpcall, assert, loadstring, '
+        + 'string, table, math, coroutine, debug = '
+        + 'select, type, unpack, tonumber, getfenv, setfenv, pairs, ipairs, next, '
+        + 'rawget, rawset, rawequal, getmetatable, setmetatable, pcall, xpcall, assert, loadstring, '
+        + 'string, table, math, coroutine, debug; ';
+    private static readonly TOSTRING_LOCAL = 'local tostring = tostring; ';
+
+    /**
+     * Put in front of an internal chunk, on its first line so the chunk's line
+     * numbers don't move: `error` there is one of {@link C_ERROR_LUA}'s, so an
+     * error raised from that code is positioned the way the C it stands in for
+     * positions it.
+     *   - `mudlet`: Mudlet's own API raises with lua_error — no position at
+     *     all (`tempTimer: bad argument #1 ...`).
+     *   - `lual`: the C libraries (io, lfs, luautf8, lrexlib, lua-yajl,
+     *     LuaSQL, LPeg) raise with luaL_error / luaL_argerror — the position
+     *     of the script line that called them, none when C called them.
+     * A chunk-local rather than a replaced global `error`, because a script's
+     * `return error(msg)` tail-calls it: the stock C function keeps the
+     * caller's frame for its position, a Lua replacement would not.
+     */
+    private static readonly INTERNAL_PROLOGUE = {
+        mudlet: 'local error = __mudlet_c_error; ' + LuaRuntime.BUILTIN_LOCALS + LuaRuntime.TOSTRING_LOCAL,
+        lual: 'local error = __mudlet_lual_error; ' + LuaRuntime.BUILTIN_LOCALS + LuaRuntime.TOSTRING_LOCAL,
+        // The chunk that installs the safe global `tostring` is one of these,
+        // and with a local of that name in scope its `function tostring`
+        // would define the local instead.
+        none: LuaRuntime.BUILTIN_LOCALS,
+    } as const;
+
+    /** Run one of Mudlet Web's own bootstrap chunks on the main state, under
+     *  {@link INTERNAL_CHUNK}. */
+    private runInternalChunk(code: string, errors: keyof typeof LuaRuntime.INTERNAL_PROLOGUE = 'mudlet'): void {
+        const g = this.lua.global;
+        const top = g.getTop();
+        try {
+            g.loadString(LuaRuntime.INTERNAL_PROLOGUE[errors] + code, LuaRuntime.INTERNAL_CHUNK);
+            g.runSync();
+        } finally {
+            g.luaApi.lua_settop(g.address, top);
+        }
+    }
+
+    /** {@link exec} for Mudlet Web's own Lua: compiled under
+     *  {@link INTERNAL_CHUNK}, so what it defines reads as C to a script. */
+    private execInternal(code: string, name: string, errors: keyof typeof LuaRuntime.INTERNAL_PROLOGUE = 'lual'): unknown {
+        return this.execInner(LuaRuntime.INTERNAL_PROLOGUE[errors] + code, name, LuaRuntime.INTERNAL_CHUNK);
     }
 
     // `lua_gc(L, LUA_GCCOUNT, 0)` — Lua-managed memory in KB, one C call.
@@ -3872,9 +4764,15 @@ end`);
      *  table in place — in the main state and in the thread it returns to. */
     private resumeAsRunning<T>(t: LuaThread, resume: () => T): T {
         this.runningThreads.push(t);
+        // Every way into a script says whether it is an alias's, as desktop's
+        // ScriptCallerScope does: only asAliasScript() makes one.
+        const wasAliasScript = this.runningAliasScript;
+        this.runningAliasScript = this.nextEntryIsAliasScript;
+        this.nextEntryIsAliasScript = false;
         try {
             return resume();
         } finally {
+            this.runningAliasScript = wasAliasScript;
             this.runningThreads.pop();
             if (!this.inert) {
                 this.adoptGlobalsOf(t);
@@ -3898,8 +4796,67 @@ end`);
             api.lua_rawset(L, -3);
         }
         api.lua_pop(L, 1);
+        this.inheritDebugHook(threadIndex);
     }
     private static readonly ENTRY_THREADS_KEY = 'mudlet.entryThreads';
+
+    /** Give the new entry thread at `threadIndex` the debug hook a script set
+     *  on the main state, if any. Desktop runs every entry on that one state,
+     *  so its hook carries over from callback to callback; Lua 5.1 keeps hooks
+     *  per thread, so each thread made here has to be handed it (Bridge.lua's
+     *  debug.sethook keeps the record). */
+    private inheritDebugHook(threadIndex: number): void {
+        const api = this.lua.global.luaApi;
+        const L = this.lua.global.address;
+        api.lua_getfield(L, LUA_REGISTRYINDEX, 'mudlet.hook');
+        if (api.lua_type(L, -1) !== LuaType.Table) {
+            api.lua_pop(L, 1);
+            return;
+        }
+        const hook = api.lua_gettop(L);
+        api.lua_getfield(L, LUA_REGISTRYINDEX, 'mudlet.rawSethook');
+        api.lua_pushvalue(L, threadIndex);
+        api.lua_rawgeti(L, hook, 1);
+        api.lua_rawgeti(L, hook, 2);
+        api.lua_rawgeti(L, hook, 3);
+        if (api.lua_pcall(L, 4, 0, 0) !== LuaReturn.Ok) api.lua_pop(L, 1);
+        api.lua_pop(L, 1);
+    }
+
+    /**
+     * Before wasmoon reads a failed thread's error, make it a string.
+     *
+     * `assertOk` renders a non-string error with its own `luaL_tolstring`,
+     * which calls `__tostring` unprotected: an error object whose `__tostring`
+     * raises is then a Lua panic, and the panic is C `exit()` — the module is
+     * gone for the session (mudlet-web#330). Desktop reports such an error and
+     * carries on, so the object is described here first, under a pcall, by
+     * Bridge.lua's `__mudlet_describe_error`. Strings, numbers and userdata
+     * (wasmoon's wrapped JS errors, whose message `assertOk` keeps) are left
+     * alone.
+     */
+    private stringifyThreadError(t: LuaThread, result: LuaReturn): void {
+        if (result === LuaReturn.Ok || result === LuaReturn.Yield || result === LuaReturn.ErrorMem) return;
+        if (t.getTop() < 1) return;
+        const api = this.lua.global.luaApi;
+        const type = api.lua_type(t.address, -1);
+        if (type === LuaType.String || type === LuaType.Number || type === LuaType.Userdata) return;
+        const L = this.lua.global.address;
+        const fallback = `(error object is a ${api.lua_typename(t.address, type)} value)`;
+        let text = fallback;
+        api.lua_getfield(L, LUA_REGISTRYINDEX, LuaRuntime.DESCRIBE_ERROR_KEY);
+        if (api.lua_type(L, -1) === LuaType.Function) {
+            api.lua_xmove(t.address, L, 1);
+            if (api.lua_pcall(L, 1, 1, 0) === LuaReturn.Ok && api.lua_type(L, -1) === LuaType.String) {
+                text = api.lua_tolstring(L, -1, null) ?? fallback;
+            }
+        } else {
+            api.lua_settop(t.address, -2);
+        }
+        api.lua_settop(L, -2);
+        api.lua_pushstring(t.address, text);
+    }
+    private static readonly DESCRIBE_ERROR_KEY = 'mudlet.describeError';
 
     private execOnThread(code: string, name: string, chunkName?: string): unknown {
         const g = this.lua.global;
@@ -3908,7 +4865,7 @@ end`);
         const threadIndex = g.getTop();
         try {
             this.markEntryThread(threadIndex);
-            t.loadString('return __exec(...)', '@' + name);
+            t.loadString('return __exec(...)', LuaRuntime.INTERNAL_CHUNK);
             t.pushValue(code);
             t.pushValue(name);
             if (chunkName !== undefined) t.pushValue(chunkName);
@@ -3920,6 +4877,7 @@ end`);
                 this.parkDialogThread(t, name, 'exec', threadIndex);
                 return undefined;
             }
+            this.stringifyThreadError(t, res.result);
             t.assertOk(res.result);
             const top = t.getTop();
             const err = top >= 1 ? t.getValue(1) : null;
@@ -3954,12 +4912,13 @@ end`);
         const threadIndex = g.getTop();
         try {
             this.markEntryThread(threadIndex);
-            t.loadString(chunk, '@' + label);
+            t.loadString(chunk, LuaRuntime.INTERNAL_CHUNK);
             const res = this.resumeAsRunning(t, () => t.resume(0));
             if (res.result === LuaReturn.Yield) {
                 this.parkDialogThread(t, label, 'chunk', threadIndex);
                 return;
             }
+            this.stringifyThreadError(t, res.result);
             t.assertOk(res.result);
         } catch (e) {
             if (this.markFatal(e)) return;
@@ -4045,6 +5004,7 @@ end`);
                 // The handler called invokeFileDialog again.
                 reparked = this.parkDialogThread(t, park.label, park.kind, undefined, park.ref);
             } else {
+                this.stringifyThreadError(t, res.result);
                 t.assertOk(res.result);
                 if (park.kind === 'exec') {
                     // __exec finished after the original exec() caller already
@@ -4066,27 +5026,78 @@ end`);
     // Fire a registered Lua callback by id (label clicks, tempTimer/Alias/
     // Trigger/Key).
     private dispatchCb(cbId: number, label: string): void {
-        this.runChunk(`__mudlet_dispatch_cb(${cbId})`, label);
+        this.runCallback(cbId, label, false, undefined);
         this.api.flushOutput();
     }
 
-    /** Whether the callback {@link dispatchCb} last ran returned true — the way
-     *  an expiring temp trigger asks for another life. See __mudlet_dispatch_cb. */
+    /** Set by {@link runCallback}: whether the callback's first result was
+     *  `true` — the way an expiring temp trigger asks for another life. */
+    private cbReturnedTrue = false;
+
+    /** Whether the callback {@link dispatchCb} last ran returned true. */
     private lastCbReturnedTrue(): boolean {
-        try {
-            return this.lua.global.get('__mudlet_cb_returned_true') === true;
-        } catch {
-            return false;
-        }
+        return this.cbReturnedTrue;
     }
 
     // Same as dispatchCb but passes a single argument to the callback. Used by
     // label mouse callbacks to deliver the {button, x, y, ...} event table.
     private dispatchCbWithArg(cbId: number, arg: unknown, label: string): void {
         if (this.inert) return;
-        this.lua.global.set('__mudlet_cb_arg', arg);
-        this.runChunk(`__mudlet_dispatch_cb_arg(${cbId})`, label);
+        this.runCallback(cbId, label, true, arg);
         this.api.flushOutput();
+    }
+
+    /**
+     * Call the Lua function registered under `cbId` (Bridge.lua's
+     * `mudlet.cb` registry table) as the base function of a fresh entry
+     * thread. Desktop calls such a callback straight from C with lua_pcall, so
+     * nothing sits under it: its traceback ends at the callback, which shows as
+     * `in function <chunk:line>` — called from C, it has no name. Running it
+     * through a Lua dispatcher chunk instead left two frames of ours under it.
+     */
+    private runCallback(cbId: number, label: string, withArg: boolean, arg: unknown): void {
+        this.cbReturnedTrue = false;
+        if (this.inert) return;
+        this.checkMemoryPressure();
+        try {
+            const g = this.lua.global;
+            const api = g.luaApi;
+            this.syncGlobalsFromRunning();
+            const t = g.newThread();
+            const threadIndex = g.getTop();
+            try {
+                this.markEntryThread(threadIndex);
+                api.lua_getfield(t.address, LUA_REGISTRYINDEX, 'mudlet.cb');
+                if (api.lua_type(t.address, -1) !== LuaType.Table) {
+                    api.lua_settop(t.address, 0);
+                    return;
+                }
+                api.lua_rawgeti(t.address, -1, cbId);
+                api.lua_remove(t.address, -2);
+                if (api.lua_type(t.address, -1) !== LuaType.Function) {
+                    api.lua_settop(t.address, 0);
+                    return;
+                }
+                if (withArg) t.pushValue(arg);
+                const res = this.resumeAsRunning(t, () => t.resume(withArg ? 1 : 0));
+                if (res.result === LuaReturn.Yield) {
+                    this.parkDialogThread(t, label, 'chunk', threadIndex);
+                    return;
+                }
+                this.stringifyThreadError(t, res.result);
+                t.assertOk(res.result);
+                this.cbReturnedTrue = t.getTop() >= 1
+                    && api.lua_type(t.address, 1) === LuaType.Boolean
+                    && api.lua_toboolean(t.address, 1) !== 0;
+            } catch (e) {
+                if (this.markFatal(e)) return;
+                this.api.printError(`[${label}] ${describeThrown(e, label)}`);
+            } finally {
+                g.remove(threadIndex);
+            }
+        } catch (e) {
+            if (!this.markFatal(e)) throw e;
+        }
     }
 
     // Unregister a previously registered callback id (Lua side). Used to free
@@ -4112,7 +5123,7 @@ end`);
     }
 
     private execModule(code: string, name: string, globalName: string): void {
-        const result = this.execInner(code, name);
+        const result = this.execInternal(code, name);
         if (result !== undefined && result !== null) this.lua.global.set(globalName, result);
     }
 
@@ -4137,6 +5148,62 @@ end`);
             if (r.kind === 'unsupported') return undefined;
             if (r.kind === 'nomatch') return false;
             return [r.start, r.end, ...r.captures];
+        });
+        // The byte-position search behind utf8.gsub / utf8.gmatch: `first byte,
+        // byte after the match, capture…`, false, or nil to use the Lua matcher.
+        this.lua.global.set('__mudlet_utf8_findb', (subject: unknown, pattern: unknown, init: unknown) => {
+            if (typeof subject !== 'string' || typeof pattern !== 'string') return undefined;
+            const r = findLuaPatternBytes(subject, pattern, Number(init) || 1);
+            if (r === null) return undefined;
+            if (r === false) return false;
+            return [r.start, r.end, ...r.captures];
+        });
+        // Lua class membership for luautf8's own matcher in utf8.lua.
+        this.lua.global.set('__mudlet_utf8_isclass', (cl: unknown, cp: unknown) =>
+            luaClassMatches(String(cl), Number(cp)));
+    }
+
+    /**
+     * The Unicode tables behind luautf8's normalize_nfc / isnfc /
+     * grapheme_indices, read off the JS engine (String.prototype.normalize,
+     * Intl.Segmenter) rather than vendored. Both take and give the text armored
+     * (see byteArmor.ts) — valid UTF-8 may still hold a NUL, which the wasmoon
+     * string bridge would cut at. utf8.lua validates before calling, so the
+     * bytes always decode.
+     */
+    private installUtf8Natives(): void {
+        const decoder = new TextDecoder('utf-8');
+        const encoder = new TextEncoder();
+        const toText = (armored: unknown): string => {
+            const bytes = unarmor(String(armored ?? '\x02'));
+            const buf = new Uint8Array(bytes.length);
+            for (let i = 0; i < bytes.length; i++) buf[i] = bytes.charCodeAt(i) & 0xff;
+            return decoder.decode(buf);
+        };
+        const utf8Length = (s: string): number => encoder.encode(s).length;
+        // NFC of the text, armored for the trip back.
+        this.lua.global.set('__mudlet_utf8_nfc', (armored: unknown): string => {
+            const bytes = encoder.encode(toText(armored).normalize('NFC'));
+            let out = '';
+            for (let i = 0; i < bytes.length; i += 0x8000) {
+                out += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+            }
+            return armor(out);
+        });
+        // Extended grapheme clusters, as the byte length of each, comma
+        // separated: one flat string rather than an array for Lua to walk.
+        this.lua.global.set('__mudlet_utf8_graphemes', (armored: unknown): string => {
+            const text = toText(armored);
+            const lengths: number[] = [];
+            const Segmenter = (Intl as unknown as { Segmenter?: new (l?: string, o?: object) => { segment(s: string): Iterable<{ segment: string }> } }).Segmenter;
+            if (Segmenter) {
+                for (const { segment } of new Segmenter(undefined, { granularity: 'grapheme' }).segment(text)) {
+                    lengths.push(utf8Length(segment));
+                }
+            } else {
+                for (const ch of text) lengths.push(utf8Length(ch));
+            }
+            return lengths.join(',');
         });
     }
 
@@ -4169,6 +5236,17 @@ end`);
             this.lua.global.set('__mws_w', null);
             this.lua.global.set('__mws_h', null);
         }
+        // A LuaBytes argument crosses armored, its position listed for
+        // __mudlet_dispatch_event to unarmor (see byteArmor.ts).
+        let bytesAt: string | null = null;
+        if (args.some(a => a instanceof LuaBytes)) {
+            args = args.map((a, i) => {
+                if (!(a instanceof LuaBytes)) return a;
+                bytesAt = (bytesAt === null ? '' : bytesAt + ',') + (i + 1);
+                return armor(a.bytes);
+            });
+        }
+        this.lua.global.set('__mudlet_evt_bytes', bytesAt);
         this.lua.global.set('__mudlet_evt_args', args);
         // Explicit count: a nil/false-carrying payload (raiseEvent("x", nil,
         // false, "y")) lands in Lua as a table with holes, and neither `#` nor a
@@ -4188,10 +5266,10 @@ end`);
         this.lua.global.set('__mudlet_gmcp_path', path);
         // Raw-push the (potentially large, deeply nested) decoded payload instead
         // of wasmoon's generic pushValue, whose ref/unref bookkeeping is O(n²) in
-        // the node count (issue #2). pushJsValue mirrors toLuaValue's conventions
-        // and delegates the yajl.null sentinel leaves back to wasmoon.
+        // the node count (issue #2) — and which recursed past the Lua stack on a
+        // deep document. The yajl bridge builds it the way yajl.to_value does.
         const L = this.lua.global.address;
-        this.pushJsValue(L, this.toLuaValue(value));
+        if (!this.pushDecodedJson(L, value, `gmcp "${path}"`)) return;
         this.lua.global.luaApi.lua_setglobal(L, '__mudlet_gmcp_val');
         this.runChunk('__mudlet_set_gmcp(__mudlet_gmcp_path, __mudlet_gmcp_val)', `set-gmcp "${path}"`);
     }
@@ -4205,9 +5283,25 @@ end`);
         // Raw-push the decoded value (see setGmcpValue) to avoid the O(n²)
         // generic pushValue on large nested MSDP tables (issue #2).
         const L = this.lua.global.address;
-        this.pushJsValue(L, this.toLuaValue(value));
+        if (!this.pushDecodedJson(L, value, `msdp "${path}"`)) return;
         this.lua.global.luaApi.lua_setglobal(L, '__mudlet_msdp_val');
         this.runChunk('__mudlet_set_msdp(__mudlet_msdp_path, __mudlet_msdp_val)', `set-msdp "${path}"`);
+    }
+
+    /**
+     * Push a JSON-decoded protocol payload as yajl.to_value would decode it.
+     * False, with nothing pushed, when it nests deeper than lua_yajl accepts —
+     * Mudlet's json_to_value raises on such a payload and the table is left as
+     * it was, so the caller skips the update too.
+     */
+    private pushDecodedJson(L: LuaState, value: unknown, what: string): boolean {
+        if (!this.yajl) {
+            this.lua.global.luaApi.lua_pushnil(L);
+            return true;
+        }
+        if (this.yajl.pushValue(L, value)) return true;
+        console.warn(`[mudlet] ${what} not stored: nested deeper than yajl accepts`);
+        return false;
     }
 
     /** Records one channel-102 report in the Lua `channel102` global. Both
@@ -4219,6 +5313,15 @@ end`);
         this.lua.global.set('__mudlet_channel102_val', value);
         this.runChunk('__mudlet_set_channel102(__mudlet_channel102_var, __mudlet_channel102_val)',
             `set-channel102 ${variable}`);
+    }
+
+    /** Records one ATCP message in the Lua `atcp` global — Mudlet's
+     *  setAtcpTable rawset. The event is raised separately by the engine. */
+    setAtcpValue(name: string, value: string): void {
+        if (this.inert) return;
+        this.lua.global.set('__mudlet_atcp_name', name);
+        this.lua.global.set('__mudlet_atcp_val', value);
+        this.runChunk('__mudlet_set_atcp(__mudlet_atcp_name, __mudlet_atcp_val)', `set-atcp "${name}"`);
     }
 
     // Bridges a single MSSP variable into the Lua `mssp` global. `name` is the
@@ -4253,20 +5356,27 @@ end`);
         this.lua.global.set('__mudlet_mxp_attrs', flat);
         // Flattened for the same reason as the attributes: a Lua-side split is
         // cheaper and steadier than walking a proxy. Both are server text, so
-        // both use the separators no MXP attribute can contain.
+        // both use the separators no MXP attribute can contain. Each action is
+        // terminated rather than separated, so an empty one — the action of an
+        // <A> whose address Mudlet will not open — is still an entry.
         this.lua.global.set('__mudlet_mxp_text', body?.text ?? '');
-        this.lua.global.set('__mudlet_mxp_actions', (body?.actions ?? []).join('\x01'));
+        this.lua.global.set('__mudlet_mxp_actions', (body?.actions ?? []).map(a => a + '\x01').join(''));
         this.runChunk('__mudlet_set_mxp(__mudlet_mxp_name, __mudlet_mxp_attrs,'
             + ' __mudlet_mxp_text, __mudlet_mxp_actions)', `set-mxp "${name}"`);
     }
 
     /**
-     * Mudlet-style async unzip. Reads the zip from the profile VFS, decodes
-     * it on a worker (fflate falls back to a chunked main-thread decode where
-     * workers aren't available), writes every entry under destDir, then
-     * raises sysUnzipDone / sysUnzipError. Always fire-and-forget.
+     * Mudlet-style async unzip, after TLuaInterpreter::unzipAsync: the extract
+     * directory is created (mkpath) before the call returns, whether or not the
+     * zip turns out to be usable, and everything after that — reading the zip,
+     * decoding it, writing every entry under destDir — runs on the timer queue
+     * and ends in sysUnzipDone or sysUnzipError. A missing or broken zip is
+     * therefore reported after unzipAsync() has returned, never inside it.
+     *
+     * Returns null once started, or the message desktop's warnArgumentValue
+     * gives when the directory could not be made (and nothing is queued).
      */
-    private runUnzipAsync(zipPath: string, destDir: string): void {
+    private runUnzipAsync(zipPath: string, destDir: string): string | null {
         const vfs = this.vfs;
         // Both events carry the extract location with a trailing separator,
         // whether or not the caller gave one — Mudlet appends it before the
@@ -4276,21 +5386,16 @@ end`);
             console.warn('[unzipAsync]', msg);
             this.emitEvent('sysUnzipError', [zipPath, reported]);
         };
-        if (!vfs)         return fail('no profile VFS available');
-        if (!zipPath)     return fail('zipPath is required');
-        if (!destDir)     return fail('destDir is required');
-
-        // A zip may live in the read-only /lua/ namespace rather than the
-        // profile — that is where the spec corpus keeps its fixture archives,
-        // and Lua's own io.open sees both.
-        let buf: Uint8Array;
-        const builtin = this.readBuiltinBytes(zipPath);
-        if (builtin) {
-            buf = builtin;
-        } else {
-            if (!vfs.exists(zipPath)) return fail(`zip not found: ${zipPath}`);
-            try { buf = vfs.readBinaryFile(zipPath); }
-            catch (err) { return fail(`read failed: ${err instanceof Error ? err.message : String(err)}`); }
+        // Desktop's QDir::mkpath, which also succeeds for a directory already
+        // there. Not for an empty destDir: that is "/" on desktop, the root of
+        // the disk, which here is nowhere a profile may write.
+        if (vfs && destDir) {
+            try {
+                if (vfs.stat(resolveLinkedDirectory(vfs, destDir))?.type !== 'dir') vfs.mkdir(destDir);
+            } catch (err) {
+                console.warn('[unzipAsync] could not create', destDir, err);
+                return "couldn't create output directory to put the extracted files into";
+            }
         }
 
         const TEXT_EXT = /\.(xml|lua|txt|json|md|css|html|htm|js|csv|ini|cfg|conf|yml|yaml)$/i;
@@ -4306,23 +5411,52 @@ end`);
         //
         // The *events* still arrive later, which is the part of "async" a caller
         // actually observes: emitting from inside the binding Lua is executing
-        // would re-enter the Lua state mid-call and crash wasmoon.
+        // would re-enter the Lua state mid-call and crash wasmoon — and the
+        // failures are no exception, desktop's come from the finished future.
         this.deferToTimerQueue(() => {
             if (this.inert) return;
-            let entries: Record<string, Uint8Array>;
-            try { entries = unzipSync(buf); }
-            catch (err) { return fail(`unzip failed: ${err instanceof Error ? err.message : String(err)}`); }
+            if (!vfs)     return fail('no profile VFS available');
+            if (!zipPath) return fail('zipPath is required');
+            if (!destDir) return fail('destDir is required');
+
+            // A zip may live in the read-only /lua/ namespace rather than the
+            // profile — that is where the spec corpus keeps its fixture
+            // archives, and Lua's own io.open sees both.
+            let buf: Uint8Array;
+            const builtin = this.readBuiltinBytes(zipPath);
+            if (builtin) {
+                buf = builtin;
+            } else {
+                if (!vfs.exists(zipPath)) return fail(`zip not found: ${zipPath}`);
+                try { buf = vfs.readBinaryFile(zipPath); }
+                catch (err) { return fail(`read failed: ${err instanceof Error ? err.message : String(err)}`); }
+            }
+
+            const entries = readZipEntries(buf);
+            if (!entries) return fail('unzip failed: not a zip archive');
+            // Every entry is checked before the first is written, as desktop's
+            // mudlet::unzip does, so an archive that would reach outside destDir
+            // — by its names, or through a link already inside it — is refused
+            // whole rather than half unpacked.
+            const problem = zipExtractionProblem(vfs, destDir, entries.map(e => e.name));
+            if (problem) return fail(problem);
+            // The extract location itself may be reached through a link — that
+            // is where the caller asked for the files to go — so it is followed
+            // once, up front, and every entry is written under what it names.
+            const base = resolveLinkedDirectory(vfs, destDir.replace(/\/+$/, ''));
             try {
-                if (!vfs.exists(destDir)) vfs.mkdir(destDir);
-                for (const [name, data] of Object.entries(entries)) {
-                    if (name.endsWith('/')) {
-                        vfs.mkdir(`${destDir}/${name}`);
+                if (!vfs.exists(base)) vfs.mkdir(base);
+                for (const entry of entries) {
+                    const parts = zipEntryComponents(entry.name)!;
+                    if (parts.length === 0) continue;
+                    const dest = `${base}/${parts.join('/')}`;
+                    if (/[/\\]$/.test(entry.name)) {
+                        vfs.mkdir(dest);
                         continue;
                     }
-                    const dest = `${destDir}/${name}`;
-                    const parent = dest.substring(0, dest.lastIndexOf('/'));
-                    if (parent && !vfs.exists(parent)) vfs.mkdir(parent);
-                    if (TEXT_EXT.test(name)) vfs.writeFile(dest, strFromU8(data));
+                    if (parts.length > 1) vfs.mkdir(`${base}/${parts.slice(0, -1).join('/')}`);
+                    const data = entry.read();
+                    if (TEXT_EXT.test(dest)) vfs.writeFile(dest, strFromU8(data));
                     else                     vfs.writeBinaryFile(dest, data);
                 }
                 void vfs.flush();
@@ -4331,6 +5465,7 @@ end`);
                 fail(`extract failed: ${e instanceof Error ? e.message : String(e)}`);
             }
         });
+        return null;
     }
 
     /** Run `fn` off the current call stack, on the queue a blocked script still
@@ -4371,22 +5506,31 @@ end`);
     }
 
     dispatchSendRequest(text: string): boolean {
-        this.emitEvent('sysDataSendRequest', [text]);
-        if (!this._denyCurrentSend) return false;
-        // Mudlet's Host::mAllowToSendCommand is consumed by the send it blocks,
-        // never cleared ahead of the event (cTelnet::sendData puts it back only
-        // on the branch that refused). Clearing it first — as this used to —
-        // silently threw away every denyCurrentSend() issued from anywhere but
-        // inside a sysDataSendRequest handler: a key binding or timer that
-        // denied the command about to go out had no effect at all.
-        this._denyCurrentSend = false;
-        return true;
+        // cTelnet::sendData: a deny belongs to the command whose handlers raised
+        // it — including from an alias pass a handler runs — and to nothing
+        // else. A send made inside a handler (an alias's replacement) gets a
+        // frame of its own, so neither command's deny reaches the other.
+        this._sendRequestDenies.push(false);
+        let denied = false;
+        try {
+            this.emitEvent('sysDataSendRequest', [text]);
+        } finally {
+            denied = this._sendRequestDenies.pop() === true;
+        }
+        return denied;
     }
 
-    killScriptHandlers(scriptId: string): void {
-        if (this.inert) return;
-        this.lua.global.set('__mudlet_kill_sid', scriptId);
-        this.runChunk('__mudlet_kill_script_handlers(__mudlet_kill_sid)', 'kill-script-handlers');
+    syncScriptHandlers(entries: ScriptHandlerEntry[]): void {
+        if (this.inert || entries.length === 0) return;
+        // One string, one chunk, however many scripts changed: a group toggle
+        // flips every script under it.
+        const flat = entries
+            .map(e => [e.id, e.name, e.active ? '1' : '0',
+                e.events.filter(ev => ev !== '').join('\u0003')].join('\u0002'))
+            .join('\u0001');
+        this.lua.global.set('__mudlet_sync_flat', flat);
+        this.runChunk('__mudlet_sync_script_handlers(__mudlet_sync_flat); __mudlet_sync_flat = nil',
+            'sync-script-handlers');
     }
 
     /**
@@ -4499,16 +5643,15 @@ end`);
      * pushTable does (see issue #2) is gone:
      *   - integer-valued numbers → lua_pushinteger, others → lua_pushnumber
      *   - arrays keyed by Object.keys + lua_rawseti, so dense 0-based arrays
-     *     (map getters) stay 0-indexed and the sparse 1-based arrays toLuaValue
-     *     builds stay 1-indexed — identical to wasmoon's arrIndexs handling
+     *     (map getters) stay 0-indexed and sparse 1-based arrays stay
+     *     1-indexed — identical to wasmoon's arrIndexs handling
      *   - plain objects → string keys via lua_setfield
      * Anything that isn't a primitive / plain array / plain object (wasmoon
-     * LuaTable proxies such as the yajl.null sentinel, functions, Maps, class
-     * instances) is delegated to wasmoon's own pushValue, which is O(1) for
-     * these leaves and preserves their reference identity. Such values only
-     * appear as leaves of GMCP/MSDP payloads (toLuaValue rebuilds every
-     * container as a fresh plain array/object) and always push on the main
-     * thread; on a coroutine stack we can't safely delegate, so degrade to nil.
+     * LuaTable proxies, functions, Maps, class instances) is delegated to
+     * wasmoon's own pushValue, which is O(1) for these leaves and preserves
+     * their reference identity. That is only safe on the main thread; on a
+     * coroutine stack we can't delegate, so degrade to nil. (GMCP/MSDP
+     * payloads don't come through here — see pushDecodedJson.)
      */
     private pushJsValue(L: LuaState, value: unknown, depth = 0): void {
         const api = this.lua.global.luaApi;
@@ -4527,7 +5670,11 @@ end`);
                 else api.lua_pushnumber(L, value);
                 return;
             case 'string':
-                api.lua_pushstring(L, value);
+                // lua_pushstring stops at the first NUL, so a GMCP "x\u0000y"
+                // arrived as "x". Mudlet's yajl decoder keeps the byte (Lua
+                // strings are counted), so push those with their UTF-8 length.
+                if (value.includes('\0')) api.lua_pushlstring(L, value, api.module.lengthBytesUTF8(value));
+                else api.lua_pushstring(L, value);
                 return;
             case 'boolean':
                 api.lua_pushboolean(L, value ? 1 : 0);
@@ -4603,8 +5750,19 @@ end`);
         // Likewise every reference a parked nested dispatch holds: they belong
         // to the state about to go, and nothing may hand one back afterwards.
         this.nestedDispatchStates = [];
+        this.stopAnsiPaletteSync();
         this.globalEvents?.close();
         this.tts?.destroy();
+        // Close the luasql connections as desktop does when the profile closes:
+        // what they never committed is rolled back, what they did is written
+        // out. Then mark Luasql.lua's finalizers inert — lua_close runs every
+        // __gc, and those must not reach back into JS for handles already gone.
+        try {
+            this.closeSqlConnections();
+            this.lua.global.set('__luasql_dead', true);
+        } catch (err) {
+            console.error('[mudlet] error closing sql connections (ignored):', err);
+        }
         this.api.map.setMapEventDispatcher(null);
         this.api.map.setMapInfoEvaluator(null);
         this.api.map.clearMapInfoContributors();

@@ -30,6 +30,7 @@ const { TimerEngine } = await import('../../src/mud/timers/TimerEngine');
 const { KeyEngine } = await import('../../src/mud/keybindings/KeyEngine');
 const { ScriptingEngine } = await import('../../src/scripting/ScriptingEngine');
 const { useAppStore } = await import('../../src/storage/appStore');
+const { PROFILE_DATA_PATH } = await import('../../src/storage/profileVfsData');
 type ProfileVFS = import('../../src/scripting/vfs/ProfileVFS').ProfileVFS;
 
 // Minimal DOM for the engine constructor, installed after the imports (pcre2
@@ -57,10 +58,12 @@ const PROFILE_ROOT = `/profiles/${CONN}`;
 /** A Map-backed VFS covering the handful of methods the save path touches. */
 function fakeVfs(seed: Record<string, string> = {}) {
     const files = new Map<string, string>(Object.entries(seed));
+    const dirs = new Set<string>();
     const vfs = {
         profilePath: PROFILE_ROOT,
         resolvePath: (p: string) => (p.startsWith('/') ? p : `${PROFILE_ROOT}/${p}`),
-        exists: (p: string) => files.has(p) || [...files.keys()].some(k => k.startsWith(`${p}/`)),
+        exists: (p: string) => files.has(p) || dirs.has(p) || [...files.keys()].some(k => k.startsWith(`${p}/`)),
+        mkdir: (p: string) => { dirs.add(p); },
         readFile: (p: string) => {
             const v = files.get(p);
             if (v === undefined) throw new Error(`ENOENT: ${p}`);
@@ -75,6 +78,10 @@ function fakeVfs(seed: Record<string, string> = {}) {
     };
     return { vfs: vfs as unknown as ProfileVFS, files };
 }
+
+/** The saves written, leaving out the profile data file — saveProfile rewrites
+ *  that too, with the saved variables as they are now (#360). */
+const savesIn = (files: Map<string, string>) => [...files.keys()].filter(k => k !== PROFILE_DATA_PATH);
 
 describe('saveProfile — the XML save it writes', () => {
     const engines: InstanceType<typeof ScriptingEngine>[] = [];
@@ -108,7 +115,7 @@ describe('saveProfile — the XML save it writes', () => {
         const res = makeEngine(vfs).saveProfileXml();
 
         expect(res.ok).toBe(true);
-        const written = [...files.keys()];
+        const written = savesIn(files);
         expect(written).toHaveLength(1);
         // Mudlet's stamp: YYYY-MM-DD#HH-mm-ss.xml, in current/.
         expect(written[0]).toMatch(/^current\/\d{4}-\d{2}-\d{2}#\d{2}-\d{2}-\d{2}\.xml$/);
@@ -118,16 +125,30 @@ describe('saveProfile — the XML save it writes', () => {
 
     it('honours an explicit location and appends .xml to a name that lacks one', () => {
         const { vfs, files } = fakeVfs();
+        vfs.mkdir('backups');
 
         expect(makeEngine(vfs).saveProfileXml('backups', 'before-refactor').ok).toBe(true);
-        expect([...files.keys()]).toEqual(['backups/before-refactor.xml']);
+        expect(savesIn(files)).toEqual(['backups/before-refactor.xml']);
     });
 
     it('does not double up the suffix on a name that already has one', () => {
         const { vfs, files } = fakeVfs();
+        vfs.mkdir('backups');
 
         expect(makeEngine(vfs).saveProfileXml('backups/', 'snapshot.XML').ok).toBe(true);
-        expect([...files.keys()]).toEqual(['backups/snapshot.XML']);
+        expect(savesIn(files)).toEqual(['backups/snapshot.XML']);
+    });
+
+    // Host::saveProfile makes the folder; Host::saveProfileAs — a save under a
+    // name of its own — writes only into one that is there.
+    it('makes a missing folder for a plain save, but refuses a save-as into one', () => {
+        const { vfs, files } = fakeVfs();
+        const engine = makeEngine(vfs);
+
+        const refused = engine.saveProfileXml('nowhere', 'copy');
+        expect(refused).toEqual({ ok: false, err: 'No such file or directory', path: `${PROFILE_ROOT}/nowhere/copy.xml` });
+        expect(engine.saveProfileXml('made-by-the-save').ok).toBe(true);
+        expect(savesIn(files).some(k => k.startsWith('made-by-the-save/'))).toBe(true);
     });
 
     it('writes the live automation tree into the save', () => {
@@ -160,6 +181,7 @@ describe('saveProfile — the XML save it writes', () => {
             pattern: '^hi$', command: 'say hello', code: '', language: 'lua',
         });
 
+        vfs.mkdir('out');
         expect(makeEngine(vfs).saveProfileXml('out', 'x').ok).toBe(true);
         const xml = files.get('out/x.xml') ?? '';
         expect(xml).toContain('greet');
@@ -201,7 +223,7 @@ describe('saveProfile — the XML save it writes', () => {
         const { vfs, files } = fakeVfs();
 
         expect(makeEngine(vfs).saveProfileXml().ok).toBe(true);
-        const xml = files.get([...files.keys()][0]) ?? '';
+        const xml = files.get(savesIn(files)[0]) ?? '';
         // Packages only: desktop keeps modules in <mInstalledModules>.
         expect(installedIn(xml)).toEqual(['run-lua-code', 'vpkg']);
         // The Host names the profile as desktop's does.
@@ -217,7 +239,7 @@ describe('saveProfile — the XML save it writes', () => {
         const { vfs, files } = fakeVfs({ 'current/2020-01-01#00-00-00.xml': base });
 
         expect(makeEngine(vfs).saveProfileXml().ok).toBe(true);
-        const saved = [...files.keys()].find(k => k !== 'current/2020-01-01#00-00-00.xml') ?? '';
+        const saved = savesIn(files).find(k => k !== 'current/2020-01-01#00-00-00.xml') ?? '';
         expect(installedIn(files.get(saved) ?? '')).toEqual(['vpkg']);
     });
 

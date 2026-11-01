@@ -1,11 +1,12 @@
-import { colorCodes, setPaletteColor, resetPaletteColor, resetAllPaletteColors, isServerRedefineColorsAllowed } from "./colors";
+import { colorCodes, setAnsiPaletteColor, resetAnsiPaletteToDefaults, isServerRedefineColorsAllowed } from "./colors";
 import mudletColorsJson from "./mudletColors.json";
 import {
     scanEscape,
+    cursorForwardCount,
+    cursorForwardSpaces,
     parseOsc8Payload,
     classifyHyperlinkUri,
-    parseOscColorPalette,
-    type OscPaletteOp,
+    parseOscPalette,
 } from "./ansiEscapes";
 import {
     parseOsc8Uri,
@@ -16,22 +17,24 @@ import {
     type UnderlineStyle,
 } from "./hyperlinkConfig";
 import { applyVisibility } from "./hyperlinkVisibility";
+import { detachRow, detachRows } from "../../ui/output/outputRows";
 import { appendCells, cellsToHtml, columnAfter } from "./cellRender";
 import { getControlCharacterMode } from "./controlCharacterMode";
 import { getExpectColorSpaceId } from "./colorSpaceId";
 
-/** Apply OSC 4/104 palette operations to the global colour tables. Palette
- *  changes affect text parsed *after* this point — which is exactly document
- *  order, since lines are fed to the parser in the order the server sent them. */
-export function applyOscPaletteOps(ops: ReadonlyArray<OscPaletteOp>): void {
-    // Mudlet's "Allow server to redefine your colors": when off, OSC 4/104 from
-    // the server is ignored and the user's palette stands.
+/** Obey a Linux-console palette OSC (`ESC]P…` / `ESC]R`, see
+ *  {@link parseOscPalette}) against the global colour tables. Palette changes
+ *  affect text parsed *after* this point — which is exactly document order,
+ *  since lines are fed to the parser in the order the server sent them. Any
+ *  other payload — xterm's OSC 4/104 included — changes nothing. */
+export function applyOscPalette(payload: string): void {
+    // Mudlet's "Allow server to redefine your colors": when off, the server's
+    // palette commands are ignored and the user's palette stands.
     if (!isServerRedefineColorsAllowed()) return;
-    for (const op of ops) {
-        if (op.kind === "set") setPaletteColor(op.index, op.color);
-        else if (op.kind === "reset") resetPaletteColor(op.index);
-        else resetAllPaletteColors();
-    }
+    const op = parseOscPalette(payload);
+    if (!op) return;
+    if (op.kind === "set") setAnsiPaletteColor(op.index, op.color);
+    else resetAnsiPaletteToDefaults();
 }
 
 const ESC = "";
@@ -68,6 +71,12 @@ export interface FormatHyperlink {
      * for it (`{"style":{"underline":true}}` / a matching pseudo-class state).
      */
     autoUnderline?: boolean;
+    /**
+     * The Lua code a scripted link runs — every entry, for a popup. Read by
+     * the clipboard, which holds its own reference to each function a copied
+     * link calls (see `ScriptingAPI.clipboardLinkCommands`).
+     */
+    luaCommands?: string[];
 }
 
 export interface IndexedColor {
@@ -90,22 +99,12 @@ export interface HexColor {
 
 export type FormatColor = IndexedColor | RgbColor | HexColor
 
-/** What `38;5;n` names past the 256-colour table, where Mudlet's own reading
- *  of it (TBuffer::decodeSGR38/48) gives no colour at all: black. */
-const OUT_OF_RANGE_FOREGROUND: RgbColor = {space: "rgb", r: 0, g: 0, b: 0};
-
-/** The colour `38;5;n` / `48;5;n` picks, or undefined when there is none.
- *  Past 255 Mudlet keeps running its greyscale formula, `(n - 232) * 10 + 8`,
- *  so 256 is still a grey (248) and every index above it overflows a channel
- *  into an invalid colour. The table lookup alone gave `color: undefined`,
- *  which threw in the trigger engine and dropped the rest of the packet
- *  (mudlet-web#174). */
+/** The colour `38;5;n` / `48;5;n` picks, or undefined when there is none: as
+ *  xterm does, TBuffer::decodeSGR38/48 ignore an index past the end of the
+ *  256-colour palette, so it changes nothing rather than reading as black. */
 function xtermColor(index: number): FormatColor | undefined {
     const hex = colorCodes.xterm[index];
-    if (hex !== undefined) return {space: "hex", color: hex};
-    const grey = (index - 232) * 10 + 8;
-    if (index > 255 && grey <= 255) return {space: "rgb", r: grey, g: grey, b: grey};
-    return undefined;
+    return hex !== undefined ? {space: "hex", color: hex} : undefined;
 }
 
 /** One SGR parameter: a number, or its sub-parameters when it carried any
@@ -402,6 +401,19 @@ export class FormatState {
         return snapshot;
     }
 
+    /** The attributes the spaces a `CSI n C` (cursor forward) stands for are
+     *  written with: the current ones, with the foreground set to the
+     *  background so the gap stays transparent — an underline or strike-out in
+     *  force does not show across it (TBuffer's
+     *  `TChar(mBackGroundColor, mBackGroundColor, computeCurrentAttributeFlags())`).
+     *  A default background leaves the foreground default too: the parser has
+     *  no profile colours to resolve it to. */
+    toCursorForwardSnapshot(): FormatStateSnapshot {
+        const snapshot = this.toCellSnapshot();
+        snapshot.foreground = cloneColor(this.background);
+        return snapshot;
+    }
+
     toSnapshot(): FormatStateSnapshot {
         return {
             foreground: cloneColor(this.foreground),
@@ -535,14 +547,14 @@ export class FormatState {
                         return typeof p === "number" && !Number.isNaN(p) ? p : undefined;
                     };
                     const present = (n: number): boolean => i + n < params.length;
-                    const mode = at(1);
-                    // A missing, unreadable or zero colour type abandons the
-                    // WHOLE sequence, arguments and all — anything after it was
-                    // meant to be read relative to a type we never got.
-                    if (mode === undefined || mode === 0) {
+                    // A missing colour type abandons the rest of the sequence;
+                    // an empty, zero or unreadable one is stepped over alone,
+                    // like any type that takes no arguments.
+                    if (!present(1)) {
                         i = params.length;
                         break;
                     }
+                    const mode = at(1);
                     // Two spellings of 24-bit colour. `38;2;r;g;b` is what
                     // almost every server sends; ITU T.416 actually puts a
                     // colour-space id first, `38;2;<id>;r;g;b`, and a few
@@ -556,22 +568,16 @@ export class FormatState {
                         // The index may be left off entirely, in which case it
                         // is a zero — the same as writing `38;5;0`.
                         const index = present(2) ? at(2) : 0;
-                        if (index !== undefined) {
+                        const color = index === undefined ? undefined : xtermColor(index);
+                        if (color) {
                             // decodeSGR38 and decodeSGR48 both clear
                             // mIsDefaultColor for an index below 16.
-                            if (index >= 0 && index < 16) this.ansiColored = true;
-                            const color = xtermColor(index);
+                            if (index! < 16) this.ansiColored = true;
                             // A colour chosen out of the 256-colour cube names
                             // itself exactly; there is no brighter twin to pick,
                             // so bold leaves it alone. Same for 24-bit below.
-                            // An index Mudlet cannot make a colour of leaves the
-                            // foreground black and the background default.
-                            if (isForeground) {
-                                const fg = color ?? OUT_OF_RANGE_FOREGROUND;
-                                this.setForeground(fg, fg);
-                            } else {
-                                this.background = color;
-                            }
+                            if (isForeground) this.setForeground(color, color);
+                            else this.background = color;
                         }
                         i += 2;
                     } else if (mode === 2) {
@@ -596,9 +602,12 @@ export class FormatState {
                         // 1, 2 and 3 in front of it are not bold, faint and
                         // italics.
                         i += (mode === 3 ? 4 : 5) + shift;
+                    } else {
+                        // Every other type (1, transparent, and anything
+                        // unassigned) takes no arguments, but the type itself is
+                        // stepped over, or `38;1` would read as bold.
+                        i += 1;
                     }
-                    // Every other type (1, transparent, and anything unassigned)
-                    // takes no arguments, so there is nothing to skip.
                     break;
                 }
                 default:
@@ -654,10 +663,12 @@ export class FormatState {
             this.italic = style === 1 || style === 2 ? true : undefined;
             return;
         }
-        if (group[0] !== 4) {
-            this.applySgr(group);
-            return;
-        }
+        // Any other parameter with sub-parameters — SGR 58 / 59 (underline
+        // colour, which Mudlet does not draw), `1:3`, `0:1` — is ignored whole,
+        // as TBuffer::decodeSGR does. Reading the pieces as codes of their own
+        // turned `58:5:3` into italics and blink, and let a `0` among them reset
+        // everything set earlier in the same sequence.
+        if (group[0] !== 4) return;
         // `4:n` picks the underline's style; every style is exclusive, so each
         // replaces the last rather than adding to it (Mudlet's decodeSGR clears
         // the three sibling flags on every branch). Anything outside 0..5 is a
@@ -703,12 +714,13 @@ export class FormatState {
             if (isForeground) this.setForeground(color, color);
             else this.background = color;
         };
-        if (group[1] === 5 && group[2] !== undefined) {
-            if (group[2] >= 0 && group[2] < 16) this.ansiColored = true;
-            const color = xtermColor(group[2]);
-            if (color) put(color);
-            else if (isForeground) put(OUT_OF_RANGE_FOREGROUND);
-            else this.background = undefined;
+        if (group[1] === 5) {
+            // A left-off index is a zero, one past the palette changes nothing.
+            const index = group[2] ?? 0;
+            const color = xtermColor(index);
+            if (!color) return;
+            if (index < 16) this.ansiColored = true;
+            put(color);
         } else if (group[1] === 2) {
             put({space: "rgb", r: group[3] ?? 0, g: group[4] ?? 0, b: group[5] ?? 0});
         }
@@ -822,9 +834,13 @@ function parseAnsiSegments(
     text: string,
     baseState?: FormatStateSnapshot,
     presets?: HyperlinkPresetRegistry,
+    out?: { hyperlink?: FormatHyperlink },
 ): BufferSegment[] {
     const segments: BufferSegment[] = [];
     const state = new FormatState(baseState);
+    // The line's length so far — TBuffer's mMudLine.size(), which a cursor
+    // forward measures its column from.
+    let written = 0;
     // A bare parse (e.g. script-echoed text) still resolves config and presets
     // within this one string via an ephemeral registry; cross-line presets need
     // the session registry passed in.
@@ -835,6 +851,7 @@ function parseAnsiSegments(
         const snapshot = state.toCellSnapshot();
         const storedState = isDefaultState(snapshot) ? undefined : snapshot;
         segments.push({text: buffer, state: storedState});
+        written += buffer.length;
         buffer = "";
     };
     for (let i = 0; i < text.length;) {
@@ -852,6 +869,21 @@ function parseAnsiSegments(
                 if (sgr) {
                     flush();
                     state.applySgr(sgr);
+                }
+            } else if (esc.kind === "csi" && esc.finalByte === "C") {
+                // CUF: n spaces in the background colour (see
+                // cursorForwardCount), so column-aligned output keeps its
+                // columns, stopping at the right margin (cursorForwardSpaces).
+                // An unreadable or zero count is consumed, nothing more.
+                const spaces = cursorForwardSpaces(cursorForwardCount(esc.params), written + buffer.length);
+                if (spaces > 0) {
+                    flush();
+                    written += spaces;
+                    const snapshot = state.toCursorForwardSnapshot();
+                    segments.push({
+                        text: " ".repeat(spaces),
+                        state: isDefaultState(snapshot) ? undefined : snapshot,
+                    });
                 }
             } else if (esc.kind === "osc" && esc.oscPayload !== undefined) {
                 const link = parseOsc8Payload(esc.oscPayload);
@@ -889,11 +921,10 @@ function parseAnsiSegments(
                         // current hyperlink state untouched (text stays plain).
                     }
                 } else {
-                    // OSC 4/104: server-driven colour palette redefinition. No
-                    // text or state change — it retargets the colour tables for
-                    // the SGR runs that follow.
-                    const palette = parseOscColorPalette(esc.oscPayload);
-                    if (palette) applyOscPaletteOps(palette);
+                    // `ESC]P`/`ESC]R`: server-driven colour palette
+                    // redefinition. No text or state change — it retargets the
+                    // colour tables for the SGR runs that follow.
+                    applyOscPalette(esc.oscPayload);
                 }
             }
             // Every other recognized sequence (non-OSC-8 OSC commands, cursor
@@ -906,6 +937,7 @@ function parseAnsiSegments(
         i += 1;
     }
     flush();
+    if (out) out.hyperlink = state.hyperlink ? {...state.hyperlink} : undefined;
     return segments;
 }
 
@@ -942,13 +974,19 @@ export class AnsiAwareBuffer {
     // drops lines from the buffer and `TTextEdit` repaints only what remains.
     private _lineElement: HTMLElement | null = null;
 
+    /** The OSC 8 link still open where a string `initial` ends, which the
+     *  next line of the same stream starts inside (see computeTrailingState). */
+    readonly openHyperlink?: FormatHyperlink;
+
     constructor(
         initial?: string | BufferSegment[],
         state?: FormatStateSnapshot,
         presets?: HyperlinkPresetRegistry,
     ) {
         if (typeof initial === "string") {
-            this.segments = parseAnsiSegments(initial, state, presets);
+            const out: { hyperlink?: FormatHyperlink } = {};
+            this.segments = parseAnsiSegments(initial, state, presets, out);
+            this.openHyperlink = out.hyperlink;
             this.normalizeSegments();
         } else if (Array.isArray(initial)) {
             this.segments = initial.map(segment => ({
@@ -959,6 +997,16 @@ export class AnsiAwareBuffer {
         } else if (initial === undefined && state) {
             this.segments = [];
         }
+    }
+
+    /** A buffer holding `text` exactly as given — every character, an ESC
+     *  included, stored as text in `state`. The string constructor decodes
+     *  escape sequences instead; this is for text that must not be decoded
+     *  (a script's echo — see Console.echoText). */
+    static literal(text: string, state?: FormatStateSnapshot): AnsiAwareBuffer {
+        const buf = new AnsiAwareBuffer();
+        if (text) buf.segments = [{ text, state: isDefaultState(state) ? undefined : cloneState(state) }];
+        return buf;
     }
 
     get deleted(): boolean {
@@ -988,15 +1036,48 @@ export class AnsiAwareBuffer {
      *  wrapLine() knows to give them the hanging indent rather than the first. */
     continuation = false;
 
+    /** Columns of indent a wrap put in front of this line, when it starts a
+     *  paragraph — desktop's wrapGapBuffer entry for such a line. Leading
+     *  spaces alone can't tell the indent from text, so a later wrapLine()
+     *  reads this (and that the spaces are still there) to know the line
+     *  already carries its indent and must not be given it again. */
+    wrapIndent = 0;
+
     removeFromDom(): void {
         // The row, when the renderer registered one; otherwise whatever single
         // element it did register (mini-console/user-window renderers hand us
         // the line element itself, which is both).
         const el = this._lineElement ?? this._renderContainer;
         if (!el) return;
-        el.parentElement?.removeChild(el);
+        // With the scrollback block it sat in, once that is empty (#457).
+        detachRow(el);
         this._renderContainer = null;
         this._lineElement = null;
+    }
+
+    /**
+     * `removeFromDom()` for a whole eviction batch at once. A trim takes a run
+     * of lines off the head of a buffer, and their rows normally sit side by
+     * side at the top of the console — those go a block or a Range deletion
+     * at a time rather than one removeChild apiece, which on a 20,000-line
+     * trim was half a second of mutation bookkeeping alone (#443). Rows with
+     * a gap between them (some other element in the way) fall back to the
+     * per-line removal, so nothing that is not one of these lines is touched.
+     */
+    static removeAllFromDom(buffers: readonly AnsiAwareBuffer[]): void {
+        const rows: HTMLElement[] = [];
+        for (const buf of buffers) {
+            const el = buf._lineElement ?? buf._renderContainer;
+            buf._renderContainer = null;
+            buf._lineElement = null;
+            // Two buffers can name the same row (a partial line redrawn in
+            // place hands its row to the buffer that replaced it).
+            if (el && el.parentElement && rows[rows.length - 1] !== el) rows.push(el);
+        }
+        // Rows are grouped into scrollback blocks (outputRows.ts): a block the
+        // trim empties goes whole, and each partial block's run goes as one
+        // Range deletion.
+        detachRows(rows);
     }
 
     onRender(callback: (container: HTMLElement) => void): this {
@@ -1244,32 +1325,40 @@ export class AnsiAwareBuffer {
         return this;
     }
 
+    /**
+     * Overlays the attributes set in `format` on every segment in `range`,
+     * keeping everything else each character already had — the way
+     * TBuffer::applyBold/applyFgColor/… touch only the one attribute they set.
+     * A coloured selection stays coloured when it is made bold, and a
+     * recoloured one keeps its per-character backgrounds and attributes.
+     */
     applyFormat(range: TextRange, format: FormatStateSnapshot): this {
-        const [start, end] = range;
-        if (start >= end) return this;
-
-        const text = this.text.slice(start, end);
-        const currentState = this.getStateAt(start);
-
-        const mergedState: FormatStateSnapshot = {
-            ...currentState,
-            ...format,
-            foreground: format.foreground !== undefined ? format.foreground : currentState?.foreground,
-            background: format.background !== undefined ? format.background : currentState?.background,
-        };
-
-        this.replace([start, end], text, mergedState);
-        return this;
+        const {foreground, background, ...rest} = format;
+        const flags = Object.fromEntries(
+            Object.entries(rest).filter(([, value]) => value !== undefined),
+        ) as FormatStateSnapshot;
+        return this.overlaySegments(range, base => {
+            Object.assign(base, flags);
+            if (foreground !== undefined) base.foreground = cloneColor(foreground);
+            if (background !== undefined) base.background = cloneColor(background);
+        });
     }
 
     /**
      * Overlays a hyperlink on every segment in `range`, preserving each
      * segment's existing colors/attributes. Pass `undefined` to clear any
-     * hyperlinks in the range. Unlike `applyFormat` (which homogenizes
-     * formatting across the range), this is segment-wise — used by Mudlet
-     * `setLink` so coloured selections remain coloured after becoming clickable.
+     * hyperlinks in the range. Used by Mudlet `setLink` so coloured selections
+     * remain coloured after becoming clickable.
      */
     setHyperlink(range: TextRange, hyperlink?: FormatHyperlink): this {
+        return this.overlaySegments(range, base => {
+            base.hyperlink = hyperlink ? {...hyperlink} : undefined;
+        });
+    }
+
+    /** Split the segments at `range`'s ends and let `edit` change a copy of
+     *  each covered segment's state in place. */
+    private overlaySegments(range: TextRange, edit: (base: FormatStateSnapshot) => void): this {
         const [start, end] = range;
         if (start >= end) return this;
         this.assertRange(start, end);
@@ -1287,7 +1376,7 @@ export class AnsiAwareBuffer {
         for (let i = startIndex; i < endIndex; i++) {
             const seg = this.segments[i];
             const base = cloneState(seg.state) ?? {};
-            base.hyperlink = hyperlink ? {...hyperlink} : undefined;
+            edit(base);
             seg.state = base;
         }
         this.normalizeSegments();
@@ -1490,6 +1579,57 @@ export class AnsiAwareBuffer {
     }
 
     /**
+     * This line as TBuffer::bufferToHtml writes it into an HTML session log:
+     * every run in a span naming BOTH colours outright (text with no colour of
+     * its own takes the console's — Mudlet's TChar always carries one), then
+     * `<br>` and a line feed. The `<br>` is what breaks the lines: the log's
+     * stylesheet sets `white-space: nowrap` on the body, so without it a browser
+     * draws the whole session as one line. Only `<` and `>` are escaped, as
+     * desktop does.
+     */
+    toLogHtml(defaults: { foreground: { r: number; g: number; b: number }; background: { r: number; g: number; b: number } }): string {
+        const rgbOf = (color: FormatColor | undefined): [number, number, number] | null => {
+            if (!color) return null;
+            if (color.space === "rgb") return [color.r, color.g, color.b];
+            const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(this.colorToHex(color));
+            return m ? [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)] : null;
+        };
+        const fgDefault: [number, number, number] = [defaults.foreground.r, defaults.foreground.g, defaults.foreground.b];
+        const bgDefault: [number, number, number] = [defaults.background.r, defaults.background.g, defaults.background.b];
+        let html = "";
+        let open: string | null = null;
+        for (const segment of this.segments) {
+            if (!segment.text) continue;
+            const state = segment.state;
+            const overlay = state?.hyperlink?.config?.style;
+            const fgSrc = overlay?.foreground ?? state?.foreground;
+            const bgSrc = overlay?.background ?? state?.background;
+            let fg = rgbOf(fgSrc) ?? fgDefault;
+            // A transparent cell shows the console through it on screen, so
+            // the log paints the console's colour there rather than black.
+            let bg = bgSrc && bgSrc.space === "rgb" && bgSrc.a === 0 ? bgDefault : (rgbOf(bgSrc) ?? bgDefault);
+            if (state?.inverse) [fg, bg] = [bg, fg];
+            let style = `color: rgb(${fg.join(",")}); background: rgb(${bg.join(",")});`;
+            if (overlay?.bold ?? state?.bold) style += " font-weight: bold;";
+            if (overlay?.italic ?? state?.italic) style += " font-style: italic;";
+            const underline = (overlay?.underline ?? state?.underline) || state?.hyperlink?.autoUnderline;
+            let decorations = "";
+            if (underline) decorations += " underline";
+            if (overlay?.strikethrough ?? state?.strikethrough) decorations += " line-through";
+            if (overlay?.overline ?? state?.overline) decorations += " overline";
+            if (decorations) style += ` text-decoration:${decorations};`;
+            if (style !== open) {
+                if (open !== null) html += "</span>";
+                html += `<span style="${style}">`;
+                open = style;
+            }
+            html += segment.text.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        }
+        if (open !== null) html += "</span>";
+        return html + "<br>\n";
+    }
+
+    /**
      * Resolve the buffer's segments to styled runs with concrete CSS colours,
      * for rendering to a canvas (copy-as-image). Mirrors {@link toHtml}'s colour
      * handling, including reverse-video on default colours — there the swap
@@ -1635,9 +1775,30 @@ export class AnsiAwareBuffer {
                 });
 
                 if (link.onClick) {
+                    // Desktop runs a link on the *press*: TTextEdit::
+                    // mousePressEvent executes it and returns, between the
+                    // window's sysWindowMousePressEvent and its release, so a
+                    // press that drags off the link and lets go elsewhere still
+                    // runs it. The press is also never the start of a selection
+                    // drag. The second press of a double-click is Qt's
+                    // mouseDoubleClickEvent, not a press, so it doesn't run the
+                    // link again. An unrevealed spoiler keeps its first click
+                    // for the reveal (below), so it stays on the click path.
+                    const onPress = !link.config?.spoiler;
+                    if (onPress) {
+                        element.addEventListener('mousedown', (e) => {
+                            if (e.button !== 0) return;
+                            e.preventDefault();
+                            if (e.detail >= 2 && e.detail % 2 === 0) return;
+                            link.onClick!(e);
+                        });
+                    }
                     element.addEventListener('click', (e) => {
                         e.preventDefault();
                         e.stopPropagation();
+                        // A mouse click (detail > 0) already ran on its press;
+                        // keyboard activation (link.click(), detail 0) runs here.
+                        if (onPress && e.detail > 0) return;
                         link.onClick!(e);
                     });
                 }
@@ -2119,6 +2280,7 @@ export {cloneState as cloneFormatState, statesEqual as formatStatesEqual};
 export function computeTrailingState(
     text: string,
     baseState?: FormatStateSnapshot,
+    openHyperlink?: FormatHyperlink,
 ): FormatStateSnapshot | undefined {
     const state = new FormatState(baseState);
     let i = 0;
@@ -2136,6 +2298,11 @@ export function computeTrailingState(
         }
         i += 1;
     }
+    // An OSC 8 link left open at the end of the line goes on into the next,
+    // as TBuffer's mHyperlinkActive does: it ends at its closing sequence, not
+    // at a line ending. The line's own parse knows which link that is
+    // (AnsiAwareBuffer.openHyperlink), since opening one resolves presets.
+    state.hyperlink = openHyperlink ? {...openHyperlink} : undefined;
     const snapshot = state.toSnapshot();
     return isDefaultState(snapshot) ? undefined : snapshot;
 }

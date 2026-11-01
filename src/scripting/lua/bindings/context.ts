@@ -64,13 +64,25 @@ export interface BindingContext {
     /** Park the dispatch state (`command`, `matches`, …) the calling script is
      *  holding before running an alias pass of its own, and hand it back at the
      *  depth the push answered with. See LuaRuntime.pushNestedDispatchState. */
-    pushNestedDispatchState(): number;
+    pushNestedDispatchState(parkCommand?: boolean): number;
+    /** Whether an alias or trigger pass is running a script now — the
+     *  nesting desktop's feedTriggers parks the caller's captures for. */
+    inDispatchPass(): boolean;
     popNestedDispatchState(depth: number): void;
+
+    /** Whether `matches`/`multimatches` are being built — see
+     *  LuaRuntime.buildingCaptureTables. */
+    buildingCaptureTables(): boolean;
 
     /** This profile's virtual filesystem, or null before one is mounted.
      *  Never reassigned after the runtime is constructed, so a plain reference
      *  is safe here. */
     readonly vfs: ProfileVFS | null;
+
+    /** The bytes behind a path in the read-only `/lua/` namespace (the bundled
+     *  Lua, and in busted builds the spec corpus and its fixtures), or null
+     *  for any other path. See LuaRuntime.readBuiltinBytes. */
+    readBuiltinBytes(path: string): Uint8Array | null;
 
     /** Drop a Lua-side callback registration by id (the registry slot behind
      *  `__mudlet_register_cb`). Distinct from {@link releaseCb}, which goes
@@ -92,6 +104,10 @@ export interface BindingContext {
      *  leaking it. Mutated in place and never reassigned, so a reference is
      *  enough. */
     readonly overlayCmdLineActionCbIds: Map<string, number>;
+
+    /** The same for a miniconsole's or user window's own command line, keyed
+     *  by the window's name. */
+    readonly windowCmdLineActionCbIds: Map<string, number>;
 
     /** Run a registerMapInfo callback and read back what it produced. */
     evaluateMapInfo(

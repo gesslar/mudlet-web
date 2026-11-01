@@ -27,15 +27,14 @@ export function installWindowBindings({ lua, api, channel }: BindingContext): vo
     lua.global.set('__getMousePosition', () => api.getMousePosition());
     lua.global.set('__getUserWindowSize', (name: unknown) => {
         const n = String(name ?? '');
-        // A name with no window of its own answers with the MAIN window's size,
-        // not an error: Mudlet's TMainConsole::getUserWindowSize looks the name
-        // up in the dock registry and returns getMainWindowSize() when it is not
-        // there. Geyser leans on that — a label or container whose window has
-        // gone still needs a box to lay itself out in — and a spec reads it back
-        // to prove a deleted user window left no dock behind. That also covers
-        // the default/"main" name, which never has a dock.
-        if (!n || n === 'main' || !api.windows.has(n)) return api.getMainWindowSize();
-        return api.getUserWindowSize(n) ?? api.getMainWindowSize();
+        // Mudlet's TMainConsole::getUserWindowSize looks the name up in the dock
+        // registry, which holds user windows alone, and refuses one that is not
+        // there — a mini console included (null here; Bridge.lua shapes the
+        // refusal). The default/"main" name, in any case, is the main window,
+        // which never has a dock.
+        if (!n || n.toLowerCase() === 'main') return api.getMainWindowSize();
+        if (!api.windows.has(n) || api.windows.isMiniConsole(n)) return null;
+        return api.getUserWindowSize(n);
     });
 
     // setFontSize([windowName,] size) / getFontSize([windowName]) — Mudlet
@@ -47,19 +46,13 @@ export function installWindowBindings({ lua, api, channel }: BindingContext): vo
             ? api.setFontSize(Number(b), a)
             : api.setFontSize(Number(a));
     });
+    // A number names a window too: desktop's WINDOW_NAME is lua_isstring, so
+    // getFontSize(1) looks for a window called "1" rather than reading main.
     lua.global.set('__getFontSize', (a?: unknown) => {
-        const size = (typeof a === 'string')
-            ? api.getFontSize(a)
+        const size = (typeof a === 'string' || typeof a === 'number')
+            ? api.getFontSize(String(a))
             : api.getFontSize();
         return size ?? null;
-    });
-
-    // Mudlet setMiniConsoleFontSize(name, size) — miniconsole-only sibling
-    // of setFontSize. Raw entry returns false on miss; Bridge.lua re-shapes
-    // it into Mudlet's (nil, errMsg) failure shape.
-    lua.global.set('__setMiniConsoleFontSize', (name: unknown, size: unknown) => {
-        if (typeof name !== 'string') return false;
-        return api.setMiniConsoleFontSize(name, Number(size));
     });
 
     // setFont([windowName,] family) / getFont([windowName]). Mudlet returns
@@ -71,8 +64,8 @@ export function installWindowBindings({ lua, api, channel }: BindingContext): vo
             : api.setFont(String(a ?? ''));
     });
     lua.global.set('__getFont', (a?: unknown) => {
-        const family = (typeof a === 'string')
-            ? api.getFont(a)
+        const family = (typeof a === 'string' || typeof a === 'number')
+            ? api.getFont(String(a))
             : api.getFont();
         return family ?? null;
     });
@@ -95,7 +88,7 @@ export function installWindowBindings({ lua, api, channel }: BindingContext): vo
     // Dispatches on first-arg type — Lua-style: numeric strings (e.g. from
     // a trigger capture) coerce to the size overload. Returns [w, h] from
     // JS; Bridge.lua unpacks to two values and shapes the miss case.
-    lua.global.set('__calcFontSize', (a: unknown, b?: unknown) => {
+    lua.global.set('__calcFontSize', (a: unknown, b?: unknown, columnWidth?: unknown) => {
         let arg: number | string;
         // No argument at all measures the main window — WINDOW_NAME's default.
         if (a === undefined || a === null) {
@@ -109,7 +102,7 @@ export function installWindowBindings({ lua, api, channel }: BindingContext): vo
             return null;
         }
         const fname = (typeof b === 'string' || typeof b === 'number') ? String(b) : undefined;
-        return api.calcFontSize(arg, fname);
+        return api.calcFontSize(arg, fname, columnWidth === true);
     });
 
     // ── Borders ───────────────────────────────────────────────────────────

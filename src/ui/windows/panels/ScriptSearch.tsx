@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { Braces, CaseSensitive, ChevronDown, ChevronRight, Clock, Folder, Keyboard, MousePointerClick, Regex, Search, Shuffle, FileCode2, WholeWord, Zap } from 'lucide-react';
 import { useAppStore } from '../../../storage';
 import type { AliasNode, ButtonNode, KeyNode, ScriptNode, TimerNode, TriggerNode, TriggerPattern } from '../../../storage/schema';
+import { visibleTreeNodes } from '../../../storage/schema';
 import type { LuaGlobalEntry } from '../../../scripting/IScriptingRuntime';
 import type { ScriptingEngine } from '../../../scripting/ScriptingEngine';
 import { buildMatcher, type MatchRange, type SearchMatcher } from '../../search/matcher';
@@ -32,9 +33,11 @@ function formatCode(code: string): string {
     return code;
 }
 
-function formatKeyCombo(key: string, modifiers: string[]): string {
+function formatKeyCombo(key: string, modifiers: string[], qtKey?: number): string {
+    // A key bound only by the character it types (AZERTY's é) has no code.
+    if (!key && qtKey !== undefined && qtKey > 0) key = String.fromCharCode(qtKey).toLowerCase();
     if (!key) return '';
-    return [...modifiers.map(m => m[0].toUpperCase() + m.slice(1)), formatCode(key)].join('+');
+    return [...modifiers.filter(m => m !== 'keypad' || !key.startsWith('Numpad')).map(m => m[0].toUpperCase() + m.slice(1)), formatCode(key)].join('+');
 }
 
 // ── Matching ────────────────────────────────────────────────────────────────
@@ -73,7 +76,7 @@ function findOccurrences(item: AnyNode, matcher: SearchMatcher): SearchOccurrenc
         for (const e of any.eventHandlers as string[]) field('event', e);
     }
     if ('key' in item && (item as KeyNode).key) {
-        field('key', formatKeyCombo((item as KeyNode).key, (item as KeyNode).modifiers));
+        field('key', formatKeyCombo((item as KeyNode).key, (item as KeyNode).modifiers, (item as KeyNode).qtKey));
     }
 
     if (typeof any.code === 'string' && any.code) {
@@ -222,10 +225,17 @@ export function ScriptSearch({ connectionId, scriptingEngineRef, onNavigate, onN
     const [viewportH, setViewportH] = useState(420);
 
     const scripts     = useAppStore(s => s.connectionScripts[connectionId] ?? EMPTY);
-    const aliases     = useAppStore(s => s.connectionAliases[connectionId] ?? EMPTY);
-    const triggers    = useAppStore(s => s.connectionTriggers[connectionId] ?? EMPTY);
-    const timers      = useAppStore(s => s.connectionTimers[connectionId] ?? EMPTY);
-    const keybindings = useAppStore(s => s.connectionKeybindings[connectionId] ?? EMPTY);
+    // A permanent item a script hung under a temporary one is the session's
+    // alone — desktop drops it with its temporary parent's subtree on save —
+    // so it is not offered for editing (see visibleTreeNodes).
+    const aliasesAll  = useAppStore(s => s.connectionAliases[connectionId] ?? EMPTY);
+    const triggersAll = useAppStore(s => s.connectionTriggers[connectionId] ?? EMPTY);
+    const timersAll   = useAppStore(s => s.connectionTimers[connectionId] ?? EMPTY);
+    const keysAll     = useAppStore(s => s.connectionKeybindings[connectionId] ?? EMPTY);
+    const aliases     = useMemo(() => visibleTreeNodes(aliasesAll), [aliasesAll]);
+    const triggers    = useMemo(() => visibleTreeNodes(triggersAll), [triggersAll]);
+    const timers      = useMemo(() => visibleTreeNodes(timersAll), [timersAll]);
+    const keybindings = useMemo(() => visibleTreeNodes(keysAll), [keysAll]);
     const buttons     = useAppStore(s => s.connectionButtons[connectionId] ?? EMPTY);
 
     const searchActive = query.length > 0;

@@ -21,10 +21,10 @@
 //    parsed-and-discarded: the tag is consumed so it never renders literally,
 //    while any enclosed text still renders inline.
 
-import { FormatState, applyOscPaletteOps } from "../text/FormatState";
+import { FormatState, applyOscPalette, parseSgrCodes } from "../text/FormatState";
 import type { BufferSegment, FormatColor, FormatStateSnapshot, FormatHyperlink } from "../text/FormatState";
 import { mxpColor } from "../text/colorParsers";
-import { scanEscape, parseOsc8Payload, classifyHyperlinkUri, parseOscColorPalette } from "../text/ansiEscapes";
+import { scanEscape, cursorForwardCount, cursorForwardSpaces, parseOsc8Payload, classifyHyperlinkUri } from "../text/ansiEscapes";
 import { parseOsc8Uri, HyperlinkPresetRegistry } from "../text/hyperlinkConfig";
 import type { MspCommand, MspKind } from "./msp";
 import { CLIENT_NAME, CLIENT_VERSION } from "../../version";
@@ -136,6 +136,11 @@ export interface MxpLineResult {
 }
 
 type MxpMode = "open" | "secure" | "locked";
+/** The mode in force right now: one of the three, or TEMP SECURE (`ESC[4z`),
+ *  which is a mode of its own in Mudlet (MXP_MODE_TEMP_SECURE) — it replaces
+ *  the line's mode until the next recognised tag, then hands over to the
+ *  default mode rather than back to the line's. */
+type LineMode = MxpMode | "tempSecure";
 
 interface ElementDef {
     name: string;
@@ -241,13 +246,33 @@ const SUPPORTED_ELEMENTS: ReadonlyMap<string, readonly string[]> = new Map([
     ['h', []], ['high', []],
 ]);
 
-/** Built-in XML/HTML entities. User and `<V>`-defined entities augment these via
- *  the per-session `entities` map. */
-const BUILTIN_ENTITIES: Record<string, string> = {
-    // `&nbsp;` is a plain space, as in Mudlet's TEntityResolver — U+00A0 would
-    // make every trigger pattern with a space in it miss the text.
-    lt: "<", gt: ">", amp: "&", quot: '"', apos: "'", nbsp: " ",
-};
+/** The entities every game gets — Mudlet's TEntityResolver table, whole: the
+ *  ASCII punctuation names, `&tab;` and `&newline;`, and HTML's Latin-1 set.
+ *  Names are case-sensitive here (`&Auml;` is not `&auml;`); a name that
+ *  matches none exactly is tried again lowercased, as Mudlet tries it. A game's
+ *  own `<!ENTITY>` of the same name is looked up first and wins.
+ *  `&nbsp;` is a plain space, as in Mudlet — U+00A0 would make every trigger
+ *  pattern with a space in it miss the text. A Map, so a name like
+ *  `&constructor;` is not found on Object's prototype. */
+const BUILTIN_ENTITIES: ReadonlyMap<string, string> = new Map(Object.entries({
+    tab: "\t", newline: "\n", excl: "!", quot: "\"", num: "#", dollar: "$", percnt: "%", amp: "&",
+    apos: "'", lpar: "(", rpar: ")", ast: "*", plus: "+", comma: ",", period: ".", sol: "/",
+    colon: ":", semi: ";", lt: "<", equals: "=", gt: ">", quest: "?", commat: "@", lsqb: "[",
+    bsol: "\\", rsqb: "]", hat: "^", lowbar: "_", grave: "`", lcub: "{", verbar: "|", rcub: "}",
+    nbsp: " ", iexcl: "¡", cent: "¢", pound: "£", curren: "¤", yen: "¥", brvbar: "¦", sect: "§",
+    dot: "¨", copy: "©", ordf: "ª", laquo: "«", not: "¬", shy: "\u00ad", reg: "®", macr: "¯",
+    deg: "°", plusmn: "±", divide: "÷", times: "×", sup2: "²", sup3: "³", acute: "´", uml: "¨",
+    micro: "µ", para: "¶", middot: "·", cedil: "¸", sup1: "¹", ordm: "º", raquo: "»", frac14: "¼",
+    frac12: "½", frac34: "¾", iquest: "¿", Aacute: "Á", aacute: "á", Acirc: "Â", acirc: "â",
+    AElig: "Æ", aelig: "æ", Agrave: "À", agrave: "à", Aring: "Å", aring: "å", Atilde: "Ã",
+    atilde: "ã", Auml: "Ä", auml: "ä", Ccedil: "Ç", ccedil: "ç", Eacute: "É", eacute: "é",
+    Ecirc: "Ê", ecirc: "ê", Egrave: "È", egrave: "è", Euml: "Ë", euml: "ë", Iacute: "Í",
+    iacute: "í", Icirc: "Î", icirc: "î", Igrave: "Ì", igrave: "ì", Iuml: "Ï", iuml: "ï", ETH: "Ð",
+    eth: "ð", Ntilde: "Ñ", ntilde: "ñ", Oacute: "Ó", oacute: "ó", Ocirc: "Ô", ocirc: "ô",
+    Ograve: "Ò", ograve: "ò", Oslash: "Ø", oslash: "ø", Otilde: "Õ", otilde: "õ", Ouml: "Ö",
+    ouml: "ö", Uacute: "Ú", uacute: "ú", Ucirc: "Û", ucirc: "û", Ugrave: "Ù", ugrave: "ù",
+    Uuml: "Ü", uuml: "ü", Yacute: "Ý", yacute: "ý", THORN: "Þ", thorn: "þ", szlig: "ß",
+}));
 
 /** Tags the MXP spec defines that this parser consumes without acting on —
  *  structural ones and the heavy ones it deliberately leaves alone. Anything
@@ -266,13 +291,25 @@ const SEND_FLAGS = new Set(["prompt", "hint", "expire"]);
 
 /** Cap on a held partial escape sequence. Beyond this it was never a real one,
  *  so it is dropped rather than swallowing the rest of the stream. */
+/** Whether an `<A>` may open `href`. The game chooses the address, so only
+ *  web and mail schemes reach the opener, as other schemes (`file:`, a
+ *  program's own like `steam:`, `javascript:`) can launch local programs or run
+ *  in this page; a scheme-less address opens nothing
+ *  (TMxpLinkTagHandler::actionFor). */
+export function mxpLinkOpens(href: string): boolean {
+    return /^(https?|ftp|mailto):/i.test(href);
+}
+
 const MAX_PENDING = 256;
 /** How many links that carry an `EXPIRE` name are remembered. A link that
  *  falls off the end can no longer be retired — Mudlet's store recycles its ids
  *  after as many (TLinkStore::scmMaxLinks). */
 const MAX_EXPIRING_LINKS = 20000;
-/** Recursion guard for custom-element template expansion. */
-const MAX_DEPTH = 8;
+/** How many custom elements may be expanding inside one another at once —
+ *  TMxpCustomElementTagHandler's `maxElementExpansionDepth`: far deeper than
+ *  any game nests its elements, shallow enough that a chain of thousands a
+ *  game defines cannot exhaust the stack. */
+const MAX_ELEMENT_EXPANSION_DEPTH = 32;
 /** Narrowest an `<HR>` rule may be drawn, however narrow the window wraps.
  *  Mudlet's `TMxpMudlet::getWrapWidth` floor. */
 const HR_MIN_WIDTH = 40;
@@ -292,10 +329,18 @@ export class MxpParser {
 
     // --- persistent across the whole session ---
     private elements = new Map<string, ElementDef>();
+    /** The custom elements whose definitions are running right now, innermost
+     *  last — TMxpCustomElementTagHandler's `mElementsBeingExpanded`. See
+     *  {@link mayExpand}. */
+    private readonly expanding = new Set<string>();
     private entities = new Map<string, string>();
-    private lineMode: MxpMode = "open";
+    private lineMode: LineMode = "open";
+    /** Mudlet's mMXP_DEFAULT — the mode a newline returns to. Null is OPEN,
+     *  the initial default. */
     private lockedMode: MxpMode | null = null;
-    private tempSecure = false;
+    /** TMxpProcessor's mModeBeforeTempSecure: what an `ESC[4z` line goes back
+     *  to once its one tag is read. */
+    private modeBeforeTempSecure: LineMode = "open";
     private stack: OpenTag[] = [];
     /** Active MXP `<COLOR>`/`<FONT>` fg/bg overrides, innermost last. While
      *  non-empty, the top entry's colours are painted over whatever the ANSI
@@ -317,9 +362,9 @@ export class MxpParser {
     /** OSC 8 preset definitions seen this session (shared with the ANSI path
      *  when the engine supplies a registry). */
     private presets: HyperlinkPresetRegistry;
-    /** Set while the processor is forced on: the lock to secure mode it came
-     *  with then holds against a game's `ESC[5z`/`ESC[7z` (and the locked start
-     *  a bare `IAC SB MXP IAC SE` asks for) — Mudlet's shouldLockModeToSecure. */
+    /** Set while Force MXP is on: a secure default then holds against a lock
+     *  to OPEN or LOCKED, the game's `ESC[5z`/`ESC[7z` and the open start a
+     *  switch-on asks for included — Mudlet's shouldLockModeToSecure. */
     private forcedSecure = false;
 
     // --- the link store: Mudlet's TLinkStore, as far as MXP needs it ---
@@ -384,28 +429,21 @@ export class MxpParser {
     }
 
     /**
-     * Lock the parser to secure line mode (or release the lock). Mudlet does
-     * this whenever the MXP processor is forced on without an option-91
-     * handshake (ctelnet.cpp: MXP_MODE_CODE_LOCK_SECURE): such servers are
-     * IRE-style and never send mode switches, they just use secure tags — and
-     * without the lock every definition tag would be ignored as unsafe.
+     * Whether Force MXP is on — TMxpMudlet::shouldLockModeToSecure, read live.
+     * While it is, a secure default holds against any lock to OPEN or LOCKED,
+     * the game's `ESC[5z`/`7z` included. It changes no mode by itself: forcing
+     * the processor on is what locks it secure ({@link applyMode} with 6), and
+     * that secure default outlives the box being unticked.
      */
-    lockSecureMode(locked: boolean): void {
-        this.forcedSecure = locked;
-        this.setLockedMode(locked ? "secure" : null);
+    setForceLock(on: boolean): void {
+        this.forcedSecure = on;
     }
 
-    /** Set the mode every line falls back to — the `ESC[5z`/`6z`/`7z` lock,
-     *  reachable from outside because a bare `IAC SB MXP IAC SE` starts the
-     *  processor locked (cTelnet sets MXP_MODE_CODE_LOCK_LOCKED for it): such
-     *  a server has negotiated nothing, so until it sends a mode of its own
-     *  nothing it writes is markup. */
-    setLockedMode(mode: "open" | "secure" | "locked" | null): void {
-        // A forced processor keeps its secure lock, as it does against the
-        // game's own ESC[5z/7z (see applyLineMode).
-        if (this.forcedSecure && mode !== "secure" && mode !== null && this.lockedMode === "secure") return;
-        this.lockedMode = mode;
-        this.lineMode = mode ?? "open";
+    /** Apply mode code `n` (TMxpProcessor::setMode) from the client's side:
+     *  6 when the processor is forced on or auto-enabled, 5 each time the game
+     *  switches MXP on, which starts it in open mode. */
+    applyMode(n: number): void {
+        this.applyLineMode(n);
     }
 
     /** Whether a link is still there to click: false once an `<EXPIRE>` has
@@ -422,7 +460,7 @@ export class MxpParser {
         this.entities.clear();
         this.lineMode = "open";
         this.lockedMode = null;
-        this.tempSecure = false;
+        this.modeBeforeTempSecure = "open";
         this.stack = [];
         this.mxpColorStack = [];
         this.pendingTag = "";
@@ -502,7 +540,36 @@ export class MxpParser {
         return result;
     }
 
-    private effectiveMode(): MxpMode {
+    /**
+     * The styling MXP tags still hold open: the colour of the innermost open
+     * `<COLOR>`/`<FONT>`, and bold, italic, underline and strikeout while a tag
+     * of that kind is open. Desktop keeps these in TMxpMudlet, apart from the
+     * ANSI pen, and TBuffer paints them on every character it writes — whether
+     * or not MXP is still on, so a game that turns MXP off with a tag left open
+     * goes on showing it until MXP is reset. Undefined when nothing is open.
+     */
+    openStyle(): FormatStateSnapshot | undefined {
+        const style: FormatStateSnapshot = {};
+        let any = false;
+        for (const tag of this.stack) {
+            switch (tag.name) {
+                case "b": case "bold": case "strong": case "h": case "high":
+                    style.bold = true; any = true; break;
+                case "i": case "italic": case "em":
+                    style.italic = true; any = true; break;
+                case "u": case "underline":
+                    style.underline = true; any = true; break;
+                case "s": case "strikeout": case "strike": case "del":
+                    style.strikethrough = true; any = true; break;
+            }
+        }
+        const colour = this.mxpColorStack[this.mxpColorStack.length - 1];
+        if (colour?.fg) { style.foreground = { ...colour.fg }; any = true; }
+        if (colour?.bg) { style.background = { ...colour.bg }; any = true; }
+        return any ? style : undefined;
+    }
+
+    private effectiveMode(): LineMode {
         // The current line's mode. Lock modes (5/6/7) only change the *default*
         // that `resetTransientMode` restores at the start of each new line — they
         // are NOT an override that beats a per-line mode tag (0/1/2). Servers that
@@ -521,7 +588,6 @@ export class MxpParser {
         // Transient OPEN/SECURE/LOCKED (modes 0/1/2) last only for the current
         // line; at the newline we revert to the locked mode, or OPEN by default.
         this.lineMode = this.lockedMode ?? "open";
-        this.tempSecure = false;
     }
 
     /** Take off the styling open tags put on — bold, italic, underline,
@@ -571,9 +637,23 @@ export class MxpParser {
         if (!markup) for (const tag of this.stack) if (tag.link) tag.link.content += s;
     }
 
-    private flushRun(): void {
+    /** `CSI n C` (cursor forward): n spaces painted in the background colour,
+     *  as TBuffer writes them (see cursorForwardCount). They go straight into
+     *  the line, past any open link's content, the way Mudlet appends them to
+     *  mMudLine without the MXP handlers seeing them. */
+    private appendCursorForward(count: number): void {
+        this.flushRun();
+        this.appendText(" ".repeat(count), true);
+        this.flushRun(true);
+    }
+
+    private flushRun(transparent = false): void {
         if (this.run.length === 0) return;
-        const state = this.fmt.toSnapshot();
+        // The attributes the characters are written with, not the pen: on one
+        // of the sixteen ANSI colours bold only picks the bright twin and the
+        // text itself is not bold — an MXP <B> included, which sets the same
+        // bold the SGR does (TBuffer's `mIsDefaultColor ? mBold : false`).
+        const state = this.fmt.toCellSnapshot();
         // An open MXP <COLOR>/<FONT> colour wins over the ANSI pen (Mudlet
         // semantics): the ANSI fg/bg still tracks in `fmt` so it resumes once
         // the colour tag closes, but it isn't what gets painted meanwhile.
@@ -582,6 +662,7 @@ export class MxpParser {
             if (override.fg) state.foreground = override.fg;
             if (override.bg) state.background = override.bg;
         }
+        if (transparent) state.foreground = state.background ? { ...state.background } : undefined;
         // Route the run to the active <DEST> frame, or to the main line.
         if (this.destName === null) this.out.push({ text: this.run, state });
         else this.destOut.push({ text: this.run, state });
@@ -604,8 +685,19 @@ export class MxpParser {
                     return;
                 }
                 if (esc.kind === "csi" && esc.finalByte === "m") {
-                    this.flushRun();
-                    this.fmt.applySgr(parseSgrParams(esc.params ?? ""));
+                    // The same reading as the plain ANSI path, sub-parameters
+                    // and all — null when no parameter could be read at all.
+                    const sgr = parseSgrCodes(esc.params ?? "");
+                    if (sgr) {
+                        this.flushRun();
+                        this.fmt.applySgr(sgr);
+                    }
+                } else if (esc.kind === "csi" && esc.finalByte === "C") {
+                    // Stopping at the right margin, measured from the line
+                    // written so far (cursorForwardSpaces).
+                    const column = (this.destName === null ? this.plain : this.destPlain).length;
+                    const spaces = cursorForwardSpaces(cursorForwardCount(esc.params), column);
+                    if (spaces > 0) this.appendCursorForward(spaces);
                 } else if (esc.kind === "csi" && esc.finalByte === "z") {
                     // Consumed either way — it is never text — but only obeyed
                     // when the game sent it. See parseLine's `fromServer`.
@@ -636,10 +728,10 @@ export class MxpParser {
                             // preset definition / disallowed scheme: leave as-is.
                         }
                     } else {
-                        // OSC 4/104 colour palette redefinition (no text/state
-                        // change — retargets colour tables for following runs).
-                        const palette = parseOscColorPalette(esc.oscPayload);
-                        if (palette) applyOscPaletteOps(palette);
+                        // `ESC]P`/`ESC]R` colour palette redefinition (no
+                        // text/state change — retargets colour tables for
+                        // following runs).
+                        applyOscPalette(esc.oscPayload);
                     }
                 }
                 // Every other recognized sequence (non-OSC-8 OSC commands,
@@ -660,13 +752,23 @@ export class MxpParser {
                     i++;
                     continue;
                 }
-                const close = findTagEnd(text, i);
+                const { close, restart } = scanTag(text, i);
+                const cutAt = text.indexOf("\x1b", i + 1);
+                // A second `<` before the tag closed — outside quotes, and not
+                // in a comment — means the first never was one: what was read
+                // of it is text, and the new `<` starts afresh (TMxpProcessor's
+                // nested-'<' recovery). Read as one tag instead, `a<b and <3> ok`
+                // lost "b and <3" and turned bold.
+                if (restart !== -1 && (cutAt === -1 || restart < cutAt)) {
+                    this.appendText(text.slice(i, restart), true);
+                    i = restart;
+                    continue;
+                }
                 // An ANSI escape cannot be part of a tag, so one arriving
                 // before the tag closed cuts it short: what was read of it is
                 // shown as the text it was, in the colours in use before the
                 // escape, and the escape then acts as usual (TBuffer's
                 // `abortCurrentTag()` on an ESC while a tag is being built).
-                const cutAt = text.indexOf("\x1b", i + 1);
                 if (cutAt !== -1 && (close === -1 || cutAt < close)) {
                     this.appendText(text.slice(i, cutAt), true);
                     i = cutAt;
@@ -734,14 +836,19 @@ export class MxpParser {
             case 0: this.lineMode = "open"; break;
             case 1: this.lineMode = "secure"; break;
             case 2: this.lineMode = "locked"; break;
-            case 3: // reset — close everything, back to defaults
+            case 3:
+                // Reset: close everything and drop the styling, then open the
+                // line — open, not the default: a secure default would let this
+                // line use secure tags. The default applies again at the newline.
                 this.closeAllTags();
                 this.fmt.reset();
                 this.lineMode = "open";
-                this.lockedMode = null;
-                this.tempSecure = false;
                 break;
-            case 4: this.tempSecure = true; break;
+            case 4:
+                // The line's own mode comes back once the tag is read.
+                if (this.lineMode !== "tempSecure") this.modeBeforeTempSecure = this.lineMode;
+                this.lineMode = "tempSecure";
+                break;
             case 5: case 7:
                 // A forced processor holds its secure lock against a game
                 // that would unlock it (shouldLockModeToSecure).
@@ -775,9 +882,16 @@ export class MxpParser {
         const trimmed = raw.trim();
         if (trimmed === "") return;
 
-        // Temp-secure (mode 4) makes exactly the next tag secure.
-        const secure = this.tempSecure || this.effectiveMode() === "secure";
-        this.tempSecure = false;
+        const mode = this.effectiveMode();
+        const secure = mode === "secure" || mode === "tempSecure";
+        // Temp-secure (mode 4) lasts for one recognised tag, after which the
+        // line's own mode is in force again — not the default: an open line
+        // under a secure default would stay secure (TMxpProcessor::
+        // processMxpInput). A name Mudlet does not know is rejected before that
+        // point and leaves it pending.
+        if (mode === "tempSecure" && this.isRecognisedTag(trimmed)) {
+            this.lineMode = this.modeBeforeTempSecure;
+        }
 
         if (trimmed.startsWith("!")) {
             if (!secure || !this.handleDefinition(trimmed)) this.showAsText(raw);
@@ -819,6 +933,16 @@ export class MxpParser {
 
     private isKnownTag(name: string): boolean {
         return SUPPORTED_ELEMENTS.has(name) || CONSUMED_ELEMENTS.has(name) || this.elements.has(name);
+    }
+
+    /** Whether Mudlet would recognise a tag (its trimmed raw text) as MXP —
+     *  the definitions it lists in allMxpTags, or a known element, open or
+     *  closing. What it does not recognise it rejects as text before the
+     *  temp-secure mode is spent. */
+    private isRecognisedTag(trimmed: string): boolean {
+        if (trimmed.startsWith("!")) return /^!(element|el|attlist|at|entity|en|tag|--)(?![a-z])/i.test(trimmed);
+        const body = trimmed.startsWith("/") ? trimmed.slice(1).trim() : trimmed;
+        return this.isKnownTag(body.split(/[\s>]/)[0].toLowerCase());
     }
 
         private openAllowed(name: string): boolean {
@@ -1178,7 +1302,7 @@ export class MxpParser {
      *  end the string it is put in (TMxpSendTagHandler::actionFor). */
     private linkActions(link: LinkState, text: string): string[] {
         const target = link.href.replace(/&text;/gi, text);
-        if (link.tag === "a") return [`openUrl(${quoteLuaLiteral(target)})`];
+        if (link.tag === "a") return [mxpLinkOpens(target) ? `openUrl(${quoteLuaLiteral(target)})` : ""];
         const command = link.kind === "prompt" ? "printCmdLine" : "send";
         const cmds = target.split("|").filter(c => c.trim().length > 0);
         return (cmds.length > 0 ? cmds : [text]).map(c => `${command}(${quoteLuaLiteral(c)})`);
@@ -1240,7 +1364,32 @@ export class MxpParser {
                 return;
             }
         }
-        // Stray closing tag with no matching open — ignore.
+        // A custom element with nothing open to close — an EMPTY one, which
+        // never leaves a marker: close what its definition opens, innermost
+        // first, as Mudlet's handleEndTag does for any element with a
+        // definition (`<!ELEMENT rd '<COLOR red><B>' EMPTY>` makes `</rd>` a
+        // `</B></COLOR>`) — only its opening tags, as a closing tag in a
+        // definition is ignored, and not for an element already being closed
+        // or past the expansion cap (mayExpand). Anything else is a stray
+        // close, and is ignored.
+        const def = this.elements.get(name);
+        if (!def || !this.mayExpand(name)) return;
+        const opened = [...def.template.matchAll(/<\s*([A-Za-z][\w-]*)/g)].map(m => m[1].toLowerCase());
+        this.expanding.add(name);
+        try {
+            for (let k = opened.length - 1; k >= 0; k--) this.handleCloseTag(opened[k]);
+        } finally {
+            this.expanding.delete(name);
+        }
+    }
+
+    /** TMxpCustomElementTagHandler::mayExpand: a game can define an element
+     *  that expands to itself, directly or through other elements, or a chain
+     *  of elements long enough to exhaust the stack. An element already being
+     *  expanded, or one past {@link MAX_ELEMENT_EXPANSION_DEPTH} of them, is
+     *  handled without running its definition. */
+    private mayExpand(name: string): boolean {
+        return this.expanding.size < MAX_ELEMENT_EXPANSION_DEPTH && !this.expanding.has(name);
     }
 
     private finalizeTag(tag: OpenTag): void {
@@ -1261,9 +1410,9 @@ export class MxpParser {
             const payload = link.href.replace(/&text;/gi, link.content);
             const actions = this.linkActions(link, link.content);
             if (this.currentLink?.id === link.id && this.isLinkLive(link.id)) this.currentLink.actions = actions;
-            // An <A> opens its address; one that is not a web address is
-            // offered to the game as a command, as it always was here.
-            const kind = link.tag === "a" && !/^(https?|mailto):/i.test(payload) ? "command" : link.kind;
+            // An <A> keeps its "url" kind whatever its address: Mudlet's action
+            // for one is always openUrl(…), so nothing in it reaches the game.
+            const kind = link.kind;
             if (payload && end > link.start) {
                 // Split, but not trimmed: a trailing space is part of the command a
                 // game means to be completed (<SEND "tell Zugg " PROMPT>), and Mudlet
@@ -1284,7 +1433,9 @@ export class MxpParser {
                         start: link.start, end,
                         kind,
                         payload: cmds[0] ?? text,
-                        hint: hintParts[0] ?? link.hint,
+                        hint: link.tag === "a" && !mxpLinkOpens(payload)
+                            ? `Mudlet does not open this kind of address: ${payload}`
+                            : hintParts[0] ?? link.hint,
                         id: link.id,
                     });
                 }
@@ -1292,7 +1443,7 @@ export class MxpParser {
             if (link.tag === "send") this.reportSend(link, link.content.trim(), payload, actions);
         }
         if (tag.varName !== undefined && tag.varName !== "") {
-            this.entities.set(tag.varName, this.plain.slice(tag.varStart ?? this.plain.length, this.plain.length));
+            this.entities.set(tag.varName.toLowerCase(), this.plain.slice(tag.varStart ?? this.plain.length, this.plain.length));
         }
     }
 
@@ -1373,19 +1524,32 @@ export class MxpParser {
             else if (up === "PRIVATE" || up === "PUBLISH" || up === "ADD" || up === "REMOVE") continue;
             else if (!valueSeen) { value = t.value; valueSeen = true; }
         }
-        if (del) { this.entities.delete(name); return true; }
-        this.entities.set(name, value);
+        if (del) { this.entities.delete(name.toLowerCase()); return true; }
+        this.entities.set(name.toLowerCase(), value);
         return true;
     }
 
     private expandElement(def: ElementDef, named: Map<string, string>, positional: string[], depth: number): void {
-        if (depth >= MAX_DEPTH) return;
-        const before = this.fmt.toSnapshot();
-        this.flushRun();
-        // Push the close marker *below* the tags the template will open, so
-        // `</name>` reverts everything the definition introduced.
-        if (!def.empty) this.stack.push({ name: def.name, closeFmt: before });
-        this.runTemplate(def.template, this.elementValues(def, named, positional), depth + 1);
+        // One that may not expand (mayExpand) is still handled — its event
+        // below is reported — but its definition does not run, and it leaves
+        // no marker: on desktop its `</name>` is handled as doing nothing, and
+        // a marker would have that close revert the definition of the element
+        // around it that it is the self-reference of.
+        if (this.mayExpand(def.name)) {
+            const before = this.fmt.toSnapshot();
+            this.flushRun();
+            // Push the close marker *below* the tags the template will open, so
+            // `</name>` reverts everything the definition introduced. An EMPTY
+            // element is not closed, so it gets none — see handleCloseTag for a
+            // game that closes one anyway.
+            if (!def.empty) this.stack.push({ name: def.name, closeFmt: before });
+            this.expanding.add(def.name);
+            try {
+                this.runTemplate(def.template, this.elementValues(def, named, positional), depth + 1);
+            } finally {
+                this.expanding.delete(def.name);
+            }
+        }
         // Reported once the definition has run, as Mudlet reports it after
         // handling the tag: `actions` is the newest link's, which may be the
         // one the definition just made.
@@ -1413,7 +1577,10 @@ export class MxpParser {
     /** Run a definition's markup. Its tags are read first and filled in after,
      *  attribute by attribute, so a value cannot rewrite the tag it lands in:
      *  a quote in it stays in the value. The text between them is filled in
-     *  and read as the game's own. */
+     *  and read as the game's own. Per the MXP spec a definition holds only
+     *  opening tags, so a closing tag in one is skipped, as
+     *  TMxpCustomElementTagHandler::handleStartTag skips it — `'<B>x</B>'`
+     *  leaves its element bold until the element itself is closed. */
     private runTemplate(template: string, fill: (s: string) => string, depth: number): void {
         let textStart = 0;
         let i = 0;
@@ -1422,7 +1589,8 @@ export class MxpParser {
                 const close = findTagEnd(template, i);
                 if (close === -1) break;
                 if (i > textStart) this.parseFragment(fill(template.slice(textStart, i)), depth);
-                this.handleTag(template.slice(i + 1, close), depth, fill);
+                const tag = template.slice(i + 1, close);
+                if (!tag.trimStart().startsWith("/")) this.handleTag(tag, depth, fill);
                 i = close + 1;
                 textStart = i;
                 continue;
@@ -1434,6 +1602,9 @@ export class MxpParser {
 
     // ---- entities ----
 
+    /** What `&ent;` stands for, or null when it names nothing. A game's
+     *  entities are kept under their lowercased names, as Mudlet's
+     *  registerEntity keeps them. */
     private decodeEntity(ent: string): string | null {
         if (ent.length === 0) return null;
         if (ent[0] === "#") {
@@ -1445,11 +1616,11 @@ export class MxpParser {
             }
             return null;
         }
+        // TEntityResolver::getResolution: the game's own first, by any case,
+        // so a game can redefine `&lt;` or `&amp;`; then the built-in name as
+        // written, then lowercased.
         const lc = ent.toLowerCase();
-        if (lc in BUILTIN_ENTITIES) return BUILTIN_ENTITIES[lc];
-        if (this.entities.has(ent)) return this.entities.get(ent)!;
-        if (this.entities.has(lc)) return this.entities.get(lc)!;
-        return null;
+        return this.entities.get(lc) ?? BUILTIN_ENTITIES.get(ent) ?? BUILTIN_ENTITIES.get(lc) ?? null;
     }
 }
 
@@ -1532,12 +1703,27 @@ function findTagEnd(text: string, start: number): number {
     return -1;
 }
 
-function parseSgrParams(s: string): number[] {
-    if (s === "") return [0];
-    return s.split(";").map(p => {
-        const n = parseInt(p, 10);
-        return Number.isFinite(n) ? n : 0;
-    });
+/** Read the tag starting at `start` (the `<`) up to whichever comes first
+ *  outside a quoted value: the `>` that closes it (`close`), or another `<`
+ *  that shows it never was a tag (`restart`). The other is -1, and both are
+ *  when the line ends first. A comment (`<!--`) takes `<` as text, as Mudlet's
+ *  tag builder does. */
+function scanTag(text: string, start: number): { close: number; restart: number } {
+    if (text.startsWith("<!--", start)) return { close: findTagEnd(text, start), restart: -1 };
+    let quote = "";
+    for (let j = start + 1; j < text.length; j++) {
+        const c = text[j];
+        if (quote) {
+            if (c === quote) quote = "";
+        } else if (c === '"' || c === "'") {
+            quote = c;
+        } else if (c === ">") {
+            return { close: j, restart: -1 };
+        } else if (c === "<") {
+            return { close: -1, restart: j };
+        }
+    }
+    return { close: -1, restart: -1 };
 }
 
 function firstWhitespace(s: string): number {

@@ -1,5 +1,5 @@
 import { fromByteString, toByteString, toHex } from "./byteString";
-import { GMCP_COMMAND_CODE, GMCP_IAC, GMCP_SB, GMCP_SE, TELNET_EOR, TELNET_GA, TELNET_OPTION_REGEX, TELNET_OPTION_REGEX_NO_SB } from "./constants";
+import { GMCP_COMMAND_CODE, GMCP_IAC, GMCP_SB, GMCP_SE, TELNET_EOR, TELNET_GA } from "./constants";
 
 export interface GmcpEnvelope {
     path: string;
@@ -42,13 +42,97 @@ export const createTelnetOptionParser = (
     };
 };
 
-export const stripTelnetSequences = (data: string, handler: TelnetOptionHandler): string => {
-    // After the regex consumes every complete telnet sequence, the only stray
-    // IAC (\xFF) left is a lone trailing one — an option/command split across
-    // frames — so drop it. (We no longer blanket-strip \xF9, which the old
-    // regex mis-handled for GA and which is a legitimate text byte otherwise.)
-    const re = data.includes(GMCP_IAC + GMCP_SE) ? TELNET_OPTION_REGEX : TELNET_OPTION_REGEX_NO_SB;
-    return data.replace(re, handler).replace(/\xFF/g, "");
+const IAC_SE = GMCP_IAC + GMCP_SE;
+const CODE_SB = 0xFA;
+const CODE_WILL = 0xFB;
+const CODE_DONT = 0xFE;
+
+/**
+ * Consume every complete telnet sequence in `data`, replacing each with what
+ * `handler` returns, and return the text that is left.
+ *
+ * A single forward scan with the same semantics as TELNET_OPTION_REGEX
+ * (`IAC SB … IAC SE` up to the first IAC SE, else `IAC WILL/WONT/DO/DONT x`,
+ * else `IAC x`), so `handler` sees exactly the sequences the regex matched.
+ * It replaced the regex because the lazy SB branch rescans to end-of-buffer
+ * from every IAC SB whose terminator never comes — quadratic on a run of
+ * IAC SB from a hostile server. Here the terminator search runs once: when it
+ * fails, no later IAC SB can find one either, so it is not repeated; when it
+ * succeeds, the scan resumes past it.
+ *
+ * Unfinished sequences, as the regex left them: a lone trailing IAC is
+ * dropped, `IAC WILL` at the very end is consumed as a two-byte command, and
+ * so is an `IAC SB` with no IAC SE after it. (MudClient holds a sequence split
+ * across frames back for the next one before calling this — `scanTelnetFrame`.)
+ *
+ * A NUL goes too. cTelnet::processSocketData drops `\0` from the text stream
+ * outside a subnegotiation (it is the padding half of telnet's `CR NUL`), so
+ * it never reaches the buffer; kept, it cut `line`, getCurrentLine() and
+ * getLines() short at the NUL and shifted every position after it
+ * (mudlet-web#272). Subnegotiation payloads go to `handler` intact, so a NUL
+ * inside one is untouched.
+ */
+export interface TextAheadSlot {
+    /** While `handler` runs, hands over the text stripped so far — the text
+     *  ahead of the sequence being handled — and drops it from what the strip
+     *  returns; null otherwise. */
+    take: (() => string) | null;
+}
+
+export const stripTelnetSequences = (data: string, handler: TelnetOptionHandler, textAhead?: TextAheadSlot): string => {
+    let iac = data.indexOf(GMCP_IAC);
+    if (iac === -1) return data.includes("\0") ? data.replace(/\0/g, "") : data;
+
+    const len = data.length;
+    let out = "";
+    let last = 0;
+    // Set once a search for IAC SE from some point has failed: none exists
+    // past it, so no later IAC SB can be terminated.
+    let noTerminator = false;
+    while (iac !== -1) {
+        if (iac > last) out += data.substring(last, iac);
+        const next = iac + 1;
+        if (next >= len) {
+            // Lone trailing IAC.
+            last = len;
+            break;
+        }
+        const cmd = data.charCodeAt(next);
+        let end = -1;
+        if (cmd === CODE_SB && !noTerminator) {
+            const se = data.indexOf(IAC_SE, iac + 2);
+            if (se === -1) noTerminator = true;
+            else end = se + 2;
+        }
+        if (end === -1) end = cmd >= CODE_WILL && cmd <= CODE_DONT && next + 1 < len ? iac + 3 : iac + 2;
+        let replacement: string;
+        if (textAhead && cmd === CODE_SB) {
+            // A handler can change the encoding, and the text ahead of the
+            // sequence must then be posted under the old one (cTelnet::
+            // processSubnegotiation), so it can be taken while the handler runs.
+            textAhead.take = () => {
+                const ahead = out.includes("\0") ? out.replace(/\0/g, "") : out;
+                out = "";
+                return ahead;
+            };
+            try {
+                replacement = handler(data.substring(iac, end));
+            } finally {
+                textAhead.take = null;
+            }
+        } else {
+            replacement = handler(data.substring(iac, end));
+        }
+        // An IAC in a replacement is stripped like any other stray IAC; its
+        // NULs go with the text's below.
+        if (replacement) out += replacement.includes(GMCP_IAC) ? replacement.replace(/\xFF/g, "") : replacement;
+        last = end;
+        iac = data.indexOf(GMCP_IAC, end);
+    }
+    if (last < len) out += data.substring(last);
+    // Text between sequences holds no IAC: every one starts a sequence or is
+    // the trailing one dropped above.
+    return out.includes("\0") ? out.replace(/\0/g, "") : out;
 };
 
 const parseGmcpPayload = (
@@ -70,7 +154,19 @@ const parseGmcpPayload = (
     // encoding, and only we can notice: a bad sequence never breaks the JSON
     // (every structural character is ASCII, continuation bytes are all >= 0x80),
     // so `JSON.parse` succeeds and the corruption stays inside string values.
-    const rawBody = data.substring(1);
+    // As cTelnet keeps a subnegotiation: a doubled IAC is one data byte 0xFF
+    // (which is not UTF-8, so it decodes to one U+FFFD below, not two).
+    let rawBody = data.substring(1);
+    if (rawBody.includes("\xFF\xFF")) rawBody = rawBody.replace(/\xFF\xFF/g, "\xFF");
+    // A NUL ends the message: desktop measures the command from its c_str()
+    // and then strips the two bytes of IAC SE it expects at the end, so the
+    // two bytes ahead of the NUL go as well, and a NUL within the first three
+    // leaves nothing at all (processTelnetCommand's OPT_GMCP case).
+    const nul = rawBody.indexOf("\0");
+    if (nul !== -1) {
+        if (nul < 3) return;
+        rawBody = rawBody.substring(0, nul - 2);
+    }
     const { text: gmcpData, malformed } = fromByteString(rawBody);
     if (!gmcpData.length) return;
 
@@ -102,7 +198,16 @@ const parseGmcpPayload = (
     // the byte the game sent, which the script can then act on; without it
     // JSON.parse rejects the whole message over one character it could have
     // read. Mudlet does the same replace, for every module and not just one.
-    payload = payload.replace(/\x1B/g, "\\u001B");
+    //
+    // A raw LF or CR is just as invalid there, and games leak those too —
+    // unescaped newlines in a room description or a channel line. Mudlet
+    // removes every one from the body before decoding (cTelnet::setGMCPVariables
+    // — "yajl doesn't like it"), so `"A long hall.\nIt goes north."` arrives as
+    // `A long hall.It goes north.` rather than dropping the whole message
+    // (mudlet-web#362). Outside a string they are whitespace, so pretty-printed
+    // JSON loses nothing. The raw body is kept for Client.GUI's line-based form.
+    const rawPayload = payload;
+    payload = payload.replace(/[\n\r]/g, "").replace(/\x1B/g, "\\u001B");
 
     let gmcp: unknown;
     try {
@@ -115,7 +220,7 @@ const parseGmcpPayload = (
         // on its own channel, never as an envelope: Mudlet returns before
         // setGMCPTable for this shape, keeping it out of the Lua `gmcp` table.
         if (type.toLowerCase() === CLIENT_GUI_MODULE && onRawClientGui) {
-            onRawClientGui(payload);
+            onRawClientGui(rawPayload);
             return;
         }
         // A non-conformant server can send a GMCP body that isn't valid JSON.
@@ -134,7 +239,7 @@ const parseGmcpPayload = (
     }
 
     // Outside the try: it guards the parse, not the consumer. An error thrown
-    // downstream (`atob` on a malformed gmcp_msgs body, say) would otherwise be
+    // downstream would otherwise be
     // caught here and reported as the server sending bad JSON — blaming the
     // wrong party for a bug of ours, and demoting it to a warn for the same
     // reason.
@@ -166,9 +271,10 @@ export const encodeGmcpRaw = (message: string): string => {
 };
 
 export interface GmcpStreamOptions {
+    /** Every message that reaches the `gmcp` table — `gmcp_msgs` included,
+     *  which Mudlet treats as an ordinary package rather than decoding and
+     *  printing its base64 `text` (mudlet-web#362). */
     onEnvelope: (payload: GmcpEnvelope) => void;
-    /** Called for gmcp_msgs subnegotiations (base64-encoded text with a type field). */
-    onMessage?: (text: string, type: string) => void;
     /** Called for every `Client.GUI` request, in whichever wire format it
      *  arrived: the parsed `{url, version}` object, or the legacy raw
      *  `<version>\n<url>` string. Split out from `onEnvelope` so the install has
@@ -177,15 +283,11 @@ export interface GmcpStreamOptions {
      *  table-populating path. The JSON form still emits its envelope as well,
      *  and does so first, so scripts observe it before the install runs. */
     onClientGui?: (payload: unknown) => void;
-    /** Text decoder used for gmcp_msgs payloads. Defaults to UTF-8. */
-    textEncoding?: string;
 }
 
 export const createGmcpStream = ({
     onEnvelope,
-    onMessage,
     onClientGui,
-    textEncoding = 'utf-8',
 }: GmcpStreamOptions) => {
     // Once per module rather than once per message, mirroring Mudlet's
     // `mEncodingWarningIssued`: a server that mis-encodes every `Room.Info`
@@ -197,31 +299,6 @@ export const createGmcpStream = ({
         parseGmcpPayload(
             data,
             (type, payload) => {
-                if (type.toLowerCase() === "gmcp_msgs" && onMessage) {
-                    // Everything that reads the payload goes inside the guard.
-                    // `atob` throws on a `text` field that isn't base64, the
-                    // TextDecoder ctor on an unsupported `textEncoding`, and a
-                    // literal `gmcp_msgs null` body — valid JSON — throws on the
-                    // property access itself. Caught here rather than left to
-                    // the caller's frame-level handler: the body parsed as JSON,
-                    // so this is a bad gmcp_msgs payload and nothing else in the
-                    // frame should be lost over it. Reported on its own terms,
-                    // not as a JSON error.
-                    let text: string;
-                    let msgType: string;
-                    try {
-                        msgType = (payload as { type: string }).type ?? "";
-                        const binaryString = atob((payload as { text: string }).text ?? "");
-                        text = new TextDecoder(textEncoding).decode(
-                            Uint8Array.from(binaryString, c => c.charCodeAt(0))
-                        );
-                    } catch (error) {
-                        console.warn("Malformed gmcp_msgs payload:", JSON.stringify(payload), error);
-                        return;
-                    }
-                    onMessage(text, msgType);
-                    return;
-                }
                 onEnvelope({ path: type, value: payload });
                 if (type.toLowerCase() === CLIENT_GUI_MODULE) onClientGui?.(payload);
             },

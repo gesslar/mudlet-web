@@ -3,7 +3,9 @@
 // System events checked against desktop Mudlet PTB side by side
 // (Mudlet/mudlet-web#260), at the engine level: what Lua's installModule
 // raises, when closeMudlet raises sysExitEvent, and the main console's
-// sysFontChangeEvent. The Lua-side half is sysEventDriftLua.test.ts.
+// sysFontChangeEvent; and from #354, resetProfile's answer and stopwatches,
+// and the protocol events' argument. The Lua-side halves are
+// sysEventDriftLua.test.ts and sysEventDrift354.test.ts.
 //
 // Mocked Lua runtime and node env, following packageModuleNameCollision.test.ts.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -65,6 +67,7 @@ function stubVfs() {
     return {
         profilePath: PROFILE,
         exists: (p: string) => dirs.has(p) || files.has(p),
+        stat: (p: string) => (files.has(p) ? { type: 'file' } : dirs.has(p) ? { type: 'dir' } : null),
         mkdir: (p: string) => { dirs.add(p.replace(/\/$/, '')); },
         rmdir: (p: string) => {
             for (const d of [...dirs]) if (under(p, d)) dirs.delete(d);
@@ -118,7 +121,15 @@ describe('system events match desktop (#260)', () => {
         (engine as unknown as { vfs: ProfileVFS }).vfs = vfs;
         vfs.writeBinaryFile(MOD_ARCHIVE, moduleArchive());
 
-        expect(engine.installModuleFromPath(MOD_ARCHIVE)).toEqual({ ok: true, error: null });
+        // The install events go out on the next pass of the event loop, as
+        // Host::installPackage's zero-timer sends them.
+        vi.useFakeTimers();
+        try {
+            expect(engine.installModuleFromPath(MOD_ARCHIVE)).toEqual({ ok: true, error: null });
+            vi.runAllTimers();
+        } finally {
+            vi.useRealTimers();
+        }
 
         const installs = raised.filter(([e]) => /Install/.test(e));
         expect(installs).toEqual([
@@ -135,11 +146,45 @@ describe('system events match desktop (#260)', () => {
         raised.length = 0;
         vi.mocked(engine.raiseEvent).mockImplementation((event) => { order.push(event); });
 
-        (engine as unknown as { api: { closeMudlet(): void } }).api.closeMudlet();
+        vi.useFakeTimers();
+        try {
+            const api = (engine as unknown as { api: { closeMudlet(): void } }).api;
+            api.closeMudlet();
+            // Armed, not run: desktop's closeMudlet returns before anything
+            // closes, so the rest of the calling script still runs (#354).
+            expect(order).toEqual([]);
+            api.closeMudlet();
+            vi.runAllTimers();
+        } finally {
+            vi.useRealTimers();
+        }
         expect(order).toEqual(['sysExitEvent', 'disconnect', 'close']);
 
         engine.destroy();
         expect(order.filter(e => e === 'sysExitEvent')).toHaveLength(1);
+    });
+
+    it('resetProfile answers true once armed, and the reset drops non-persistent stopwatches (#354)', async () => {
+        const api = (engine as unknown as { api: { stopwatches: import('../../src/scripting/StopwatchManager').StopwatchManager } }).api;
+        api.stopwatches.create('swN', true);
+        api.stopwatches.create('swPers', true);
+        api.stopwatches.setPersistence('swPers', true);
+
+        expect(engine.resetProfile()).toBe(true);
+        // One already in progress is folded into, as Host::resetProfile_phase1 refuses it.
+        expect(engine.resetProfile()).toBe(false);
+
+        await vi.waitFor(() => expect(names()).toContain('sysLoadEvent'));
+        expect(api.stopwatches.getTime('swN')).toEqual({ refused: "stopwatch with name 'swN' not found" });
+        expect(typeof api.stopwatches.getTime('swPers')).toBe('number');
+        api.stopwatches.setPersistence('swPers', false);
+    });
+
+    it('sysEchoAnomalyDetected and sysCharacterModeDetected carry one empty string (#354)', () => {
+        session.events.emit('telnet.echo.anomaly');
+        session.events.emit('charmode.detected');
+        expect(raised.filter(([e]) => e === 'sysEchoAnomalyDetected' || e === 'sysCharacterModeDetected'))
+            .toEqual([['sysEchoAnomalyDetected', ['']], ['sysCharacterModeDetected', ['']]]);
     });
 
     it('a change to the main console font raises sysFontChangeEvent("main", family, size)', () => {

@@ -9,7 +9,9 @@ import { unarmor } from '../byteArmor';
  * Colour channels are validated through the shared 0..255 coercion; Mudlet
  * silently no-ops on an out-of-range channel rather than raising.
  */
-export function installOutputBindings({ lua, api }: BindingContext): void {
+export function installOutputBindings(
+    { lua, api, pushNestedDispatchState, popNestedDispatchState, inDispatchPass }: BindingContext,
+): void {
     // ── Output / format ───────────────────────────────────────────────────
     lua.global.set('fg',          (name: string)  => api.fg(name));
     lua.global.set('bg',          (name: string)  => api.bg(name));
@@ -18,16 +20,32 @@ export function installOutputBindings({ lua, api }: BindingContext): void {
     // overload the window name lands in the text slot and the actual segment
     // is dropped, producing a wall of "main"s. The API itself decides where
     // to write (lineBuffer at cursor inside triggers, echo otherwise).
+    // Answers true once the text is written, as TLuaInterpreter::insertText
+    // does; a window name that is no console gets nil (Bridge.lua's
+    // unknown-window guard supplies the message for names nothing carries).
     lua.global.set('insertText', (a: string, b?: string) => {
-        if (b !== undefined) api.insertText(b, a);
-        else                 api.insertText(a);
+        const written = b !== undefined ? api.insertText(b, a) : api.insertText(a);
+        return written ? true : undefined;
     });
     // Armored, like feedTelnet: the older `feedTriggers(data, false)` form
     // carries bytes already in the game's encoding, which are not UTF-8 and
     // would not survive the wasmoon crossing as text. See byteArmor.ts.
     // Returns the refusal message, or nil when the text was fed.
-    lua.global.set('feedTriggers', (data: string, utf8Encoded?: unknown) =>
-        api.feedTriggers(unarmor(String(data ?? '')), utf8Encoded !== false));
+    //
+    // Fed from an alias or trigger script, it runs a whole trigger pass inside
+    // that script, and the pass sets the capture globals for the scripts IT
+    // runs — so the caller's are parked for it and handed back, or the caller
+    // resumes with an emptied `matches` (TLuaInterpreter::feedTriggers). Not
+    // `command`: a fed trigger may expand one, and the caller reads that back
+    // as the last command sent. At the top level there is nothing to park.
+    lua.global.set('feedTriggers', (data: string, utf8Encoded?: unknown) => {
+        const depth = inDispatchPass() ? pushNestedDispatchState(false) : -1;
+        try {
+            return api.feedTriggers(unarmor(String(data ?? '')), utf8Encoded !== false);
+        } finally {
+            if (depth >= 0) popNestedDispatchState(depth);
+        }
+    });
     lua.global.set('deleteLine',  (win?: string)  => api.deleteLine(win));
     // Mudlet `wrapLine([window,] lineNumber)`. Re-displays a line, re-wrapping
     // it and interpreting embedded \n. Overloaded: a string first arg is the
@@ -35,9 +53,10 @@ export function installOutputBindings({ lua, api }: BindingContext): void {
     // The argument TYPES are settled in Bridge.lua, where a Lua table is still
     // a table — it reaches JS as an ordinary object, and a message built from
     // `typeof` here would name the wrong thing.
+    // What it answers is settled in Bridge.lua's wrapper.
     lua.global.set('wrapLine', (a: unknown, b?: unknown) => {
-        if (typeof a === 'string') return api.wrapLine(Number(b), a);
-        return api.wrapLine(Number(a));
+        if (typeof a === 'string') api.wrapLine(Number(b), a);
+        else api.wrapLine(Number(a));
     });
     // Mudlet `printError(msg, [showStackTrace], [haltExecution])`. Mudlet Web
     // routes every script-emitted error through the same logging path so
@@ -104,7 +123,8 @@ export function installOutputBindings({ lua, api }: BindingContext): void {
     // Lua wrapper converts cmds/hints tables to \x01-delimited strings before calling here.
     // xEcho always passes (win, text, cmds_str, hints_str, fmt); win defaults to "main".
     lua.global.set('echoPopup', (win: unknown, text: unknown, cmds: unknown, hints: unknown, fmt?: unknown) => {
-        const textStr = text as string;
+        // Desktop reads the text with lua_tostring, so a number echoes as its digits.
+        const textStr = typeof text === 'number' ? String(text) : text as string;
         if (!textStr) return;
         const split = (s: unknown) => s ? String(s).split('\x01').filter(Boolean) : [];
         const cmdsArr = split(cmds);
@@ -119,7 +139,8 @@ export function installOutputBindings({ lua, api }: BindingContext): void {
     // wrapper (Bridge.lua) handles overload disambiguation + table flatten;
     // cinsertPopup/dinsertPopup/hinsertPopup (GUIUtils.lua) route here via xEcho.
     lua.global.set('insertPopup', (win: unknown, text: unknown, cmds: unknown, hints: unknown, fmt?: unknown) => {
-        const textStr = text as string;
+        // Desktop reads the text with lua_tostring, so a number echoes as its digits.
+        const textStr = typeof text === 'number' ? String(text) : text as string;
         if (!textStr) return;
         const split = (s: unknown) => s ? String(s).split('\x01').filter(Boolean) : [];
         const winStr = (win && win !== 'main') ? win as string : undefined;

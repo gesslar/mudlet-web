@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type React from 'react';
+import { accessibleRole, labelActsAsButton } from './LabelManager';
 import type { LabelManager, LabelMouseEvent, LabelState, LabelWheelEvent } from './LabelManager';
 import type { MoviePlayer } from './gifMovie';
 import { cssTextToParts, qtDeclarationsToCss, qtAlignmentToFlex, cssEscape } from './qtCss';
@@ -82,6 +83,19 @@ function buildMouseEvent(e: React.MouseEvent<HTMLDivElement>): LabelMouseEvent {
         ctrl:    e.ctrlKey,
         shift:   e.shiftKey,
         meta:    e.metaKey,
+    };
+}
+
+/** The left click at the label's centre TLabel::press() delivers for a
+ *  keyboard or screen-reader activation. */
+function buildPressEvent(el: HTMLElement): LabelMouseEvent {
+    const rect = el.getBoundingClientRect();
+    const x = Math.round(rect.width / 2);
+    const y = Math.round(rect.height / 2);
+    return {
+        button: 'LeftButton', buttons: ['LeftButton'], x, y,
+        globalX: Math.round(rect.left) + x, globalY: Math.round(rect.top) + y,
+        alt: false, ctrl: false, shift: false, meta: false,
     };
 }
 
@@ -259,6 +273,9 @@ function Label({ l, manager, zIndex }: { l: LabelState; manager: LabelManager; z
     if (l.fontFamily) {
         style.fontFamily = l.fontFamily;
     }
+    if (l.fontSize) {
+        style.fontSize = `${l.fontSize}pt`;
+    }
     if (inlineFromStylesheet) {
         Object.assign(style, inlineFromStylesheet);
     } else if (l.fillBackground) {
@@ -322,28 +339,41 @@ function Label({ l, manager, zIndex }: { l: LabelState; manager: LabelManager; z
     // The second press of a double-click is Qt's mouseDoubleClickEvent rather
     // than a press, so it runs the double-click callback only — see
     // classifyPress. The DOM's own dblclick is therefore not listened to.
+    //
+    // A press or release the label has no callback for isn't swallowed:
+    // TLabel::mousePressEvent / mouseReleaseEvent pass it on to the window
+    // underneath, which raises it as sysWindowMousePressEvent / ReleaseEvent
+    // (LabelManager.onUnhandledMouse → WindowManager.raiseUnhandledMouse). The
+    // label keeps the pointer from press to release either way, like Qt's grab,
+    // so the release it forwards is the one for its own press.
     const dragCapable = !!(l.onMouseMove || l.onMouseUp);
     const hasPress = !!(l.onClick || l.onMouseDown || l.onDoubleClick) || dragCapable;
-    const onPointerDown = hasPress
-        ? (e: React.PointerEvent<HTMLDivElement>) => {
-            // A press on an <a href> belongs to the link, not the label: Qt's
-            // QLabel consumes it and TLabel returns before running the click
-            // callback (TLabel::mousePressEvent). Skipping capture too, so a
-            // drag-capable label doesn't swallow the click that follows.
-            if (labelLinkHref(e.target) !== null) return;
-            if (dragCapable) {
-                try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* not supported */ }
-            }
-            const press = classifyPress(e.detail, e.button, e.timeStamp, lastPress.current);
-            lastPress.current = press;
-            if (press.double) {
-                ref.current.onDoubleClick?.(buildMouseEvent(e));
-                return;
-            }
-            ref.current.onMouseDown?.(buildMouseEvent(e));
-            ref.current.onClick?.(buildMouseEvent(e));
+    const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+        // A press on an <a href> belongs to the link, not the label: Qt's
+        // QLabel consumes it and TLabel returns before running the click
+        // callback (TLabel::mousePressEvent). Skipping capture too, so a
+        // drag-capable label doesn't swallow the click that follows.
+        if (labelLinkHref(e.target) !== null) return;
+        // A move still waiting for its frame happened before this press, and
+        // Qt delivers it first: a pointer moved onto the label and clicked in
+        // the same frame reports move, then click, then release on desktop.
+        flushPendingMove();
+        try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* not supported */ }
+        const press = classifyPress(e.detail, e.button, e.timeStamp, lastPress.current);
+        lastPress.current = press;
+        const cur = ref.current;
+        if (press.double && cur.onDoubleClick) {
+            cur.onDoubleClick(buildMouseEvent(e));
+            return;
         }
-        : undefined;
+        if (!cur.onClick && !cur.onMouseDown) {
+            manager.onUnhandledMouse?.('press', cur.parent, e.nativeEvent);
+            return;
+        }
+        if (press.double) return;
+        cur.onMouseDown?.(buildMouseEvent(e));
+        cur.onClick?.(buildMouseEvent(e));
+    };
 
     const flushMove = () => {
         const st = moveState.current;
@@ -351,6 +381,15 @@ function Label({ l, manager, zIndex }: { l: LabelState; manager: LabelManager; z
         const ev = st.pending;
         st.pending = null;
         if (ev) ref.current.onMouseMove?.(ev);
+    };
+    /** Deliver a frame-pending move now and drop its scheduled frame — a press
+     *  or release must never overtake a move that happened before it. */
+    const flushPendingMove = () => {
+        const st = moveState.current;
+        if (st.raf !== null && typeof cancelAnimationFrame !== 'undefined') {
+            cancelAnimationFrame(st.raf);
+        }
+        flushMove();
     };
     const onPointerMove = l.onMouseMove
         ? (e: React.PointerEvent<HTMLDivElement>) => {
@@ -365,23 +404,20 @@ function Label({ l, manager, zIndex }: { l: LabelState; manager: LabelManager; z
             }
         }
         : undefined;
-    const onPointerUp = l.onMouseUp
-        ? (e: React.PointerEvent<HTMLDivElement>) => {
-            // Release over a link is the link's, matching the same guard in
-            // TLabel::mouseReleaseEvent.
-            if (labelLinkHref(e.target) !== null) return;
-            // Flush any frame-pending move first so the release sees the final
-            // drag position (e.g. the insertion target picked on the last move),
-            // then drop the scheduled frame.
-            const st = moveState.current;
-            if (st.raf !== null && typeof cancelAnimationFrame !== 'undefined') {
-                cancelAnimationFrame(st.raf);
-                st.raf = null;
-            }
-            if (st.pending) { const ev = st.pending; st.pending = null; ref.current.onMouseMove?.(ev); }
-            ref.current.onMouseUp?.(buildMouseEvent(e));
+    const onPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+        // Release over a link is the link's, matching the same guard in
+        // TLabel::mouseReleaseEvent.
+        if (labelLinkHref(e.target) !== null) return;
+        const cur = ref.current;
+        if (!cur.onMouseUp) {
+            manager.onUnhandledMouse?.('release', cur.parent, e.nativeEvent);
+            return;
         }
-        : undefined;
+        // Flush any frame-pending move first so the release sees the final
+        // drag position (e.g. the insertion target picked on the last move).
+        flushPendingMove();
+        cur.onMouseUp(buildMouseEvent(e));
+    };
 
     // Mudlet's TLabel connects QLabel::linkActivated, so an <a href> echoed
     // into a label drives the game: `send:` fires a command, `prompt:` stages
@@ -406,6 +442,36 @@ function Label({ l, manager, zIndex }: { l: LabelState; manager: LabelManager; z
         ? (e: React.MouseEvent<HTMLDivElement>) => e.preventDefault()
         : undefined;
 
+    // Accessibility (TLabel / TLabelModel). A label that acts as a button —
+    // the role a script chose, else whether it has a click or release
+    // callback — is a button to assistive technology; one showing only an
+    // image is a graphic. With the profile's accessibleLabels on, a button
+    // also joins the Tab order and Space or Return presses it, as
+    // TLabel::keyPressEvent does: a left press then a release at its centre,
+    // the release only if the press left the label in place. A held key or
+    // one with a modifier still isn't typing, so it presses nothing.
+    const role = accessibleRole(l);
+    const keyboard = manager.accessibleLabels && labelActsAsButton(l);
+    const onKeyDown = keyboard
+        ? (e: React.KeyboardEvent<HTMLDivElement>) => {
+            if (e.key !== ' ' && e.key !== 'Enter') return;
+            e.preventDefault();
+            e.stopPropagation();
+            if (e.repeat || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+            const cur = ref.current;
+            const ev = buildPressEvent(e.currentTarget);
+            cur.onMouseDown?.(ev);
+            cur.onClick?.(ev);
+            if (manager.get(cur.name) === cur) cur.onMouseUp?.(ev);
+        }
+        : undefined;
+    const ariaRole = role === 'button' ? 'button' : role === 'graphic' || role === 'animation' ? 'img' : undefined;
+    // A generic box can't carry a name, so only a button or a graphic gets one;
+    // a text label is read by what it says, as a screen reader reads a QLabel.
+    const ariaLabel = ariaRole ? (l.accessibleName || (ariaRole === 'img' ? l.tooltip : undefined)) : undefined;
+    // TLabel::announcesTextChanges: only with accessibleLabels on and the label in view.
+    const ariaLive = manager.accessibleLabels && l.visible && l.liveRegion ? l.liveRegion : undefined;
+
     // A movie (setMovie) replaces the html content, like QLabel. The canvas
     // sits left-aligned / vertically centered (QLabel's default pixmap
     // alignment) and is clipped to the label's geometry.
@@ -423,6 +489,11 @@ function Label({ l, manager, zIndex }: { l: LabelState; manager: LabelManager; z
             style={style}
             data-mudlet-label={l.name}
             title={l.tooltip}
+            role={ariaRole}
+            aria-label={ariaLabel || undefined}
+            aria-live={ariaLive}
+            tabIndex={keyboard ? 0 : undefined}
+            onKeyDown={onKeyDown}
             onClick={onClick}
             onContextMenu={onContextMenu}
             onPointerDown={onPointerDown}
@@ -435,11 +506,10 @@ function Label({ l, manager, zIndex }: { l: LabelState; manager: LabelManager; z
             {l.backgroundImage?.svg && <SvgLayer l={l} />}
             {movie
                 ? <MovieCanvas player={movie} />
-                // Qt lays label rich text out in a QTextDocument whose default
-                // documentMargin is 4px, *inside* the QSS padding — every
-                // Mudlet label:echo() renders with that inset. The wrapper
-                // carries it so a stylesheet padding (applied inline on the
-                // outer div) adds to it instead of replacing it.
+                // QLabel zeroes its QTextDocument's root frame margin, so the
+                // wrapper adds no inset: the text sits at the contents rect,
+                // inside the stylesheet padding applied inline on the outer
+                // div — the extent getLabelSizeHint measures (see the CSS).
                 : <div className="label-doc" dangerouslySetInnerHTML={{ __html: l.html }} />}
         </div>
     );

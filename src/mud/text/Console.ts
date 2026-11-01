@@ -2,22 +2,17 @@ import { FormatState } from './FormatState';
 import { AnsiAwareBuffer } from './FormatState';
 import type { FormatStateSnapshot } from './FormatState';
 import { concealDelayedReveals } from './hyperlinkVisibility';
-import { codePointWidth, isPlainAscii, segmentCells } from './wcwidth';
+import { codePointWidth, graphemeEnds, isPlainAscii } from './wcwidth';
+import { lineBreakOpportunities } from './lineBreak';
 
 /** Longest run of characters one echo or insert may add to a line. Mudlet's
  *  `TBuffer::MAX_CHARACTERS_PER_ECHO`. */
 export const MAX_CHARACTERS_PER_ECHO = 1_000_000;
 
 /**
- * Scrollback line limit — Mudlet's per-profile `consoleBufferSize`
- * (`Host::mConsoleBufferSize`, saved to the profile XML by XMLexport.cpp:617).
- *
- * The default is `TBuffer::mLinesLimit` (src/TBuffer.h:386) and the spin box
- * default in `src/ui/profile_preferences.ui` — 10,000 lines — rather than
- * `Host.h:687`'s 100,000. Desktop can afford the larger figure because
- * `TTextEdit` paints only the visible viewport out of the buffer; Mudlet Web keeps a
- * DOM row per line, so 100,000 rows is a cost the browser pays whether or not
- * they are on screen.
+ * Scrollback line limit of a console nothing has sized — `TBuffer::mLinesLimit`
+ * (src/TBuffer.h:386), 10,000 lines with a batch of a tenth of that. Miniconsoles,
+ * user windows and buffers keep it until a script calls setConsoleBufferSize.
  *
  * The floor is `TBuffer::setBufferSize`'s (src/TBuffer.cpp:405) — a smaller
  * buffer is not usable. The ceiling stands in for
@@ -26,6 +21,15 @@ export const MAX_CHARACTERS_PER_ECHO = 1_000_000;
  * cap instead.
  */
 export const DEFAULT_CONSOLE_BUFFER_SIZE = 10_000;
+/**
+ * The main console's scrollback on a fresh profile — Mudlet's per-profile
+ * `consoleBufferSize` (`Host::mConsoleBufferSize`, Host.h, saved to the profile
+ * XML by XMLexport.cpp), which desktop applies to main over TBuffer's own
+ * default. 100,000 lines with a batch of 20,000 (mudlet-web#341): a tenth of it
+ * dropped scrollback, fired sysBufferShrinkEvent and shifted line numbers ten
+ * times as early as desktop.
+ */
+export const MAIN_CONSOLE_BUFFER_SIZE = 100_000;
 export const MIN_CONSOLE_BUFFER_SIZE = 100;
 export const MAX_CONSOLE_BUFFER_SIZE = 1_000_000;
 
@@ -68,7 +72,7 @@ export class Console {
      * about: deleteLine() removing the open line itself, which is what
      * clearWindow() followed by deleteLine() does. That is the only way to a
      * buffer of zero lines, and telling it apart from a one-line buffer is
-     * precisely what getLines()'s out-of-range answer exists for.
+     * precisely what getLines() answering an empty table exists for.
      */
     private hasOpenLine = true;
     private cursorIdx = -1; // -1 = always resolve to last line
@@ -100,8 +104,8 @@ export class Console {
     // Persistent column position on the rendered-history cursor line. Tracked
     // independently of the active trigger lineBuffer (ScriptingAPI owns that).
     // moveUp/moveDown reset to 0 unless keepHorizontal is set; moveCursor/
-    // moveTo set it explicitly. getCursorColumn clamps lazily to the current
-    // line's length, so moves into shorter lines silently snap to end.
+    // moveTo set it explicitly. Like Mudlet's mUserCursor it may sit past the
+    // end of the line; insertText pads out to it.
     private cursorCol = 0;
     private _maxLines = DEFAULT_CONSOLE_BUFFER_SIZE;
     // Mudlet's setConsoleBufferSize takes a "size of batch deletion" — how many
@@ -153,7 +157,29 @@ export class Console {
 
     // ── Output ────────────────────────────────────────────────────────────────
 
+    /** Append `text`, interpreting any ANSI escape sequences in it against the
+     *  current pen — the path for text that came from a server (feedTriggers'
+     *  carried partial) or that Mudlet Web built as ANSI itself (the colour-echo
+     *  fast path). A script's own `echo` goes through {@link echoText}. */
     echo(text: string): void {
+        this.write(text, false);
+    }
+
+    /**
+     * Append `text` verbatim in the current pen. Mudlet's echo family
+     * (`TConsoleModel::print` → `TBuffer::append`) stores every character it is
+     * given, an ESC byte included — only the network path decodes escape
+     * sequences — so `echo("A\27[31mB")` keeps the sequence as text and the pen
+     * colour unchanged.
+     */
+    echoText(text: string, state?: FormatStateSnapshot): void {
+        this.write(text, true, state);
+    }
+
+    /** `state` (literal writes only) replaces the pen for this one write and
+     *  leaves the pen itself untouched — how a link gets Mudlet's standard
+     *  link format without disturbing the format current on the console. */
+    private write(text: string, literal: boolean, state?: FormatStateSnapshot): void {
         if (this.consumeLeadingNewline) {
             this.consumeLeadingNewline = false;
             if (text.startsWith('\n') && this.partial.text.length === 0) {
@@ -161,12 +187,51 @@ export class Console {
                 if (text.length === 0) return;
             }
         }
-        this.partial.appendBuffer(new AnsiAwareBuffer(text, this.format.toSnapshot()));
+        this.reopenLastLine();
+        // A line the wrap left waiting, empty, carries on from a break that
+        // already ate the spaces there, so the ones the echo starts with are
+        // dropped the same way (TBuffer::dropSpaceAtWrap) — up to its first
+        // other character, or the line feed that starts a line of its own.
+        if (this.partial.continuation && this.partial.length === 0 && text.startsWith(' ')) {
+            text = text.replace(/^ +/, '');
+            if (text.length === 0) return;
+        }
+        // The first character on a line stamps it, as TBuffer::append does — an
+        // empty open line may have been waiting since long before.
+        if (this.partial.length === 0) {
+            this.partial.timestamp = Date.now();
+            this.untimedOpenLine = null;
+        }
+        this.partial.appendBuffer(literal
+            ? AnsiAwareBuffer.literal(text, state ?? this.format.toSnapshot())
+            : new AnsiAwareBuffer(text, this.format.toSnapshot()));
         // Anything written gives the buffer a current line back — see hasOpenLine.
         this.hasOpenLine = true;
 
-        if (!this.partial.text.includes('\n')) return;
-        this.promotePartialLines();
+        if (this.partial.text.includes('\n')) this.promotePartialLines();
+        this.wrapPartial();
+    }
+
+    /**
+     * Wrap the line still being built the moment it outgrows the wrap width,
+     * not when its newline arrives. Mudlet's TBuffer::append runs wrapLine() on
+     * the last line after every echo, so a long `echo` without a trailing
+     * newline is already several buffer lines: getLineCount, the cursor moves
+     * and getCurrentLine see them straight away, and the next echo carries on
+     * from the last piece. Every piece but the last is finished and goes to
+     * history; the last stays open as the new partial, marked as a
+     * continuation so its later wrap takes the hanging indent.
+     */
+    private wrapPartial(): void {
+        if (this.wrapWidth <= 0 || this.partial.length === 0) return;
+        const lines = wrapBuffer(this.partial, this.wrapWidth, this.wrapIndent, this.wrapHangingIndent);
+        if (!lines) return;
+        for (let i = 0; i < lines.length - 1; i++) {
+            this.store(lines[i]);
+            this.pending.push(lines[i]);
+        }
+        this.partial = lines[lines.length - 1];
+        this.evict();
     }
 
     /**
@@ -179,6 +244,12 @@ export class Console {
         const splits = this.partial.splitLines();
         const endsWithNewline = this.partial.text.endsWith('\n');
         const completeCount = endsWithNewline ? splits.length : splits.length - 1;
+        // The open line may itself be the tail of a line wrapPartial() already
+        // broke; whatever it becomes is still a continuation of that line.
+        if (this.partial.continuation) {
+            splits[0].continuation = true;
+            splits[0].timestamp = this.partial.timestamp;
+        }
 
         for (let i = 0; i < completeCount; i++) {
             for (const line of this.toStoredLines(splits[i])) {
@@ -210,28 +281,43 @@ export class Console {
             ? this.cursorIdx : this.history.length - 1;
         this.store(buffer);
         if (moveCursor || pinned < 0) {
+            // Trimmed first, so the cursor lands on the new line's index as it
+            // is AFTER the head of the buffer went: set before, it pointed past
+            // the end, where a trigger pass reads no line at all.
+            this.evict();
             this.cursorIdx = this.history.length - 1;
             this.cursorCol = 0;
-        } else {
-            this.cursorIdx = pinned;
+            return;
         }
+        this.cursorIdx = pinned;
         this.evict();
     }
 
     /**
-     * Append a pre-formatted buffer as a new complete line — mirrors Mudlet's
-     * TConsole::appendBuffer, the primitive behind the `appendBuffer`/`paste`
+     * Write a pre-formatted buffer onto the end of the last line and end that
+     * line — mirrors Mudlet's TConsole::appendBuffer, the primitive behind the `appendBuffer`/`paste`
      * clipboard functions. Unlike `appendLine` (network pipeline) this also
      * enqueues into `pending` so the line reaches the renderer through the
      * normal drain path; the cursor resets to the end so a following
      * `selectCurrentLine` sees the pasted line.
      */
     appendBuffer(buffer: AnsiAwareBuffer): void {
+        // TBuffer::appendBuffer goes through appendFormatted(), which writes the
+        // chunk onto the END of the last line — the open one, still holding
+        // whatever an echo without a newline left there — and only then ends
+        // that line. Storing the chunk as a line of its own put it ABOVE that
+        // unfinished text instead of after it.
+        this.reopenLastLine();
+        const joined = this.partial;
+        joined.appendBuffer(buffer);
+        this.partial = new AnsiAwareBuffer();
+        this.consumeLeadingNewline = false;
+        this.hasOpenLine = true;
         // Wrapped as it is stored, exactly as an echo of the same text would be
         // — Mudlet's appendFormatted() ends in the same wrapLine() call, so a
         // line that arrives through the clipboard has to lay out like one typed
         // into the window.
-        for (const line of this.toStoredLines(buffer)) {
+        for (const line of this.toStoredLines(joined)) {
             this.store(line);
             this.pending.push(line);
         }
@@ -256,37 +342,60 @@ export class Console {
         this.hasOpenLine = true;
     }
 
+    /**
+     * Give the buffer its open line back after deleteLine() removed it while
+     * complete lines remained. Mudlet has no separate open line: its last line
+     * is simply whatever lineBuffer ends with, so once the old last line is
+     * deleted the one above it is the line the next write lands on — an echo
+     * continues it rather than starting a fresh one. Here that line moves back
+     * out of history into `partial`; its row leaves the DOM so the partial
+     * render can show it in its place.
+     */
+    private reopenLastLine(): void {
+        if (this.hasOpenLine || this.history.length === 0) return;
+        const last = this.history.pop()!;
+        last.removeFromDom();
+        this.partial = last;
+        this.hasOpenLine = true;
+    }
+
     private evict(): void {
-        // Counted over the COMPLETE lines only. Mudlet bounds lineBuffer.size(),
-        // which includes the line being built, so its capacity is one lower than
-        // this — an off-by-one nothing observes: the open line is not scrollback,
-        // no spec pins the figure, and moving it would change what every console
-        // holds to nobody's benefit.
-        if (this.history.length <= this._maxLines) return;
+        // Counted as Mudlet counts it: TBuffer trims once buffer.size(), which
+        // includes the line being built, goes over mLinesLimit — so a console
+        // holds one complete line fewer than its limit, and the trim comes the
+        // moment the complete lines reach it, not one line later.
+        if (this.lineTotal <= this._maxLines) return;
         // Mudlet trims a BATCH at a time (TBuffer::shrinkBuffer): once the
         // buffer is over its limit it drops `batchDeleteSize` lines in one go,
         // and sysBufferShrinkEvent carries that count so a script can correct a
         // saved line index by exactly the amount every surviving index moved.
         // Evicting one line per appended line instead announced a stream of 1s
         // and left the buffer pinned to the limit.
-        let removed = 0;
-        while (this.history.length > this._maxLines) {
-            // Never more than the limit itself. Mudlet keeps `batch < limit` as
-            // an invariant of the one call that sets both
-            // (`TBuffer::setBufferSize`, TBuffer.cpp:407-409: a batch at or over
-            // the limit is knocked down to limit/10), so its shrinkBuffer can
-            // pop a flat batch without checking. Here the two can be set
-            // separately — by a script, by the profile preference, or by the
-            // defaults — so the invariant is enforced at the point of use
-            // instead. Without it a batch larger than the limit empties the
-            // buffer outright rather than trimming it: raising the default batch
-            // to 1,000 alongside the 10,000-line default meant any console
-            // dropped to a smaller limit lost everything on its next write.
-            const batch = Math.min(
-                Math.max(1, this._batchDeleteSize), this._maxLines, this.history.length);
-            for (let i = 0; i < batch; i++) this.history.shift()!.removeFromDom();
-            removed += batch;
-        }
+        //
+        // The whole trim is worked out up front and taken with one splice: a
+        // shift() per line was O(history) each, so a 20,000-line trim of a
+        // 100,000-line scrollback spent seconds moving the array (#443).
+        //
+        // A batch at or over the limit trims only the overflow. Mudlet keeps
+        // `batch < limit` as an invariant of the one call that sets both
+        // (`TBuffer::setBufferSize`, TBuffer.cpp:407-409: a batch at or over
+        // the limit is knocked down to limit/10), so its shrinkBuffer can
+        // pop a flat batch without checking. Here the two can be set
+        // separately — by a script, by the profile preference, or by the
+        // defaults — so the invariant is enforced at the point of use
+        // instead. Without it a batch larger than the limit empties the
+        // buffer outright rather than trimming it: raising the default batch
+        // to 1,000 alongside the 10,000-line default meant any console
+        // dropped to a smaller limit lost everything on its next write.
+        // A batch under the limit is dropped whole, as many times as it takes
+        // to get back under — the same count the old loop of flat batches
+        // reached.
+        const wanted = Math.max(1, this._batchDeleteSize);
+        const overflow = this.lineTotal - this._maxLines;
+        const removed = Math.min(
+            wanted >= this._maxLines ? overflow : Math.ceil(overflow / wanted) * wanted,
+            this.history.length);
+        if (removed > 0) AnsiAwareBuffer.removeAllFromDom(this.history.splice(0, removed));
         // The user cursor keeps the index it was given rather than following the
         // line it was parked on — the known limitation sysBufferShrinkEvent
         // exists to work around, and what Mudlet does.
@@ -301,6 +410,13 @@ export class Console {
     }
 
     get currentPartial(): AnsiAwareBuffer { return this.partial; }
+
+    /** The last finished line — the one before the line being built, which is
+     *  where TBuffer's `buffer.size() - 2` points — or undefined when there is
+     *  none yet. */
+    get lastFinishedLine(): AnsiAwareBuffer | undefined {
+        return this.history[this.history.length - 1];
+    }
 
     /**
      * Promote the in-flight partial (an echo without a trailing newline, e.g.
@@ -323,10 +439,30 @@ export class Console {
         return buf;
     }
 
+    /**
+     * `TConsole::printCommand` outside the trigger engine: when the last line
+     * is still flagged as a prompt (and nothing has been echoed after it), the
+     * command is written onto the end of that line instead of onto a line of
+     * its own, and the line stops being a prompt — so only the first command
+     * after a prompt joins it. Returns the line it was added to, or null when
+     * there is no such prompt line and the caller appends as usual.
+     */
+    appendToPromptLine(buffer: AnsiAwareBuffer): AnsiAwareBuffer | null {
+        if (this.partial.length > 0 || !this.hasOpenLine) return null;
+        const last = this.history[this.history.length - 1];
+        if (!last || !last.isPrompt || last.deleted) return null;
+        last.appendBuffer(buffer);
+        last.isPrompt = false;
+        return last;
+    }
+
     clear(): void {
         this.history = [];
         this.pending = [];
         this.partial = new AnsiAwareBuffer();
+        // The main console's cursor goes back to following the output, and
+        // every other console's user cursor onto the one line left —
+        // TConsole::clear puts mUserCursor at its start.
         this.resetCursor();
         this.consumeLeadingNewline = false;
         // Mudlet's clearWindow() leaves exactly ONE empty line, not none — the
@@ -378,7 +514,22 @@ export class Console {
      * it made `prefix()`/`suffix()` on an unfinished line silent no-ops.
      */
     private get onPartialLine(): boolean {
-        return this.followingEnd && this.partial.length > 0;
+        return this.followingEnd && (this.partial.length > 0 || this.onEmptyOpenLine);
+    }
+
+    /**
+     * Whether a script parked the cursor on the open line while it is still
+     * empty — moveCursorEnd(), or moveCursor() onto the line after a trailing
+     * `\n`. Desktop's cursor is on that empty line then: getCurrentLine() reads
+     * '' and insertText() starts the new line. Treating the slot as "the last
+     * complete line" glued the inserted text onto the line above
+     * (mudlet-web#331). Only an explicit index counts — the main console's
+     * following-the-end cursor (-1) still reads the last complete line — and
+     * not mid trigger pass, where there is no open line (see currentBuffer).
+     */
+    private get onEmptyOpenLine(): boolean {
+        return this.cursorIdx === this.history.length && this.history.length > 0
+            && this.hasOpenLine && !this.openLineSuspended;
     }
 
     getLine(): string {
@@ -391,9 +542,61 @@ export class Console {
     /** The buffer the cursor is on: the partial when it is following the end,
      *  otherwise the history line it was parked on. */
     private currentBuffer(): AnsiAwareBuffer | null {
+        // Mid trigger pass the matched line is the LAST line — Mudlet runs the
+        // triggers before its terminator opens the next one — so a cursor at or
+        // past the end of history is on no line at all: where deleteLine() on
+        // the matched line leaves it. Reading the line above instead made every
+        // later trigger on that line select, replace and recolour the PREVIOUS
+        // line (mudlet-web#273).
+        if (this.openLineSuspended && this.cursorIdx >= this.history.length) return null;
         if (this.onPartialLine) return this.partial;
         return this.history[this.cursor] ?? null;
     }
+
+    /** Line `index` in Mudlet's numbering (the open line last), or null when
+     *  the index names no line. */
+    lineBuffer(index: number): AnsiAwareBuffer | null {
+        if (index < 0 || index >= this.lineTotal) return null;
+        return index < this.history.length ? this.history[index] : this.partial;
+    }
+
+    /** The Lua code of every scripted link or popup this console's lines hold. */
+    linkCommands(): string[] {
+        const commands: string[] = [];
+        for (const line of [...this.history, this.partial]) {
+            for (const segment of line.getSegments()) {
+                const lua = segment.state?.hyperlink?.luaCommands;
+                if (lua) commands.push(...lua);
+            }
+        }
+        return commands;
+    }
+
+    /** Whether `buf` is still one of this console's lines — the open one or a
+     *  complete one — rather than one a clear, a deletion or the scrollback
+     *  limit has taken away. */
+    holdsLine(buf: AnsiAwareBuffer): boolean {
+        return buf === this.partial || this.history[this.cursor] === buf || this.history.includes(buf);
+    }
+
+    /** The last complete line, whatever the cursor is on — where Mudlet's
+     *  trigger-mode echo writes (`TConsoleModel::echo` inserts at the end of
+     *  line `size() - 1`), which after deleteLine() is the line above. */
+    lastLine(): AnsiAwareBuffer | null {
+        return this.history[this.history.length - 1] ?? null;
+    }
+
+    /**
+     * Whether the buffer is between a trigger pass's beginLine and endLine,
+     * when it has no open line past the matched one. Set by ScriptingAPI on
+     * the main console only. See {@link currentBuffer}.
+     */
+    private openLineSuspended = false;
+    suspendOpenLine(on: boolean): void { this.openLineSuspended = on; }
+
+    /** The text of line `index` in Mudlet's numbering (the open line last), or
+     *  null when there is no such line. */
+    lineText(index: number): string | null { return this.lineAt(index); }
 
     /** Per-line prompt flag on the current cursor line. Mirrors Mudlet's TBuffer
      *  behaviour: `isPrompt()` follows the cursor, so moveCursor + isPrompt can
@@ -409,14 +612,33 @@ export class Console {
     cursorPastEnd(): boolean { return this.cursorIdx >= this.history.length; }
 
     deleteLine(): void {
+        // Mid trigger pass a cursor past the end is on no line at all: the
+        // matched line was the last one and an earlier deleteLine() removed it.
+        // TBuffer::deleteLines refuses a y past the end, so a second gag of the
+        // same line is a no-op on desktop. Clamping onto the line above deleted
+        // a line nobody matched, one more per extra call (mudlet-web#383).
+        // A trigger that cleared the window first is the exception: that left
+        // the one empty line clearWindow() keeps, which is a line to delete.
+        if (this.openLineSuspended && this.history.length > 0
+            && this.cursorIdx >= this.history.length) return;
         const idx = this.cursor;
         const buf = this.history[idx];
-        if (!buf) {
+        // A cursor a script put on the open line — the last one, still being
+        // built — deletes that line, not the complete one above it, which is
+        // where the clamping `cursor` getter would otherwise land. TBuffer's
+        // deleteLine(y) takes the cursor's line as it is. Only for consoles
+        // whose cursor stays where a script put it: main's follows its output,
+        // and mid trigger pass has no open line in Mudlet's sense at all.
+        const onOpenLine = !this.followsOutput && this.cursorIdx >= this.history.length;
+        if (!buf || onOpenLine) {
+            if (onOpenLine && this.cursorIdx > this.history.length) return;
             // No complete line under the cursor, so the line being deleted is
             // the open one — the case clearWindow() then deleteLine() reaches,
             // and the only way to a buffer holding nothing at all. Mudlet drops
             // it from lineBuffer and is left with zero lines; here that is the
-            // flag going down and the half-written text going with it.
+            // flag going down and the half-written text going with it. With
+            // complete lines left, the last of them is Mudlet's last line now,
+            // and the next write reopens it (see reopenLastLine).
             // Tested on hasOpenLine alone rather than on the cursor index: with
             // no complete lines the `cursor` getter clamps to -1 whatever the
             // user cursor was set to, so there is nothing else left for
@@ -429,6 +651,10 @@ export class Console {
             return;
         }
         buf.removeFromDom();
+        // Flagged as well as removed: the file log holds the newest line back
+        // until the next one arrives, and drops it if it was deleted meanwhile
+        // (TBuffer::deleteLines) — the "gag the previous line" trigger.
+        buf.markAsDeleted();
         this.history.splice(idx, 1);
         // Keep the cursor at the same row index (Mudlet: deleteLine leaves the
         // cursor on the line that shifts up into the slot). When the deleted line
@@ -447,16 +673,20 @@ export class Console {
      * current line into multiple history lines (Mudlet issue #8945): the text up
      * to the first `\n` is inserted at the cursor column, each subsequent `\n`
      * starts a new line, and the remainder of the original line trails the last
-     * inserted segment. For a single-line insert the cursor stays at the
-     * insertion point (Mudlet's `insertText` does not advance `mUserCursor` — the
+     * inserted segment. The cursor stays at the insertion point, newline or not
+     * (Mudlet's `insertText` never moves `mUserCursor` — the
      * bundled GUIUtils `xEcho`/`cinsertText` loop advances it explicitly with its
      * own `moveCursor` after each segment; advancing here too would double-count
      * and push later color segments past their intended column). Returns false
      * when there's no current line to insert into (caller falls back to an echo).
      * Mid-buffer multi-line inserts update the buffer model fully; the
      * incremental renderer redraws the affected line(s) lazily.
+     *
+     * `split` false keeps every `\n` in the line as a character, the way a
+     * trigger's insertText does on desktop (TConsoleModel::insertText in
+     * trigger mode only inserts); a later wrapLine() splits it there.
      */
-    insertText(text: string, state?: FormatStateSnapshot): boolean {
+    insertText(text: string, state?: FormatStateSnapshot, split = true): boolean {
         const idx = this.cursor;
         const onPartial = this.onPartialLine;
         const cur = this.currentBuffer();
@@ -466,9 +696,16 @@ export class Console {
         // would otherwise spend unbounded memory and layout time on a single
         // line nobody can read anyway.
         if (text.length > MAX_CHARACTERS_PER_ECHO) text = text.slice(0, MAX_CHARACTERS_PER_ECHO);
-        const col = Math.max(0, Math.min(this.getCursorColumn(), cur.length));
-        cur.insert(col, text, state);
-        if (!text.includes('\n')) {
+        // A column past the end of the line pads the gap with spaces so the text
+        // lands at that column, as TBuffer::insertInLine expands the line first.
+        const col = this.getCursorColumn();
+        if (col > cur.length) {
+            text = ' '.repeat(col - cur.length) + text;
+            cur.insert(cur.length, text, state);
+        } else {
+            cur.insert(col, text, state);
+        }
+        if (!split || !text.includes('\n')) {
             this.cursorCol = col;
             return true;
         }
@@ -483,11 +720,16 @@ export class Console {
         // The current line now carries embedded newlines — split it into separate
         // history entries so getLineCount/getCurrentLine reflect the new lines.
         const lines = cur.splitLines();
+        // The part before the newline keeps the indent a wrap gave the line;
+        // the line the newline starts has none yet (TBuffer::wrapLine).
+        if (lines.length > 0) lines[0].wrapIndent = cur.wrapIndent;
         cur.removeFromDom();
         this.history.splice(idx, 1, ...lines);
-        const segs = text.split('\n');
-        this.cursorIdx = Math.min(idx + segs.length - 1, this.history.length - 1);
-        this.cursorCol = segs[segs.length - 1].length;
+        // The cursor stays where the text went in: the first of the new lines,
+        // at the insertion column, so a following insertText or getCurrentLine
+        // acts on that line, as on desktop.
+        this.cursorIdx = idx;
+        this.cursorCol = col;
         this.evict();
         return true;
     }
@@ -495,8 +737,7 @@ export class Console {
     /**
      * Move the cursor up `lines` rows. When `keepHorizontal` is false (the
      * default, matching Mudlet) the column resets to 0; when true the column
-     * is preserved across the move and lazily clamps to the destination
-     * line's length on read via `getCursorColumn`.
+     * is preserved across the move, even past the end of a shorter line.
      */
     moveUp(lines: number = 1, keepHorizontal: boolean = false): boolean {
         const idx = this.cursor;
@@ -515,6 +756,12 @@ export class Console {
         this.cursorIdx = target;
         if (!keepHorizontal) this.cursorCol = 0;
         return target !== idx;
+    }
+
+    /** The line number `buffer` is stored at, or -1 when it is not in the
+     *  buffer (any more). */
+    lineIndexOf(buffer: AnsiAwareBuffer): number {
+        return this.history.lastIndexOf(buffer);
     }
 
     /**
@@ -554,17 +801,14 @@ export class Console {
     }
 
     /**
-     * Mudlet's `mUserCursor.x()` — the column on the cursor line. Lazily
-     * clamped to the current line's length so a stale `cursorCol` from a
-     * `keepHorizontal` move never reports past the end of a shorter line.
+     * Mudlet's `mUserCursor.x()` — the column on the cursor line. Not clamped
+     * to the line's length: TBuffer::moveCursor accepts any column, and each
+     * operation that writes through it decides what past the end means
+     * (insertText pads out to it). Never reports below 0.
      */
     getCursorColumn(): number {
-        const col = Math.max(0, this.cursorCol);
-        if (this.onPartialLine) return Math.min(col, this.partial.text.length);
-        const idx = this.cursor;
-        if (idx < 0) return 0;
-        const lineLen = this.history[idx]?.text.length ?? 0;
-        return Math.min(col, lineLen);
+        if (!this.onPartialLine && this.cursor < 0) return 0;
+        return Math.max(0, this.cursorCol);
     }
 
     /**
@@ -602,7 +846,11 @@ export class Console {
         // that line yet still has Mudlet's "no current line" sentinel.
         // A console whose cursor was never moved sits on line 0 even before
         // anything is written into it — Mudlet's fresh miniconsole says 0.
-        if (len === 0) return this.partial.length > 0 || (!this.followsOutput && this.hasOpenLine) ? 0 : -1;
+        // That is wherever the user cursor was left.
+        if (len === 0) {
+            if (!this.followsOutput && this.hasOpenLine) return Math.max(0, this.cursorIdx);
+            return this.partial.length > 0 ? 0 : -1;
+        }
         if (this.onPartialLine) return len;
         // Following-end (cursorIdx < 0, after output/echo) reports as the last
         // line. An in-range or past-end cursorIdx is reported verbatim: after
@@ -631,6 +879,27 @@ export class Console {
     // well made every Lua-facing count one too high.
     getLineCount(): number  { return this.history.length - 1; }
 
+    /** Whether the cursor is somewhere text can be put: on a line the buffer
+     *  holds, at a column that is not negative. A column past the end of the
+     *  line counts — a write there pads up to it. Not after deleteLine() has
+     *  taken the line the cursor was on and left it past the last one, nor mid
+     *  trigger pass once the matched line is gone. */
+    cursorInText(): boolean {
+        if (this.cursorCol < 0) return false;
+        // With no line at all (deleteLine() emptied the buffer) there is no line
+        // to be outside of: desktop's insertLink falls through to appending,
+        // as insertText does.
+        if (this.lineTotal === 0) return true;
+        if (this.openLineSuspended && this.cursorIdx >= this.history.length) return false;
+        const line = this.getLineNumber();
+        return line >= 0 && line < this.lineTotal;
+    }
+
+    /** Mudlet's TBuffer::getLastLineNumber() — the index of the last line, the
+     *  open one included, and 0 for a buffer with no lines at all. Differs from
+     *  getLineCount() + 1 only once deleteLine() has removed the open line. */
+    lastLineNumber(): number { return Math.max(0, this.lineTotal - 1); }
+
     /**
      * Mudlet `moveCursorEnd` — park the cursor on the empty line past the last
      * complete one, which is where Mudlet's buffer always keeps its "current"
@@ -644,24 +913,44 @@ export class Console {
     }
 
     /**
-     * Mudlet `getLines(from, to)` — the lines starting at the 0-based index
-     * `from`, `abs(to - from)` of them (TConsole::getLines). `to` is exclusive
-     * and neither bound is clamped: the result always holds exactly
-     * `abs(to - from)` entries, and an index outside the buffer contributes
-     * {@link BAD_LINE_ERROR} rather than being dropped.
+     * Mudlet `getLines(from, to)` — the lines from the 0-based index `from`
+     * up to, not including, `to`; a reversed range reads downward from `from`
+     * (or the last line, when `from` is past it) to just above `to`.
+     * Only lines the buffer actually holds are returned: an index before line
+     * 0 or past the last line is dropped rather than padded, so the result can
+     * be shorter than asked for, and empty — `getLines(-2, 3)` reads lines 0
+     * to 2, not 0 to 4.
      *
-     * That sentinel is the only way a script can tell an empty buffer from a
+     * An empty table is the only way a script can tell an empty buffer from a
      * one-line one, because getLineCount() answers 0 for both — it reports the
-     * last line's index. Mudlet's TBuffer::line() is the shape being matched:
-     * it answers every out-of-range index with the same string rather than
-     * failing.
+     * last line's index.
      */
     getLines(from: number, to: number): string[] {
-        const start = Math.trunc(from);
-        const count = Math.abs(Math.trunc(to) - start);
+        const first = Math.trunc(from);
+        const last = Math.trunc(to);
         const lines: string[] = [];
-        for (let i = 0; i < count; i++) {
-            lines.push(this.lineAt(start + i) ?? BAD_LINE_ERROR);
+        if (last < first) {
+            // A reversed range reads downward from its first line (or the last
+            // line there is), stopping before `to` — TBuffer::getLines.
+            for (let i = Math.min(first, this.lineTotal - 1); i > last && i >= 0; i--) {
+                lines.push(this.lineAt(i) ?? '');
+            }
+            return lines;
+        }
+        const end = Math.min(last, this.lineTotal);
+        for (let i = Math.max(first, 0); i < end; i++) {
+            lines.push(this.lineAt(i) ?? '');
+        }
+        return lines;
+    }
+
+    /** TBuffer::getEndLines(n) — the text of the last `n` lines, oldest first,
+     *  the open line included. Fewer when the buffer holds fewer. */
+    getEndLines(n: number): string[] {
+        const total = this.lineTotal;
+        const lines: string[] = [];
+        for (let i = Math.max(0, total - Math.max(0, Math.trunc(n))); i < total; i++) {
+            lines.push(this.lineAt(i) ?? '');
         }
         return lines;
     }
@@ -671,48 +960,26 @@ export class Console {
      * line entered the buffer, or {@link BLANK_TIMESTAMP} for a line wrapping
      * continued from the one above. `lineNumber` indexes the buffer as
      * getLineNumber() does, from 0 — Mudlet reads `timeBuffer.at(lineNumber)`
-     * but refuses 0 — and the open line after the last complete one counts,
+     * — and the open line after the last complete one counts,
      * having a time of its own. Omit it to read the current cursor line.
      * Returns null when the line is out of range or the buffer is empty.
      * Formatting into Mudlet's "hh:mm:ss.zzz" string happens one layer up, in
      * ScriptingAPI.
      */
-    getLineTimestamp(lineNumber?: number): number | typeof BLANK_TIMESTAMP | null {
+    getLineTimestamp(lineNumber?: number): number | typeof BLANK_TIMESTAMP | '' | null {
         let line: AnsiAwareBuffer | undefined;
         if (lineNumber === undefined) {
             line = this.history[this.cursor];
         } else {
             const idx = Math.trunc(lineNumber);
-            if (!(idx >= 1)) return null;
+            if (!(idx >= 0)) return null;
             line = idx === this.history.length && this.hasOpenLine ? this.partial : this.history[idx];
         }
         if (!line) return null;
+        if (line === this.untimedOpenLine && line.length === 0) return '';
         return line.continuation ? BLANK_TIMESTAMP : line.timestamp;
     }
 
-    /**
-     * Mudlet `wrapLine(lineNumber)` — re-display the line at `lineNumber`
-     * (0-indexed, matching getLineNumber/getLineCount), re-interpreting its
-     * embedded `\n` characters and re-wrapping to the current width. Mudlet Web
-     * renders each line buffer with CSS `white-space: pre-wrap`, and the
-     * rendered DOM node holds the very same buffer object as history (set via
-     * `notifyRender`), so re-rendering that buffer in place is what makes any
-     * `\n` show as line breaks — the documented use case after a `deleteLine()`
-     * + `echo()` sequence left un-displayed newlines in the buffer. Returns
-     * false when `lineNumber` is out of range.
-     */
-    /**
-     * Mudlet `wrapLine(lineNumber)` — re-wrap one stored line to the console's
-     * current wrap width, replacing it with as many buffer lines as it now
-     * needs. That is a real buffer edit in Mudlet (TBuffer::wrapLine splits the
-     * line in place), not a repaint: getLineCount and getLines see the split
-     * afterwards.
-     *
-     * `wrapAt` of 0 (wrapping disabled) leaves the line alone and just
-     * repaints. `indent` prefixes the first resulting line and `hangingIndent`
-     * every continuation, matching setWindowWrapIndent /
-     * setWindowWrapHangingIndent.
-     */
     /**
      * The wrap this console applies to a line as it is stored — the console's
      * own `setWindowWrap` width, so a line longer than it becomes several
@@ -743,6 +1010,11 @@ export class Console {
         return this.wrapHangingIndent;
     }
 
+    /** The open line, while it is the untimed one desktop starts after a game
+     *  line — see {@link wrapAppendedLine}. Anything else in `partial` (a new
+     *  buffer, or this one once written to) is timed as usual. */
+    private untimedOpenLine: AnsiAwareBuffer | null = null;
+
     private wrapWidth = 0;
     private wrapIndent = 0;
     private wrapHangingIndent = 0;
@@ -764,32 +1036,83 @@ export class Console {
      * see the whole line as the server sent it, and only then does wrapLine() cut
      * it into the buffer lines getLines() and the cursor APIs count.
      */
-    wrapAppendedLine(buffer: AnsiAwareBuffer): AnsiAwareBuffer[] {
-        if (this.wrapWidth <= 0) return [buffer];
+    wrapAppendedLine(buffer: AnsiAwareBuffer, fromGame = false): AnsiAwareBuffer[] {
         const idx = this.history.lastIndexOf(buffer);
         if (idx < 0) return [buffer];
+        // The line desktop opens after a game line is pushed with no timestamp
+        // at all (translateToPlainText), so getTimestamp() on it answers "" until
+        // something is written there. Only the empty piece a wrap leaves behind
+        // (below) is a line appendEmptyLine() made, with a time of its own.
+        if (fromGame && idx === this.history.length - 1 && this.partial.length === 0) {
+            this.untimedOpenLine = this.partial;
+        }
+        if (this.wrapWidth <= 0) return [buffer];
         const lines = wrapBuffer(buffer, this.wrapWidth, this.wrapIndent, this.wrapHangingIndent);
         if (!lines) return [buffer];
+        // A line whose break fell in its trailing spaces — or at width 1, after
+        // its last wide character — ends in an empty piece. Desktop's commit
+        // keeps that piece as the new current line instead of adding another
+        // after it (translateToPlainText only appends one when the last line
+        // has text), so it is the open line here too, not a stored "" line. A
+        // line with others already after it keeps the piece, as desktop does.
+        if (idx === this.history.length - 1 && lines.length > 1 && lines[lines.length - 1].length === 0) {
+            lines.pop();
+            this.untimedOpenLine = null;
+        }
         this.history.splice(idx, 1, ...lines);
         if (this.cursorIdx > idx) this.cursorIdx += lines.length - 1;
         this.evict();
         return lines;
     }
 
-    wrapLine(lineNumber: number, wrapAt = 0, indent = 0, hangingIndent = 0): boolean {
+    /**
+     * Mudlet `wrapLine(lineNumber)` — re-wrap the buffer from `lineNumber`
+     * (0-indexed, matching getLineNumber/getLineCount) to its end at `wrapAt`,
+     * replacing each line with as many buffer lines as it now needs, as
+     * TBuffer::wrapLine does: a real buffer edit that getLineCount and getLines
+     * see, not a repaint. Embedded `\n` become line breaks too. `wrapAt` of 0
+     * (wrapping off) only repaints the line, so pre-wrap rendering shows its
+     * `\n`. Returns false when `lineNumber` names no stored line.
+     */
+    wrapLine(lineNumber: number, wrapAt = 0, indent = 0, hangingIndent = 0, stopAt = Infinity): boolean {
         if (!Number.isFinite(lineNumber)) return false;
         const idx = Math.trunc(lineNumber);
-        const buf = this.history[idx];
-        if (!buf) return false;
+        if (idx < 0 || idx >= this.history.length) return false;
         const width = Math.trunc(wrapAt);
-        if (!(width > 0)) { buf.rerender(); return true; }
+        if (!(width > 0)) { this.history[idx].rerender(); return true; }
 
-        const lines = wrapBuffer(buf, width, indent, hangingIndent);
-        if (!lines) { buf.rerender(); return true; }
-        buf.removeFromDom();
-        this.history.splice(idx, 1, ...lines);
-        // The cursor tracked a line index that may have moved down.
-        if (this.cursorIdx > idx) this.cursorIdx += lines.length - 1;
+        // TBuffer::wrapLine re-wraps from the line it is given to the end of the
+        // buffer, not that line alone: every later line that has outgrown the
+        // width — one echoed while wrapping was off, say — is split as well.
+        // Up to `stopAt` (exclusive) when given: a line a trigger pass is still
+        // running on is left whole, with everything after it, and is wrapped
+        // when its pass ends.
+        let end = Math.min(this.history.length, stopAt);
+        for (let i = idx; i < end; i++) {
+            const buf = this.history[i];
+            const lines = wrapBuffer(buf, width, indent, hangingIndent);
+            if (!lines) { if (i === idx) buf.rerender(); continue; }
+            buf.removeFromDom();
+            this.history.splice(i, 1, ...lines);
+            // The cursor tracked a line index that may have moved down.
+            if (this.cursorIdx > i) this.cursorIdx += lines.length - 1;
+            i += lines.length - 1;
+            end += lines.length - 1;
+        }
+        // The line still being built is the buffer's last line on desktop, so it
+        // is in the range too; what it is split into above its last piece is
+        // finished.
+        if (stopAt === Infinity && this.hasOpenLine && this.partial.length > 0) {
+            const lines = wrapBuffer(this.partial, width, indent, hangingIndent);
+            if (lines) {
+                for (let i = 0; i < lines.length - 1; i++) {
+                    this.store(lines[i]);
+                    this.pending.push(lines[i]);
+                }
+                this.partial = lines[lines.length - 1];
+            }
+        }
+        this.evict();
         return true;
     }
 }
@@ -800,33 +1123,52 @@ export class Console {
 export const WINDOW_WRAP_DEFAULT = 99999999;
 
 /** What getTimestamp() answers for a continued line — Mudlet's
- *  `smBlankTimeStamp`, cut to the width of the times this client formats. */
-export const BLANK_TIMESTAMP = '------------';
+ *  `smBlankTimeStamp`, trailing space included, the same 13 characters as a
+ *  real stamp ("hh:mm:ss.zzz "). */
+export const BLANK_TIMESTAMP = '------------ ';
 
 /**
  * Split `buf` into the lines a console of `width` columns stores it as, or
  * null when it needs no splitting. Mudlet's TBuffer::wrapLine: an indent as
  * wide as the window is dropped rather than wrapping the text into single
- * characters, the first line takes `indent` and the continuations
+ * characters, one wider than half the window is held to half, the first line takes `indent` and the continuations
  * `hangingIndent` (a line that is itself a continuation takes the latter
  * throughout), and every continuation is marked as one.
  */
 function wrapBuffer(buf: AnsiAwareBuffer, width: number, indent: number, hangingIndent: number): AnsiAwareBuffer[] | null {
-    const firstIndent = indent > 0 && indent < width ? Math.trunc(indent) : 0;
-    const hang = hangingIndent > 0 && hangingIndent < width ? Math.trunc(hangingIndent) : 0;
-    const pieces = wrapInfo(buf.text, !buf.continuation, width, firstIndent, hang);
+    // Each wrapped line pads indent columns per (width - indent) of text, so an
+    // indent is held to half the width: near the width a long line would become
+    // one padded line per character
+    const half = Math.trunc(width / 2);
+    const firstIndent = indent > 0 && indent < width ? Math.min(Math.trunc(indent), half) : 0;
+    const hang = hangingIndent > 0 && hangingIndent < width ? Math.min(Math.trunc(hangingIndent), half) : 0;
+    // A line an earlier wrap already indented keeps that indent rather than
+    // being given another: desktop knows it from the gap the wrap recorded,
+    // checked against the spaces still being there in case an edit took them.
+    const startsIndented = !buf.continuation && firstIndent > 0
+        && buf.wrapIndent >= firstIndent && leadingSpaces(buf.text) >= firstIndent;
+    const pieces = wrapInfo(buf.text, !buf.continuation, startsIndented, width, firstIndent, hang);
     if (pieces.length === 0) return null;
 
+    // The indent takes the format of the character it precedes, so it reads as
+    // part of the run of text it starts (TBuffer::wrapLine copies that TChar);
+    // a piece with no character left to precede — the empty tail a break in
+    // trailing spaces leaves — gets none. Looked up before any edit, while the
+    // offsets still point into the original text.
+    const textLength = buf.length;
+    const indentFor = (piece: WrapPiece) =>
+        piece.needsIndent && piece.first < textLength ? ' '.repeat(piece.isNewline ? firstIndent : hang) : '';
+    const indentStates = pieces.map(piece => indentFor(piece) ? formatAt(buf, piece.first) : undefined);
     // Back to front, so each edit leaves the earlier offsets valid. What lies
     // between two pieces — the spaces a break dropped, or an embedded newline —
-    // becomes the line break and whatever indent the later piece is owed.
-    const indentFor = (piece: WrapPiece) =>
-        piece.needsIndent ? ' '.repeat(piece.isNewline ? firstIndent : hang) : '';
+    // becomes the line break, followed by whatever indent the later piece is owed.
     for (let i = pieces.length - 1; i >= 1; i--) {
-        buf.replace([pieces[i - 1].last, pieces[i].first], `\n${indentFor(pieces[i])}`);
+        buf.replace([pieces[i - 1].last, pieces[i].first], '\n');
+        const indent = indentFor(pieces[i]);
+        if (indent) buf.insert(pieces[i - 1].last + 1, indent, indentStates[i] ?? {});
     }
     const lead = indentFor(pieces[0]);
-    if (lead) buf.insert(0, lead);
+    if (lead) buf.insert(0, lead, indentStates[0] ?? {});
 
     const lines = buf.splitLines();
     // splitLines() has no line to give a trailing newline, so a piece that
@@ -836,8 +1178,30 @@ function wrapBuffer(buf: AnsiAwareBuffer, width: number, indent: number, hanging
         line.timestamp = buf.timestamp;
         line.isPrompt = buf.isPrompt;
         line.continuation = !pieces[i].isNewline;
+        // The first piece keeps the source line's own record unless this wrap
+        // indented it; a line an embedded newline starts gets no indent.
+        line.wrapIndent = !pieces[i].isNewline ? 0
+            : indentFor(pieces[i]) ? firstIndent
+            : i === 0 ? buf.wrapIndent : 0;
     });
     return lines;
+}
+
+/** How many spaces `text` starts with (TBuffer::wrapIndentWidth). */
+function leadingSpaces(text: string): number {
+    let width = 0;
+    while (width < text.length && text[width] === ' ') width++;
+    return width;
+}
+
+/** The format of the character at `index` in `buf` ({} for the default). */
+function formatAt(buf: AnsiAwareBuffer, index: number): FormatStateSnapshot {
+    let offset = 0;
+    for (const segment of buf.getSegments()) {
+        offset += segment.text.length;
+        if (index < offset) return segment.state ?? {};
+    }
+    return {};
 }
 
 interface WrapPiece {
@@ -852,36 +1216,46 @@ interface WrapPiece {
 /**
  * Where `text` breaks to fit `maxWidth` columns — a port of Mudlet's
  * TBuffer::getWrapInfo, so the answer has to agree with it piece for piece.
- * Width is counted per grapheme in terminal columns, an east asian character
- * taking two. A break falls at the last opportunity that fits: before a space
- * (the run of spaces it lands in is then skipped rather than starting the next
- * line), or wherever the line-break rules allow one, and a word longer than
- * the whole width is broken hard. An empty answer means the line stays as it
- * is — including a line that would only have been broken by its indent.
+ * Width is counted per grapheme in terminal columns, each grapheme as wide as
+ * its base character by Mudlet's width table (wcwidth.ts). A break falls at
+ * the last opportunity that fits: before a space (the run of spaces it lands
+ * in is then skipped rather than starting the next line), or wherever Qt's
+ * line breaker allows one (lineBreak.ts), and a word longer than the whole
+ * width is broken hard. An empty answer means the line stays as it is —
+ * including a line that would only have been broken by its indent.
  */
-function wrapInfo(text: string, isNewline: boolean, maxWidth: number, indent: number, hangingIndent: number): WrapPiece[] {
+function wrapInfo(text: string, isNewline: boolean, startsIndented: boolean, maxWidth: number, indent: number, hangingIndent: number): WrapPiece[] {
     const output: WrapPiece[] = [];
     if (text.length === 0) return output;
-    // Most lines are short printable ASCII, one column a character, and those
-    // need none of the grapheme work below.
-    if (text.length <= (isNewline ? maxWidth - indent : maxWidth) && text.length <= maxWidth && isPlainAscii(text)) {
-        return output;
-    }
+    // A line that already carries its indent (startsIndented, only read for a
+    // line starting a paragraph) is measured as it stands.
+    const indentToCome = isNewline && !startsIndented;
+    // Printable ASCII is one column a character, so such a line no wider than
+    // the wrap column has no break to find.
+    const widthAvailable = Math.min(indentToCome ? maxWidth - indent : maxWidth, maxWidth);
+    const plainAscii = isPlainAscii(text);
+    if (plainAscii && text.length <= widthAvailable) return output;
+    // No grapheme is wider than two columns or shorter than one code unit, so
+    // this line can't reach the wrap column; only an embedded newline breaks it.
+    if (text.length * 2 <= widthAvailable && !text.includes('\n')) return output;
 
-    // The grapheme starting at each offset: where it ends, and how wide it is.
-    const cellEnd = new Int32Array(text.length + 1).fill(-1);
-    const cellWidth = new Uint8Array(text.length + 1);
-    let offset = 0;
-    for (const cell of segmentCells(text)) {
-        cellEnd[offset] = offset + cell.text.length;
-        cellWidth[offset] = cell.width;
-        offset += cell.text.length;
-    }
+    // Where each grapheme starting at an offset ends; a plain ASCII line's
+    // graphemes are its characters. The break opportunities are only worked
+    // out once a line actually overflows.
+    const cellEnd = plainAscii ? null : graphemeEnds(text);
+    let breaks: Uint8Array | null = null;
+    const lineBreakAtOrBefore = (position: number): number => {
+        breaks ??= lineBreakOpportunities(text);
+        if (position === 0 || breaks[position]) return position;
+        let previous = position - 1;
+        while (previous > 0 && !breaks[previous]) previous--;
+        return previous;
+    };
 
     let xPos = 0;
     let totalWidth = 0;
     let firstChar = 0;
-    let needsIndent = isNewline;
+    let needsIndent = indentToCome;
     let hasNewline = false;
     for (let index = 0; index < text.length;) {
         const c = text[index];
@@ -895,20 +1269,33 @@ function wrapInfo(text: string, isNewline: boolean, maxWidth: number, indent: nu
             output.push({ isNewline, needsIndent, first: firstChar, last: index });
             firstChar = ++index;
             isNewline = true;
+            startsIndented = false;
             needsIndent = false;
             xPos = 0;
             continue;
         }
-        const isCellStart = cellEnd[index] > index;
-        const next = isCellStart ? cellEnd[index] : index + 1;
-        const charWidth = isCellStart ? cellWidth[index] : 1;
+        let next = index + 1;
+        let charWidth = 1;
+        if (cellEnd) {
+            // A break inside a grapheme resumes there, as Qt's grapheme finder
+            // does after setPosition(): up to the next boundary, measured by the
+            // character it starts on.
+            next = cellEnd[index];
+            if (next < 0) {
+                next = index + 1;
+                while (next < text.length && cellEnd[next] < 0) next++;
+            }
+            charWidth = codePointWidth(text.codePointAt(index)!);
+        }
         const indentationHere = isNewline ? indent : hangingIndent;
         if (xPos + charWidth > maxWidth - (needsIndent ? indentationHere : 0)) {
-            if (isNewline) needsIndent = true;
+            if (isNewline && !startsIndented) needsIndent = true;
+            // Any space will do as a break, unlike the indirect break UAX #14
+            // only allows after the last of a run of them.
             const firstNonIndentChar = firstChar + (needsIndent ? 0 : indentationHere);
-            if (c !== ' ' && !isLineBreakAt(text, index, cellEnd)) {
-                const previous = previousLineBreak(text, index, cellEnd);
-                if (previous > firstNonIndentChar) index = previous;
+            if (c !== ' ') {
+                const wrapPoint = lineBreakAtOrBefore(index);
+                if (wrapPoint > firstNonIndentChar) index = wrapPoint;
             }
             if (index <= firstChar) {
                 // no room for even one grapheme: keep one on the line, or the
@@ -930,46 +1317,4 @@ function wrapInfo(text: string, isNewline: boolean, maxWidth: number, indent: nu
     if (totalWidth <= maxWidth && !hasNewline) return [];
     if (output.length > 0) output.push({ isNewline, needsIndent: !isNewline, first: firstChar, last: text.length });
     return output;
-}
-
-// East asian punctuation a line may not start with, and the kind it may not end
-// on — the few UAX #14 rules that decide where ideographic text can break.
-const NO_BREAK_BEFORE = new Set([...'、。，．：；！？）］｝〕〉》」』】〙〗〟ー々〻ぁぃぅぇぉっゃゅょゎゕゖァィゥェォッャュョヮヵヶ・…‥']);
-const NO_BREAK_AFTER = new Set([...'（［｛〔〈《「『【〘〖〝']);
-
-function codePointBefore(text: string, index: number): number {
-    const low = text.charCodeAt(index - 1);
-    if (index >= 2 && low >= 0xdc00 && low <= 0xdfff) {
-        const high = text.charCodeAt(index - 2);
-        if (high >= 0xd800 && high <= 0xdbff) return text.codePointAt(index - 2)!;
-    }
-    return low;
-}
-
-/**
- * Whether a line may break before `index` — what Mudlet asks
- * QTextBoundaryFinder::Line. The rules that matter for game text: after a run
- * of spaces, after a hyphen inside a word, and between east asian characters,
- * short of the punctuation that has to stay with its neighbour.
- */
-function isLineBreakAt(text: string, index: number, cellEnd: Int32Array): boolean {
-    if (index <= 0 || index >= text.length || cellEnd[index] <= index) return false;
-    const current = text.codePointAt(index)!;
-    const previous = codePointBefore(text, index);
-    if (current === 0x20) return false;
-    if (previous === 0x20) return true;
-    if (previous === 0x2d) return /\p{L}/u.test(String.fromCodePoint(current));
-    if (codePointWidth(current) === 2 || codePointWidth(previous) === 2) {
-        return !NO_BREAK_BEFORE.has(String.fromCodePoint(current))
-            && !NO_BREAK_AFTER.has(String.fromCodePoint(previous));
-    }
-    return false;
-}
-
-/** The last line-break opportunity before `index`, or 0 for none. */
-function previousLineBreak(text: string, index: number, cellEnd: Int32Array): number {
-    for (let i = index - 1; i > 0; i--) {
-        if (isLineBreakAt(text, i, cellEnd)) return i;
-    }
-    return 0;
 }

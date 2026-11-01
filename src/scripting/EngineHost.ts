@@ -1,4 +1,4 @@
-import type { TriggerPattern } from '../storage/schema';
+import type { KeyNode, TriggerPattern } from '../storage/schema';
 import type { InstallOutcome } from './ScriptingAPI';
 
 /**
@@ -40,6 +40,12 @@ export interface TempComplexTriggerSpec {
     fireLength: number;
     delta: number;
     highlight?: { fg?: string; bg?: string };
+    /** Its code string did not compile. Mudlet still makes the trigger, but it
+     *  is inactive however it is switched — it never matches or highlights. */
+    uncompiled?: boolean;
+    /** Called once when the trigger is killed or expires, so the callback it
+     *  dispatches to can be let go of. */
+    onFree?: () => void;
 }
 
 export interface EngineHost {
@@ -90,9 +96,15 @@ export interface EngineHost {
 
     installPackageFromVfsPath(path: string): InstallOutcome;
     uninstallPackageByName(name: string): boolean;
+    /** Which package or module owns the code a Lua frame is running ('' for
+     *  the profile's own), from the frame's chunk source. */
+    packageOfCaller(source: string, isMain: boolean, calledFromMain: boolean): string;
+    /** Lua `uninstallPackage()`: the refusal, or null once it is uninstalled. */
+    uninstallPackageFromScript(name: string): string | null;
     getPackageNames(): string[];
     getPackageInfo(name: string): Record<string, string>;
-    setPackageInfo(name: string, key: string, value: string): boolean;
+    /** The refusal, or null once the field is set. */
+    setPackageInfo(name: string, key: string, value: string): string | null;
 
     // ── Modules ──────────────────────────────────────────────────────────────
 
@@ -103,19 +115,21 @@ export interface EngineHost {
     saveSyncedModules(): void;
     /** Write the profile out as a Mudlet-format XML save, answering with the
      *  full path written. The XML half of `saveProfile([location [, saveName]])`. */
-    saveProfileXml(location?: string, saveName?: string): { ok: true; path: string } | { ok: false; err: string };
+    /** A refusal names the file it could not write, when it got that far. */
+    saveProfileXml(location?: string, saveName?: string): { ok: true; path: string } | { ok: false; err: string; path?: string };
 
     /** Put package installs off until the turn that started a profile save has
      *  ended; see ScriptingEngine.markProfileSaveInFlight. */
     markProfileSaveInFlight(): void;
-    reloadModuleFromFile(name: string): boolean;
+    reloadModuleFromFile(name: string): InstallOutcome;
     setModuleSync(name: string, sync: boolean): void;
     getModuleSync(name: string): boolean;
     setModulePriority(name: string, priority: number): boolean;
     getModulePriority(name: string): number;
     getModuleNames(): string[];
     getModulePath(name: string): string | null;
-    setModuleInfo(name: string, key: string, value: string): boolean;
+    /** The refusal, or null once the field is set. */
+    setModuleInfo(name: string, key: string, value: string): string | null;
     /** Module manifest fields as a flat record, with any Lua-set overrides
      *  applied. Null when no module by that name is installed. */
     getModuleInfoRecord(name: string): Record<string, unknown> | null;
@@ -159,9 +173,11 @@ export interface EngineHost {
 
     // ── Automation tree: queries ─────────────────────────────────────────────
 
-    /** The saved keybinding carrying this numeric id, or null — getKeyCode
-     *  resolves a permanent key by the id permKey returned, not only by name. */
-    keyNodeByNumericId(numericId: number): { key: string; modifiers: string[] } | null;
+    /** The saved keybinding or key group carrying this numeric id or name, or
+     *  null — getKeyCode resolves a permanent key by the id permKey returned as
+     *  well as by name, and reaches the groups and switched-off keys the key
+     *  engine does not hold. */
+    savedKeyNode(idOrName: number | string): KeyNode | null;
 
     /** Mudlet's Host::setForceMXPProcessorOn — run the in-band MXP parser with
      *  no option-91 handshake. */
@@ -169,9 +185,6 @@ export interface EngineHost {
 
     /** Mudlet `exists(nameOrId, type)` — count of matching items. */
     existsByName(nameOrId: string | number, type: string): number;
-    /** enable/disable a script-created temp trigger or alias by its numeric id.
-     *  False when no live temp item has that id. */
-    setTempItemEnabled(id: number, enabled: boolean): boolean;
 
     /** Mudlet `isActive(nameOrId, type)` — count of matching *active* items. */
     isActiveByName(nameOrId: string | number, type: string, checkAncestors: boolean): number;
@@ -220,19 +233,24 @@ export interface EngineHost {
     getScriptByName(name: string, pos: number): { code: string; id: number } | null;
     /** Remove the script with this numeric id; true when one was removed. */
     removeScriptById(id: number): boolean;
+    /** Why the body of the script with this numeric id failed the last time it
+     *  ran, or null when it ran cleanly. */
+    scriptLoadErrorById(id: number): string | null;
     /** Mudlet's killTimer/killAlias/killTrigger/killKey by permanent-item name. */
     killByName(kind: 'timer' | 'alias' | 'trigger' | 'key', name: string): boolean;
 
     // ── Profile lifecycle ────────────────────────────────────────────────────
 
-    /** Mudlet `resetProfile()` — reload the profile with a fresh Lua VM. */
-    resetProfile(): void;
-    /** Render a map area to a PNG inside the profile VFS. */
+    /** Mudlet `resetProfile()` — reload the profile with a fresh Lua VM. True
+     *  when the reset was armed, false when it was refused. */
+    resetProfile(): boolean;
+    /** Render a map area to a PNG inside the profile VFS — one z level, or
+     *  every level to a file each for `true`. */
     exportAreaImageToVfs(
         areaId: number,
         filePath: string,
-        zLevel?: number,
-    ): { path: string } | { error: string };
+        zLevel?: number | true,
+    ): { path: string } | { error: string; target?: boolean };
 }
 
 /**
@@ -258,9 +276,11 @@ export const NULL_ENGINE_HOST: EngineHost = Object.freeze({
 
     installPackageFromVfsPath: () => ({ ok: false, error: 'no package installer available' }),
     uninstallPackageByName: () => false,
+    packageOfCaller: () => '',
+    uninstallPackageFromScript: (name: string) => `package '${name}' is not installed`,
     getPackageNames: () => [],
     getPackageInfo: () => ({}),
-    setPackageInfo: () => false,
+    setPackageInfo: (name: string) => `package '${name}' not found`,
 
     installModuleFromPath: () => ({ ok: false, error: 'no module installer available' }),
     uninstallModuleByName: () => false,
@@ -268,14 +288,14 @@ export const NULL_ENGINE_HOST: EngineHost = Object.freeze({
     saveSyncedModules: () => {},
     saveProfileXml: () => ({ ok: false as const, err: 'no profile host available' }),
     markProfileSaveInFlight: () => {},
-    reloadModuleFromFile: () => false,
+    reloadModuleFromFile: () => ({ ok: false, error: "module doesn't exist" }),
     setModuleSync: () => {},
     getModuleSync: () => false,
     setModulePriority: () => false,
     getModulePriority: () => 0,
     getModuleNames: () => [],
     getModulePath: () => null,
-    setModuleInfo: () => false,
+    setModuleInfo: (name: string) => `module '${name}' not found`,
     getModuleInfoRecord: () => null,
 
     rewriteCss: (css: string) => css,
@@ -292,10 +312,9 @@ export const NULL_ENGINE_HOST: EngineHost = Object.freeze({
     toggleToolBarByName: (name: string) => `toolbar '${name}' not found`,
     setTriggerStayOpenByName: () => false,
 
-    keyNodeByNumericId: () => null,
+    savedKeyNode: () => null,
     setForceMxpProcessorOn: () => {},
     existsByName: () => 0,
-    setTempItemEnabled: () => false,
     isActiveByName: () => 0,
     ancestorsById: () => null,
     findItemsByName: () => [],
@@ -327,8 +346,9 @@ export const NULL_ENGINE_HOST: EngineHost = Object.freeze({
     setScriptByName: () => -1,
     getScriptByName: () => null,
     removeScriptById: () => false,
+    scriptLoadErrorById: () => null,
     killByName: () => false,
 
-    resetProfile: () => {},
+    resetProfile: () => false,
     exportAreaImageToVfs: () => ({ error: 'exportAreaImage: no profile filesystem' }),
 });

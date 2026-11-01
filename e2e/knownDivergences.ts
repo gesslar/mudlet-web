@@ -25,27 +25,37 @@ export interface KnownDivergence {
     reason: string;
 }
 
+// Specs that need a SECOND profile running beside the one under test, which
+// they make by hand: a folder beside getMudletHomeDir(), a saved profile XML
+// in its current/ folder, then loadProfile(name) and pumpEvents() while that
+// profile runs and closes. Recorded once here because the reason is the same
+// for each, whichever subsystem the spec is really about.
+const SECOND_PROFILE_FROM_A_FOLDER =
+    'The spec builds a second profile on disk — lfs.mkdir() of a folder beside getMudletHomeDir(), a '
+    + 'saved profile XML written into its current/ folder — then loadProfile()s it and pumps the event loop '
+    + 'while that profile runs and closes. In Mudlet that is fair: a folder holding current/<date>.xml IS a '
+    + 'profile, and every profile shares one process and one event loop. Here it meets two walls, and the '
+    + 'spec stops at the first. (1) A profile VFS is mounted AT its own directory and cannot reach its '
+    + 'siblings — the boundary the "leaves no file or folder of its own behind" and Package "refuses a name '
+    + 'that trims down to a step out of the profile" entries already rest on: a profile writing into another '
+    + 'profile\'s storage is what the mount exists to prevent, so the mkdir answers "No such file or '
+    + 'directory". (2) Even past that, a profile is an app-store record, not a folder (see "lists a profile '
+    + 'that is not loaded"), and loadProfile() opens it in a new browser tab: its own page, its own Lua state, '
+    + 'its own event loop. Nothing this tab\'s pumpEvents() drives reaches it. Passing would take a script '
+    + 'that can write into every other profile, profiles conjured out of folders, and a second profile run '
+    + 'inside one page — three things the app never does for a player, built to satisfy a test. ';
+
+// The four teardown specs share one reason; see SECOND_PROFILE_FROM_A_FOLDER.
+const TORN_DOWN_REASON =
+    SECOND_PROFILE_FROM_A_FOLDER
+    + 'These need the second profile only because the self-test profile cannot close or reset itself; what '
+    + 'they guard is closeProfile()/resetProfile() queueing the lua_close() of a state whose script is still '
+    + 'running a nested event loop. Mudlet Web defers both the same way — closeProfile() of the running '
+    + 'profile closes after the calling script returns, and a reset is armed and run later behind a teardown '
+    + 'guard (ScriptingEngine.resetProfile) — but a second profile here is another tab, so there is no shared '
+    + 'loop for one profile\'s teardown to happen underneath another\'s script.';
+
 export const KNOWN_DIVERGENCES: Record<string, KnownDivergence[]> = {
-    DB: [
-        {
-            name: 'Tests DB.lua functions / Tests the functionality of db.Database:_begin, db.Database:_commit, db.Database:_rollback and db.Database:_end / _commit answers false when the database engine refuses the commit',
-            reason:
-                'It is the SCENARIO that is out of reach here, not the behaviour. The spec provokes a refusal '
-                + 'by opening a SECOND connection to the same database file and holding a read cursor on it, so '
-                + 'SQLite answers the writer with SQLITE_BUSY. That needs two connections contending over one '
-                + 'file and mudlet has neither: a database lives in wasm memory (sqliteClient opens `:memory:` '
-                + 'and persists by snapshotting the bytes into the profile VFS), and `open()` hands every caller '
-                + 'naming the same path the one live handle — so the reader and the writer in this spec are '
-                + 'literally the same connection, which cannot lock itself out. Reproducing it would mean an '
-                + "OPFS-backed file with a connection per caller, the design sqliteClient's header rejects, "
-                + 'putting a worker hop and async back on the trigger write path to earn one error message. '
-                + 'What the spec is really guarding — that _commit reports a refusal instead of answering true '
-                + 'over work that never landed — IS implemented and does happen here: SQLite refuses a COMMIT '
-                + 'on a single connection whenever a DEFERRABLE constraint fails at the end of the '
-                + 'transaction, or the database has outgrown what the wasm heap can still grow to. '
-                + 'Luasql.lua propagates those, and tests/scripting/dbCommitRefusal.test.ts pins it.',
-        },
-    ],
     Mapper: [
         {
             name: 'Tests saveMap and loadMap / Tests the saveMap argument contract / resolves a relative location against the profile directory',
@@ -78,6 +88,15 @@ export const KNOWN_DIVERGENCES: Record<string, KnownDivergence[]> = {
                 + 'mudlet-map-binary-reader reads 16-20 but every legacy model\'s write throws, by its author\'s '
                 + 'decision, so saveMap accepts the version argument and writes 20 regardless (see the map format '
                 + 'version row of docs/settings-divergence.md). Saving for an older Mudlet stays a job for desktop.',
+        },
+        {
+            name: 'Tests closing another profile that opened a map widget / survives the main window being activated again after the close',
+            reason:
+                SECOND_PROFILE_FROM_A_FOLDER
+                + 'What the spec guards is a desktop crash: the main window keeping a pointer to the closed '
+                + 'profile\'s command line, to give focus back to when the mapper-script reminder dialog lets go. '
+                + 'There is no shared main window here for a closed profile to leave a pointer in — each profile '
+                + 'is its own tab, and closing one takes its whole page with it.',
         },
     ],
     Media: (() => {
@@ -133,6 +152,17 @@ export const KNOWN_DIVERGENCES: Record<string, KnownDivergence[]> = {
     ],
     Miscallaneous: [
         {
+            name: 'Tests C++ functions in the Miscallaneous category / Tests the functionality of saveProfile / writes the application-wide settings to Mudlet.ini as well',
+            reason:
+                'Reads Mudlet.ini beside the profiles folder, above getMudletHomeDir(). Mudlet keeps its '
+                + 'application-wide settings in that file; Mudlet Web keeps settings in its app store (in '
+                + 'localStorage, outside any profile VFS) and writes no Mudlet.ini at all. Even a written one '
+                + 'could not be read here: a profile VFS is mounted AT its own directory and cannot see above it '
+                + '(the boundary the "leaves no file or folder of its own behind" entry rests on). What the spec '
+                + 'cares about — a setting such as showTabConnectionIndicators surviving a save — holds: '
+                + 'setConfig writes it straight to the store, which persists it without a save.',
+        },
+        {
             name: 'Tests C++ functions in the Miscallaneous category / Tests the functionality of getProfiles / lists a profile that is not loaded',
             reason:
                 'The spec mkdir()s a bare folder under the profiles directory and expects getProfiles() to list it. '
@@ -157,8 +187,94 @@ export const KNOWN_DIVERGENCES: Record<string, KnownDivergence[]> = {
                 + 'it must, and lfs.dir() over the parent answers nil, which the spec\'s `for entry in lfs.dir(...)` '
                 + 'calls. There is nothing of a profile\'s own that could be left up there to find.',
         },
+        {
+            name: 'Tests C++ functions in the Miscallaneous category / Tests the functionality of unzipAsync / survives the profile that asked for it closing before the extraction reports back',
+            reason:
+                SECOND_PROFILE_FROM_A_FOLDER
+                + 'The hazard itself — an extraction reporting back to a profile that has gone — cannot cross '
+                + 'profiles here: an unzipAsync() belongs to the runtime of the tab that asked for it, and that '
+                + 'tab closing takes the extraction, and anything it would report to, down with it.',
+        },
+        {
+            name: 'Tests C++ functions in the Miscallaneous category / Tests a profile torn down while its script spins the event loop / loads another profile after closeProfile(), then closes',
+            reason: TORN_DOWN_REASON,
+        },
+        {
+            name: 'Tests C++ functions in the Miscallaneous category / Tests a profile torn down while its script spins the event loop / loads another profile after resetProfile(), then resets',
+            reason: TORN_DOWN_REASON,
+        },
+        {
+            name: 'Tests C++ functions in the Miscallaneous category / Tests a profile torn down while its script spins the event loop / never runs another function for a timer made while its state closed',
+            reason:
+                TORN_DOWN_REASON
+                + ' The hazard this one adds — a __gc finaliser making a timer while lua_close() runs, which then '
+                + 'outlives the state it was made in — is guarded here too, within one profile: once LuaRuntime.destroy() '
+                + 'has begun, tempTimer() from a finaliser makes no timer, so the timer engine a reset reuses is '
+                + 'never handed a callback into the closed state.',
+        },
+        {
+            name: 'Tests C++ functions in the Miscallaneous category / Tests a profile torn down while its script spins the event loop / closes another profile after closeProfile(), then closes',
+            reason: TORN_DOWN_REASON,
+        },
+        {
+            name: 'Tests C++ functions in the Miscallaneous category / Tests a profile torn down while its script spins the event loop / closes after resetProfile() then closeProfile()',
+            reason: TORN_DOWN_REASON,
+        },
+    ],
+    Networking: [
+        {
+            name: 'MMCP chat with a profile that closes / should hang up its calls when the profile running the server closes',
+            reason:
+                SECOND_PROFILE_FROM_A_FOLDER
+                + 'And past both, the spec needs that profile to auto-start an MMCP chat server and this one to '
+                + 'call it — peer-to-peer TCP, listening as well as dialing, which a browser tab can do neither of '
+                + '(see the MMCP entry in UNSUPPORTED_AREAS). It is not caught by that entry\'s skip because it '
+                + 'is gated on MUDLET_TEST_MODE rather than on the peer fixture, so it runs and fails instead.',
+        },
+    ],
+    Other: [
+        {
+            name: 'Tests the timer API / Tests the functionality of tempTimer / runs nothing and reports nothing for a timer with no code',
+            reason:
+                SECOND_PROFILE_FROM_A_FOLDER
+                + 'What it pins — a timer whose code is empty runs nothing and reports nothing — is the same here as '
+                + 'in this profile; only the second profile it builds to watch that on a fresh console cannot be made.',
+        },
+        {
+            name: 'Tests Other.lua functions / Tests getConfig and setConfig round-trips / round-trips every boolean configuration option',
+            reason:
+                'Every boolean option round-trips except lazyCaptureGlobals, which setConfig refuses to set true. '
+                + 'That is the decision recorded under Trigger below: Mudlet Web always sets matches, multimatches '
+                + 'and line up front, which is Mudlet with lazyCaptureGlobals off, so getConfig answers false and '
+                + 'a true is refused rather than stored and then not honoured — a script reading the setting back '
+                + 'would otherwise be told about a deferral that never happens.',
+        },
     ],
     Package: [
+        ...[
+            'Tests opening a profile whose script fails as it loads / names the scripts that failed on that profile\'s console, once',
+            'Tests opening a profile whose script fails as it loads / names them again after a reset, leaving out those fixed or disabled since',
+            'Tests opening a profile whose script fails as it loads / names a package\'s script when a module has the package\'s name too',
+            'Tests opening a profile whose script fails as it loads / runs a failing body of a module loaded before the profile\'s scripts only once',
+        ].map(name => ({
+            name,
+            reason:
+                SECOND_PROFILE_FROM_A_FOLDER
+                + 'The report itself is made here, as desktop words it — the switched-on scripts that failed as the '
+                + 'profile loaded or reset are named once on its console (tests/scripting/scriptItemDrift338.test.ts) '
+                + '— but for the profile this tab runs; the spec watches it happen on another.',
+        })),
+        {
+            name: 'Tests exporting the profile to a file with saveProfile / says so on the console when the write fails after the call has answered',
+            reason:
+                'Desktop writes a profile save on a worker thread: saveProfile() answers first, and the spec moves '
+                + 'the target folder away before the write lands, then expects the console to report the late '
+                + 'failure. Here the XML is built and written before saveProfile() answers, so there is no window '
+                + 'between the answer and the write — the spec\'s own setup says so ("the write finished before '
+                + 'its folder was moved away") and stops. A failure here is reported synchronously instead, as '
+                + 'saveProfile\'s nil and message and the console line the neighbouring specs check. Making the '
+                + 'write late just to open that window would make every save slower to land for no gain.',
+        },
         {
             name: 'Tests installing an archive whose config.lua will not run / refuses a name that trims down to a step out of the profile',
             reason:
@@ -195,32 +311,39 @@ export const KNOWN_DIVERGENCES: Record<string, KnownDivergence[]> = {
             + 'offer reaches the downloader (an incomplete one does not), its notice is on the main console, '
             + 'and a raw telnet offer leaves the gmcp table alone. The failure notice Mudlet posts ("Package download failed from ...") '
             + 'is implemented and is asserted instead by tests/scripting/clientGuiNotices.test.ts.';
-        return [
+        // These serve the package themselves, from a file:// url inside the
+        // profile, and need the install to have finished when the offer
+        // returns. The file is read straight from the VFS, but the install
+        // still settles later: it registers the package only once the VFS
+        // flush has landed (ScriptingEngine.handleClientGuiInstall), so a page
+        // killed mid-install leaves "not installed" rather than a package on
+        // record with its files missing — the f2ce-tools failure that ordering
+        // was written for. That flush is IndexedDB, so it resolves through the
+        // event loop the busted run is sitting on, as the download above does.
+        const servedReason =
+            'Needs a Client.GUI install to have finished before the spec looks. Mudlet Web registers a '
+            + 'downloaded package only once its files are flushed to the profile VFS, so a page closed mid-install '
+            + 'leaves it not installed rather than recorded with its files missing (which is how f2ce-tools lost '
+            + 'its bundled databases). That flush is IndexedDB and settles through the browser\'s event loop, which '
+            + 'a synchronous busted run is sitting on top of — the same wall as the download entries beside these. '
+            + 'Registering before the flush to let a synchronous test see it would bring the half-install back.';
+        const served = [
+            'Tests the Client.GUI package offer / installs nothing from a Client.GUI download that came back empty',
+            'Tests the Client.GUI package offer / installs a Client.GUI package downloaded from a file URL',
+            'Tests the Client.GUI package offer / leaves an installed Client.GUI package alone when it is offered at the same version',
+            'Tests the Client.GUI package offer / forgets the recorded Client.GUI version once that package is uninstalled',
+            'Tests the Client.GUI package offer / upgrades a Client.GUI package after another one was installed',
+            'Tests the Client.GUI package offer / announces a Client.GUI package only once it is installed when a save was running',
+            'Tests the Client.GUI package offer / records the Client.GUI package that installed, not an offer made while it installed',
+            'Tests the Client.GUI package offer / records no version for a Client.GUI download that installed nothing',
+        ].map(name => ({ name, reason: servedReason }));
+        return [...served, ...[
             'Tests the Client.GUI package offer / acts on a Client.GUI offer sent as raw telnet rather than JSON (#7704)',
             'Tests the Client.GUI package offer / keeps a raw telnet Client.GUI out of the gmcp table (#7034)',
             'Tests the Client.GUI package offer / acts on a JSON Client.GUI offer whose version is a number',
             'Tests the Client.GUI package offer / ignores a Client.GUI offer that is missing its version or its URL',
-        ].map(name => ({ name, reason }));
+        ].map(name => ({ name, reason }))];
     })(),
-    STT: [
-        {
-            name: 'stt bridge / getInfo / names the engine it would use',
-            reason:
-                'The spec pins getInfo().backend to "Vosk", and its own comment says why that is the right test '
-                + 'THERE: "the contract worth holding is that the name is one this build actually has". mudlet has '
-                + 'none. Vosk is a native library Mudlet dlopen()s beside a language-model directory on disk, and '
-                + 'neither survives the move to a browser tab — half of stt.* exists to manage exactly those two '
-                + 'things (getLibraryPath, getPlatformKey, reloadLibrary, unloadLibrary). Answering "Vosk" to '
-                + 'satisfy this line would be the very thing the spec guards against: a build claiming an engine '
-                + 'it does not have. That is worse than a truthful "none", because backend is what a package reads '
-                + 'to decide what it can do. Everything else in STT_spec passes, because the spec is written to '
-                + 'run on a machine with no engine installed and mudlet is permanently in that state: available() '
-                + 'is false, mudlet.supports.stt is false, and every call refuses clearly — engine refusals also '
-                + 'announcing on sysSTTError, a script\'s own mistakes not (Bridge.lua). If speech recognition is '
-                + 'ever wired up here it will be the Web Speech API, so the honest name then is that — still not '
-                + '"Vosk".',
-        },
-    ],
     Trigger: (() => {
         // Mudlet leaves `matches`, `multimatches` and `line` out of the globals
         // table until a script reads them (Mudlet/Mudlet's lazyCaptureGlobals,
@@ -271,12 +394,42 @@ export const KNOWN_DIVERGENCES: Record<string, KnownDivergence[]> = {
                 'the handlers once the metatable is handed out / come off the globals metatable at the next line',
                 'the lazyCaptureGlobals setting / is on by default',
                 'the lazyCaptureGlobals setting / leaves them out again once switched back on',
+                // Mudlet's own Lua carries a write barrier (MUDLET_LUA_WATCH) the
+                // deferral leans on to know an empty `matches` was left alone
+                // between dispatches; these read its state off rearmLazyGlobals(),
+                // which with the deferral off answers a lone false, as desktop's
+                // does with the setting off
+                'leaves the checks to the write barrier of Mudlet\'s own Lua',
+                'hands a script the empty matches after the collector cleared it from a weak registry',
+                'hands a script its captures after the collector cleared __index from a weak globals metatable',
             ].map(name => ({ name: lazy + name, reason })),
-            {
-                name: 'Trigger processing / triggers ruled out from a copy of their pattern / leaves the pinned filters alone when a trigger creates another trigger',
+            // The same cases as their "(built up front)" twins, which pass, run a
+            // second time with the deferral re-armed — and they assert that it
+            // is, which with no deferral to arm they cannot
+            ...[
+                'keeps a regex fire\'s groups in order, unset and empty ones as empty strings',
+                'keeps every match of a match-all regex in order',
+                'hands a substring, start-of-line or exact-match fire its pattern',
+                'hands a colour fire the text of the run',
+                'hands a filter child the capture of its parent',
+                'hands a multiline fire the groups of each line',
+                'hands a multiline filter\'s script its groups, and its children the groups after',
+                'keeps its own captures across a nested pass in its script',
+            ].map(name => ({
+                name: 'Trigger processing / the captures a fire hands its script / ' + name + ' (read on demand)',
+                reason,
+            })),
+            ...[
+                'leaves the pinned filters alone when a trigger creates another trigger',
+                // the same, through triggers.unfilterableEpoch: how often a line in
+                // flight was made to drop its prefiltered candidate list
+                'drops a line\'s candidate list for a trigger its own match held open only on a line that fed it',
+            ].map(name => ({
+                name: 'Trigger processing / triggers ruled out from a copy of their pattern / ' + name,
                 reason:
-                    'Reads getProfileStats().triggers.rootFilterEpoch, a test-mode-only counter of how often '
-                    + 'TriggerUnit invalidated the per-pass copies of its root triggers\' bigram prefilters — the '
+                    'Reads getProfileStats().triggers.rootFilterEpoch or unfilterableEpoch, test-mode-only '
+                    + 'counters of how often TriggerUnit invalidated the per-pass copies of its root triggers\' bigram '
+                    + 'prefilters, or a line\'s list of candidates they left — the '
                     + 'summaries Mudlet uses to rule a trigger out of a line without running its pattern. mudlet '
                     + 'has no such prefilter (TriggerEngine runs each active pattern), so there are no pinned '
                     + 'copies to invalidate and no epoch to count; reporting one would be a number that measures '
@@ -285,7 +438,7 @@ export const KNOWN_DIVERGENCES: Record<string, KnownDivergence[]> = {
                     + 'processed" block, which passes. The sibling prefilter probes in TriggerFlood_spec '
                     + '(prescanWorkers) find the field absent and pend themselves; this one has no such gate '
                     + 'beyond MUDLET_TEST_MODE, which the busted build sets.',
-            },
+            })),
         ];
     })(),
 };
@@ -379,5 +532,479 @@ export const UNSUPPORTED_AREAS: UnsupportedArea[] = [
             + 'stop skipping and start failing. mudlet binds mmcp.* as stubs that report an empty peer list (the '
             + 'true state of a client nobody can reach) and sets mudlet.supports.mmcp = false so feature-testing '
             + 'scripts route around it.',
+    },
+];
+
+/**
+ * Divergences no spec in the corpus exercises, so neither list above can hold
+ * them (both are checked against live spec output). Recorded so the decision
+ * sits with the others, and so nobody re-files it as a bug.
+ */
+export interface PlatformDivergence {
+    /** The Lua surface that behaves differently. */
+    api: string;
+    /** What a script sees on each client. */
+    behaviour: string;
+    /** Why Mudlet Web does not match. */
+    reason: string;
+    /** Where it was reported. */
+    issue: string;
+}
+
+export const PLATFORM_DIVERGENCES: PlatformDivergence[] = [
+    {
+        api: 'files written in sysExitEvent on a profile linked to a local folder',
+        behaviour:
+            'Desktop: a file a sysExitEvent handler writes as Mudlet closes is on disk afterwards. Mudlet Web: '
+            + 'the same on an ordinary (IndexedDB) profile; on a profile linked to a folder on disk, a write made '
+            + 'as the tab closes or reloads can be lost. Writes made while playing reach the folder as before.',
+        reason:
+            'The folder link goes through the File System Access API, which has no synchronous write: every '
+            + 'write opens a writable stream and closes it over several turns of the event loop, and a page that '
+            + 'is closing gets none. IndexedDB can be told to finish on its own (the profile VFS commits each '
+            + 'write\'s transaction explicitly, so the database completes it after the page is gone), and that is '
+            + 'what closes the gap for the default storage; the File System Access API offers no equivalent. '
+            + 'Holding the tab open until the writes land would take a "Leave site?" prompt on every close. '
+            + 'Pinned for IndexedDB by tests/scripting/vfsUnloadCommit438.test.ts.',
+        issue: '#438',
+    },
+    {
+        api: 'trigger and alias regex: PCRE2 10.34 in 16-bit mode',
+        behaviour:
+            'Desktop matches with PCRE2 10.39 over UTF-8; Mudlet Web with 10.34 over UTF-16. So: letters '
+            + 'added in Unicode 13 (Yezidi, U+10E80…) are not \\p{L} or \\w here, and \\p{Yezidi} does not compile; '
+            + '\\K inside a lookaround (^KL a(?=b\\K)) compiles and fires here where desktop (10.38+) rejects the '
+            + 'pattern; and \\C matches one UTF-16 code unit here (é) where desktop matches one byte (<C3>). '
+            + 'Everything else the #361 comparison covered matches.',
+        reason:
+            'These are properties of the PCRE2 build itself: its Unicode tables, its compile rules and its '
+            + 'code-unit width. pcre2-wasm-universal is the only WebAssembly PCRE2 there is and ships 10.34 as '
+            + 'the 16-bit library; its wasm is also byte-patched at build time (vite-plugin/pcre2Wasm.ts), so a '
+            + 'newer one is a rebuild of the library, not a version bump. Rewriting patterns to imitate a newer '
+            + 'release (rejecting \\K in lookarounds, say) would need a PCRE pattern parser in front of PCRE and '
+            + 'still could not supply the newer Unicode tables. Pinned by tests/triggers/regexDrift361.test.ts.',
+        issue: '#361',
+    },
+    {
+        api: 'trigger and alias regex: match limit',
+        behaviour:
+            'Desktop compiles trigger and alias patterns with PCRE2\'s default match limit (10 000 000) and runs '
+            + 'them through the JIT. Mudlet Web caps them at 500 000 steps (ENGINE_MATCH_LIMIT in '
+            + 'src/mud/triggers/pcre/Pcre2.ts). A pattern that needs between the two to decide a line matches on '
+            + 'desktop and counts as no match here, silently on both clients (TTrigger::match_perl treats a match '
+            + 'error as no match). Ordinary patterns need a few tens of thousands of steps even on a 20 kB line, '
+            + 'so in practice only nested-quantifier patterns like ^(\\w+\\s?)+$ reach the limit, and those fail '
+            + 'on such lines on both clients anyway. Lua rex keeps the library default.',
+        reason:
+            'The wasm build has no JIT (sljit has no WebAssembly backend) and its interpreter takes about 50 ns '
+            + 'a step, so 10 000 000 steps froze the page for one to several seconds per line, for a pattern that '
+            + 'then failed anyway (#435). 500 000 gives up in tens of milliseconds. Matching the default would '
+            + 'bring the freeze back; running matching off the main thread would not shorten it, only hide it. '
+            + 'Pinned by tests/triggers/pcreLeadingDotPlus.test.ts.',
+        issue: '#435',
+    },
+    {
+        api: 'order of lines, GMCP, input and timers within one large network read',
+        behaviour:
+            'Desktop reads the socket in large chunks and processes each read in full '
+            + 'before typed input or a timer can run; GMCP and telnet negotiation in a read are handled before '
+            + 'its text lines. Mudlet Web processes a read of more than 32 lines in slices of 32 lines, handing '
+            + 'the page back to input and timers once a slice has run for 12 ms, and handles GMCP before the '
+            + 'lines of its own slice rather than of the whole read. Nothing is reordered: lines, prompts, GMCP '
+            + 'and sends keep their order, and a slice boundary is always between whole lines.',
+        reason:
+            'A browser tab is single-threaded, so processing a 5 000-line flood in one go blocked typing, '
+            + 'timers and rendering for seconds where desktop stays responsive (#435). Read boundaries already '
+            + 'differ from desktop\'s (the proxy and the WebSocket frame the stream their own way), so scripts '
+            + 'cannot depend on them on either client; slicing only adds more of them. Pinned by '
+            + 'tests/mud/connection/inboundSlices.test.ts.',
+        issue: '#435',
+    },
+    {
+        api: 'postHTTP / putHTTP / deleteHTTP / customHTTP answered by a redirect',
+        behaviour:
+            'Desktop: a 301/302/303 is followed with a GET and finishes as sysGetHttpDone; a 307/308 repeats '
+            + 'the verb and finishes as that verb\'s event. Mudlet Web: any redirected request finishes as '
+            + 'sysGetHttpDone with the final url, so a 307/308 reports sysGetHttpDone where desktop reports '
+            + 'the verb\'s event; and a PUT (with its body), DELETE or custom verb answered by a 301/302 is '
+            + 're-sent with its own method, so the server sees that verb, not desktop\'s GET. A POST is '
+            + 'followed with a GET as on desktop.',
+        reason:
+            'Redirects are followed under the Fetch standard - by the browser for a direct request, by the '
+            + 'proxy\'s own fetch for a proxied one - which keeps every verb but POST on a 301/302 and hides '
+            + 'the redirect\'s status from script (redirect: "manual" in a browser answers an opaque response '
+            + 'with neither status nor Location), so neither the follow-up\'s method nor which status was '
+            + 'followed can be chosen or known. The event is picked for the 301/302/303 that answer nearly '
+            + 'every redirected POST/PUT/DELETE. Following redirects by hand in the proxy would close the gap '
+            + 'for proxied requests only, at the cost of the proxy fetching Location urls itself. Pinned by '
+            + 'tests/scripting/httpRedirectParity.test.ts.',
+        issue: '#349',
+    },
+    {
+        api: 'os.clock()',
+        behaviour:
+            'Desktop: CPU time the whole process has used — stands still while idle (0.0 across an idle 1.5s '
+            + 'tempTimer), advances for rendering and network work too. Mudlet Web: main-thread time in the '
+            + 'tasks that read the clock — also stands still while idle and measures a benchmark inside one '
+            + 'call the same, but misses work in tasks that never read it and starts near 0.',
+        reason:
+            'Desktop runs stock Lua 5.1, whose os.clock() is C clock(). A page has no CPU-time clock at all '
+            + "(performance.now() is wall time, and emscripten's clock() is wall time since start, which is "
+            + 'what os.clock used to report). The approximation counts main-thread '
+            + 'time in the tasks that read the clock: the first reading in a task opens a segment and a '
+            + 'microtask closes it once the synchronous Lua call has unwound. So idle time never counts and a '
+            + 'benchmark inside one call measures as on desktop, but work in tasks that never read the clock '
+            + '(rendering, other JS, Lua that ran without calling os.clock) is missing, and the value starts '
+            + 'near 0 rather than at the CPU time the process had already used. Pinned by '
+            + 'tests/scripting/textTimeUtilityParity.test.ts.',
+        issue: '#294',
+    },
+    {
+        api: 'string→number coercion of "0x"',
+        behaviour: 'Desktop: "0x" + 1 raises (not a number). Mudlet Web: "0x" + 1 is 1.',
+        reason:
+            'Lua 5.1 parses a numeric string with strtod and, on a trailing "x", strtoul(s, 16). glibc stops '
+            + "that strtoul after the \"0\" when no hex digit follows, so \"0x\" is not a number on desktop; the "
+            + 'wasm Lua is built against musl, which consumes the bare prefix and yields 0. tonumber() is '
+            + 'wrapped in Lua to answer nil as desktop does (#308), but the same C parse also runs for arithmetic '
+            + 'coercion ("0x" + 1) and string.format("%d", "0x"), inside the VM where Lua cannot reach. Fixing '
+            + 'those means patching luaO_str2d in the wasm build of wasmoon-lua5.1; a script would have to do '
+            + 'arithmetic on a bare "0x" string to notice. Pinned by tests/scripting/textTimeUtilityParity.test.ts.',
+        issue: '#294',
+    },
+    {
+        api: 'string.dump / loadstring of precompiled chunks',
+        behaviour:
+            'Bytecode dumped by desktop Mudlet fails to load here with "binary string: bad header in '
+            + 'precompiled chunk", and bytecode dumped here fails the same way on desktop. Source code, and '
+            + 'string.dump/loadstring round-trips within one client, are unaffected.',
+        reason:
+            'A Lua 5.1 chunk header records the sizes of the C types the VM was built with, and lundump '
+            + 'refuses any chunk whose header differs from its own. The WebAssembly Lua is a wasm32 build, '
+            + 'so sizeof(size_t) is 4 where desktop\'s 64-bit build has 8 (header bytes `04 04 04 08 00` '
+            + 'against `04 08 04 08 00`), and every string length inside the chunk is a size_t of that width. '
+            + 'Closing it would mean transcoding chunks between the two layouts inside load/loadstring/'
+            + 'loadfile/dofile/require AND emitting the 64-bit layout from string.dump, all for the rare .luac '
+            + 'file or dumped function moved between clients. Lua 5.1 bytecode is also unverified (a malformed '
+            + 'chunk can corrupt the VM), so widening what the loader accepts is not worth it for that.',
+        issue: '#296',
+    },
+    {
+        api: 'getModulePath on a module that came in with an imported desktop profile',
+        behaviour:
+            'Desktop answers with the <filepath> the profile recorded (e.g. C:/Users/me/modB.xml). Mudlet Web '
+            + 'answers with the copy of that XML the import placed inside the profile\'s VFS '
+            + '(/profiles/<id>/modB/modB.xml, or wherever the imported tree already held it). The module is '
+            + 'otherwise a module on both: getModules lists it, getPackages does not, and its priority and '
+            + 'sync flag carry over.',
+        reason:
+            'The recorded path is on the original machine\'s disk, which a browser cannot open; the module '
+            + 'reloads from, and syncs to, the VFS copy. Reporting the old path would hand scripts a file that '
+            + 'installModule/reinstall cannot read.',
+        issue: '#279',
+    },
+    {
+        api: 'string.sub / string.byte with a position of 2^31 or more',
+        behaviour:
+            'Desktop: ("abcdef"):sub(3, 2^33) is "cdef", ("abcdef"):sub(2^31) is "", and ("abc"):byte(1, 2^31) '
+            + 'returns 97 98 99. Mudlet Web: "", the whole string, and nothing — the position narrows to INT_MIN '
+            + 'before the C code sees it. Every position inside the 32-bit range, negative ones included, '
+            + 'behaves exactly as on desktop.',
+        reason:
+            'This client runs Lua 5.1 compiled to wasm32, where lua_Integer is 32 bits; desktop builds it for a '
+            + '64-bit host. The wasm cannot be rebuilt from here, so the only fix is a Lua wrapper in front of '
+            + 'each function — and it was written and measured: it made both of these, among the hottest '
+            + 'functions any script calls, about five times slower on every call (sub ~36ns -> ~190ns), to '
+            + 'correct positions no real script uses, since a string two billion bytes long cannot exist in the '
+            + 'first place. string.format, tonumber and table.insert — where the large values are real (gold, '
+            + 'XP, epoch milliseconds) or the narrowing froze the tab — ARE corrected, by '
+            + 'src/scripting/lua/WideIntegers.lua; tests/scripting/wideIntegers.test.ts pins those and this '
+            + 'decision.',
+        issue: '#275',
+    },
+    {
+        api: 'registerAnonymousEventHandler during a dispatch of the same event',
+        behaviour:
+            'A handler registered while its event is being dispatched (directly, or from a nested event) runs '
+            + 'in that same dispatch on desktop, which walks Other.lua\'s live handler table with pairs(). Mudlet '
+            + 'Web snapshots each handler list before calling into it, so the new handler first runs on the next '
+            + 'raise of the event. Killing a handler mid-dispatch behaves the same on both.',
+        reason:
+            'The snapshot (the dispatchEventToFunctions override in LuaRuntime\'s mudlet-lua-overrides) guards '
+            + 'the EleUI2 GitUpdater regression: a package installed from a sysDownloadDone handler registers its '
+            + 'own sysDownloadDone handler from sysInstallPackage, and a live walk hands it the very download that '
+            + 'installed it, which it takes for a finished update and uninstalls the package. Desktop is safe '
+            + 'from that only because Host::installPackage raises sysInstall/sysInstallPackage from a '
+            + 'QTimer::singleShot(0), after the dispatch that asked for the install has finished, whereas '
+            + 'ScriptingEngine.notifyPackageInstalled raises them synchronously. Dropping the snapshot needs the '
+            + 'install events (sysInstall, sysInstallPackage, sysLuaInstallModule, sysSyncInstallModule) deferred '
+            + 'the same way first, which reorders the profile-open bootstrap, held self-removals and UI installs.',
+        issue: '#282',
+    },
+    {
+        api: 'CSI n C (cursor forward) on the default background — getFgColor / getTextFormat',
+        behaviour:
+            'Both clients turn `ESC[nC` into n spaces painted with the foreground set to the background. When '
+            + 'the background is the profile default, desktop resolves that to the profile\'s background colour '
+            + '(getFgColor on the gap reports 0,0,0 on a stock profile, and an underline or strike-out in force '
+            + 'is invisible across it); Mudlet Web leaves the foreground default (getFgColor reports the profile '
+            + 'foreground, and the decoration shows). With any explicit background the two agree.',
+        reason:
+            'Desktop resolves colours to RGB as it decodes, from the Host. Mudlet Web\'s ANSI and MXP parsers '
+            + 'keep a default colour as "default" so a later change of the profile colours repaints old output, '
+            + 'and they run with no access to the profile — there is no colour value that means "the default '
+            + 'background" to give the foreground. The gap is spaces, so only a decoration drawn through it and '
+            + 'a script reading its colour back can tell.',
+        issue: '#272',
+    },
+    {
+        api: 'getLabelSizeHint, and Geyser.Label adjustSize / autoWidth / autoHeight built on it',
+        behaviour:
+            'Both clients size the hint the same way: the label\'s contents laid out unwrapped, with no '
+            + 'document margin, plus the stylesheet\'s margin, border and padding, whatever box the label has '
+            + 'now. The pixel values still differ by font: desktop under the PTB reported 62x13 for an 8pt '
+            + '"Hello world" and 11x22 for an empty label, and the browser answers with what its own font '
+            + 'measures (an empty label is a zero-width line of the label font).',
+        reason:
+            'The hint is a text measurement, and the two clients rasterise text with different engines and '
+            + 'usually different fonts (Qt\'s font database against the browser\'s CSS font stack), so there '
+            + 'is no shared number to match. The shape of the answer is what scripts rely on, and that is '
+            + 'matched.',
+        issue: '#283',
+    },
+    {
+        api: 'Docked Geyser.UserWindow / openUserWindow: the size a new dock gets',
+        behaviour:
+            'Both clients lay a docked window out before openUserWindow returns, so getUserWindowSize, '
+            + 'getMainWindowSize, getWindowGeometry and sysWindowResizeEvent already reflect the dock on the '
+            + 'next line. The size of the dock differs: desktop gave a new right dock its minimum width (49 '
+            + 'pixels in the report), Mudlet Web gives it the width of that side\'s dock area (300 pixels '
+            + 'unless the player has dragged it), shared by every panel docked on that side.',
+        reason:
+            'The dock area is Mudlet Web\'s own layout, one resizable extent per side that the player sets and '
+            + 'the profile remembers, not a Qt QDockWidget negotiating its size hint. Opening every new dock '
+            + 'at a sliver would not make a script more portable (the width is still the player\'s to change '
+            + 'on both clients) and would leave each new panel unusable until dragged open.',
+        issue: '#283',
+    },
+    {
+        api: 'debug.traceback / debug.getinfo, tail-called',
+        behaviour:
+            'A function that ends in `return debug.traceback(msg)` (or `return debug.getinfo(1)`) gets a '
+            + '"(tail call): ?" frame at level 1 here where desktop shows that function\'s own line. Every other '
+            + 'level, and every call that is not a tail call, matches.',
+        reason:
+            'These are Lua functions here (Bridge.lua), so they can present Mudlet Web\'s own Lua as C frames. A '
+            + 'tail call to a Lua function replaces the caller\'s frame and Lua 5.1 keeps only a placeholder for '
+            + 'it, so its line is gone before the override runs; desktop\'s C functions never replace a frame. '
+            + 'Matching would mean writing them as C functions against the raw stack, for one cosmetic line.',
+        issue: '#276',
+    },
+    {
+        api: 'runtime errors inside Mudlet Web\'s own Lua',
+        behaviour:
+            'An error the Lua VM or a stock C function raises from inside Mudlet Web\'s own Lua - e.g. '
+            + 'utf8.len({}), which fails inside string.len - is prefixed "[C]:<line>:", where desktop prefixes the '
+            + 'calling script line (luaL_argerror) or nothing. Errors that code raises deliberately are '
+            + 'positioned as desktop positions them.',
+        reason:
+            'Desktop\'s io/lfs/utf8/rex/yajl/luasql/lpeg and API are C; here they are Lua compiled under the chunk '
+            + 'name "=[C]". Deliberate raises go through an error() that positions the way lua_error / luaL_error '
+            + 'do, but an error raised by the VM itself, or by a stock C function such code calls, takes the '
+            + 'position of the Lua frame that called it, and nothing sits between there and the script\'s pcall '
+            + 'to rewrite it. Closing it means validating every argument up front in every shim.',
+        issue: '#276',
+    },
+    {
+        api: 'loadProfile(name)',
+        behaviour:
+            'Opens the profile in a new browser tab. Desktop opens every profile a script asks for; here the '
+            + 'browser allows one new tab per user gesture, so the second loadProfile() in one alias, and any '
+            + 'loadProfile() from a trigger, timer or event handler, answers nil plus "the browser blocked the new '
+            + 'tab". That refusal also leaves a line in the main console with an "Open profile <name>" link, '
+            + 'which opens the profile when clicked.',
+        reason:
+            'Each profile lives in its own browser tab, and a page may only open a tab while handling a click or '
+            + 'key press - once per gesture, and never from code the game\'s output started. No page can lift '
+            + 'that, so the link turns the refused call into one click instead of a silent failure.',
+        issue: '#453',
+    },
+    {
+        api: 'setActiveProfile(name)',
+        behaviour:
+            'For a profile open in another browser tab it answers false plus "is open in another browser tab, '
+            + 'which a page cannot bring to the front", where desktop switches to it and answers true; the other '
+            + 'tab flashes its title until the user switches to it, and sysProfileFocusChangeEvent fires when '
+            + 'they do. For this tab\'s own profile it asks for window focus and answers true.',
+        reason:
+            'Each profile lives in its own browser tab, and browsers only let the user switch tabs - a page '
+            + 'cannot focus another tab. Answering true would tell a "jump to the profile that needs attention" '
+            + 'script it had worked when nothing moved. The refusals (empty name, no such profile, not loaded) '
+            + 'match.',
+        issue: '#453',
+    },
+    {
+        api: 'raiseGlobalEvent(name, ...)',
+        behaviour:
+            'Other profiles\' handlers run a task later, not during the call: desktop has run them all by the '
+            + 'time raiseGlobalEvent returns, so a profile that asks another for a value and reads the reply on '
+            + 'the next line sees it there, and sees the old value here. Have the reply raise an event of its '
+            + 'own and act on it in that handler.',
+        reason:
+            'Desktop\'s profiles share one process, and HostManager::postInterHostEvent calls raiseEvent on each '
+            + 'host in turn. Here each profile is a separate browser tab with its own Lua state, and the only way '
+            + 'between tabs is a BroadcastChannel message, which the receiving tab handles on a later task. One '
+            + 'tab cannot run another tab\'s Lua synchronously.',
+        issue: '#453',
+    },
+    {
+        api: 'rex.config()',
+        behaviour:
+            'PCRE2_CONFIG_JIT is 0 and there is no PCRE2_CONFIG_JITTARGET; desktop\'s build reports 1 and its '
+            + 'JIT target.',
+        reason:
+            'The table describes the PCRE2 library in use, and the WebAssembly build has no JIT (rex.jit_compile '
+            + 'is not provided either). Reporting desktop\'s values would describe a library that is not there.',
+        issue: '#276',
+    },
+    {
+        api: 'rex, CASELESS in byte mode',
+        behaviour:
+            'Without UTF, a caseless pattern also matches bytes 0xC0-0xDE against 0xE0-0xFE (Latin-1\'s '
+            + 'letter pairs, e.g. "\\195" against "\\227"); desktop\'s C-locale tables only fold ASCII. Whole '
+            + 'UTF-8 characters still compare as desktop compares them: rex.find("É", "é", 1, "i") is nil.',
+        reason:
+            'The WebAssembly PCRE2 is the 16-bit library and its compile always sets PCRE2_UTF, so byte mode '
+            + 'runs on one code unit per byte, and caseless matching of units 0x80-0xFF uses Unicode case '
+            + 'folding. Mapping those bytes elsewhere would need every \\x escape, octal and class range in '
+            + 'the pattern rewritten to match; the gap only touches a caseless pattern that itself holds such '
+            + 'a byte.',
+        issue: '#333',
+    },
+    {
+        api: 'rex compile flags DOLLAR_ENDONLY, FIRSTLINE, ALT_*, MATCH_UNSET_BACKREF, ALLOW_EMPTY_CLASS, NEVER_*',
+        behaviour:
+            'Accepted and ignored as numeric compile flags. The rest take effect: CASELESS, MULTILINE, DOTALL, '
+            + 'EXTENDED, UNGREEDY, DUPNAMES, NO_AUTO_CAPTURE, UTF, UCP, ANCHORED, LITERAL and the NO_* '
+            + 'optimisation switches.',
+        reason:
+            'The WebAssembly library\'s compile takes a pattern and nothing else, so a flag only reaches it '
+            + 'when it has an in-pattern spelling ((?i), (*UCP), …) or is also a match option (ANCHORED). '
+            + 'These have neither.',
+        issue: '#333',
+    },
+    {
+        api: 'lfs.lock / lfs.unlock',
+        behaviour:
+            'Always succeed on an open handle whose mode can carry the lock; desktop\'s fcntl lock can be refused '
+            + 'by another process holding one.',
+        reason:
+            'A profile\'s files belong to the one tab holding its Web Lock, so no second holder of a record lock '
+            + 'can exist to contend with. The argument checks and the closed-file error match.',
+        issue: '#276',
+    },
+    {
+        api: 'lfs.link / lfs.lock_dir / lfs.symlinkattributes',
+        behaviour:
+            'Work over the default IndexedDB filesystem; on a linked local folder they answer '
+            + '`nil, "Operation not supported", 95` where desktop makes the link.',
+        reason:
+            'Links are a feature of the virtual filesystem backend. ZenFS\'s store backend implements them; the '
+            + 'File System Access API behind a linked folder has no links at all.',
+        issue: '#276',
+    },
+    {
+        api: 'io.popen, io.stdout / io.stderr',
+        behaviour:
+            'io.popen raises "\'popen\' not supported". io.stdout / io.stderr writes go to the browser console '
+            + 'rather than the process streams desktop writes to.',
+        reason:
+            'A browser page cannot start processes and has no standard streams; the console is the nearest '
+            + 'equivalent, and the error is what a Lua built without popen raises.',
+        issue: '#276',
+    },
+    {
+        api: 'getPath() between equal-cost routes through different rooms',
+        behaviour:
+            'Desktop: when two routes of the same total weight reach the target through different '
+            + 'intermediate rooms, which one speedWalkPath/speedWalkDir describe can change from one Mudlet run '
+            + 'to the next. Mudlet Web: always the same route for the same map, but not necessarily the one a '
+            + 'given desktop run picked. Two exits of equal cost from one room into the SAME room do match: the '
+            + 'first of n,e,s,w,up,down,ne,se,sw,nw,in,out wins, then the alphabetically first special exit.',
+        reason:
+            'Desktop numbers its search vertices in QHash iteration order over the room map (TMap::initGraph), '
+            + 'and its frontier breaks equal-priority ties by that vertex number. Qt seeds QHash per process, so '
+            + 'the order — and with it the choice between equal routes — is not a property of the map and '
+            + 'cannot be reproduced. The per-room tie (parallel exits into one room) is decided while the graph '
+            + 'is built, in a fixed order, and is ported exactly in src/map/pathfinding.ts. Pinned by '
+            + 'tests/scripting/mapperParity295.test.ts.',
+        issue: '#295',
+    },
+    {
+        api: 'getTextFormat() with nothing selected',
+        behaviour:
+            'Desktop: reads the character under the user cursor, which stays at column 0 of the last line the '
+            + 'trigger engine ran on (or on the last character after moveCursorEnd). Mudlet Web: reads the '
+            + 'character under its own cursor, which follows output on the main console and sits one past the '
+            + 'last character of an unfinished last line after moveCursorEnd — so it can answer (nil, "current selection invalid…") where '
+            + 'desktop answers a format table.',
+        reason:
+            'The two answers come from different cursor models rather than from getTextFormat: the main console '
+            + "follows output until a trigger parks it, and moveCursorEnd's column was chosen so a following "
+            + 'insertText appends. Both are wider changes than #277; the messages and the window-not-found case '
+            + 'now match desktop. Pinned by tests/scripting/argContracts.test.ts.',
+        issue: '#277',
+    },
+    {
+        api: 'Discord setters, receiveMSP: bad argument types',
+        behaviour:
+            'Desktop: setDiscordState({}) and friends raise "bad argument" while Discord is enabled for the '
+            + 'profile, and receiveMSP({}) raises while MSP is on. Mudlet Web: no raise.',
+        reason:
+            'Desktop answers (nil, msg) for the disabled feature before it looks at the arguments, so whether '
+            + 'it raises depends on state Mudlet Web does not have (no Discord integration) or rarely has. '
+            + 'The rest of the #277 sweep is enforced by src/scripting/lua/argContracts.ts.',
+        issue: '#277',
+    },
+    {
+        api: 'luasql / db:* SQL newer than SQLite 3.37',
+        behaviour:
+            'Desktop links SQLite 3.37.2; Mudlet Web ships 3.53. SQL that 3.37 does not know - the -> and ->> '
+            + 'JSON operators, format(), unixepoch(), concat()/concat_ws(), the newer strftime specifiers - runs '
+            + 'here and fails on desktop with a syntax or "no such function" error. What the two versions both '
+            + 'run gives the same answers: a REAL turned into text has desktop\'s 15 significant digits '
+            + '(SQLITE_DBCONFIG_FP_DIGITS), and round() is replaced with 3.37\'s arithmetic, so round(2.675, 2) '
+            + 'is 2.68 on both.',
+        reason:
+            'The operators and specifiers live in 3.53\'s parser and date code, which cannot be switched off, '
+            + 'and no SQLite 3.37 WebAssembly build exists to ship instead. Shadowing only the new functions '
+            + 'with failing stand-ins would still leave the operators working, and would take SQL that works '
+            + 'away from scripts written here for no gain on desktop. A script meant for both clients has to '
+            + 'keep to 3.37\'s SQL, as it would on an older desktop build. Pinned by '
+            + 'tests/scripting/luasqlDrift335.test.ts.',
+        issue: '#335',
+    },
+    {
+        api: 'mudlet.translations.en_US.e',
+        behaviour:
+            'Desktop: nil — the table has 23 keys. Mudlet Web: "e", with all 24 direction names.',
+        reason:
+            'TLuaInterpreter::setupLanguageData stores the translation of "e" under the key "s", where the '
+            + 'next line overwrites it with "s"\'s own; it sizes the table for 24 entries and sets every other '
+            + 'short name, so the missing "e" is a typo rather than a choice. A script indexing it on desktop '
+            + 'gets nil, and translateTable() falls back to the key, so "e" reads as "e" on both clients that '
+            + 'way. Leaving the key out here would only reproduce the slip. The rest of the table, i and o '
+            + 'included, matches; tests/scripting/consoleConfigDrift341.test.ts pins it.',
+        issue: '#341',
+    },
+    {
+        api: 'highlightRoom: missing alpha arguments',
+        behaviour:
+            'Desktop: highlightRoom with 8 arguments raises "bad argument #9 type (color1Alpha as number '
+            + 'expected, got no value!)". Mudlet Web: the two alphas are optional; a wrongly typed one still raises.',
+        reason:
+            'Mudlet Web documented the alphas as optional (luaCompletions.ts) before #277, so scripts written '
+            + 'here may omit them; refusing them now would break those scripts for no gain.',
+        issue: '#277',
     },
 ];

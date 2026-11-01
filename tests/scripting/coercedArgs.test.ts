@@ -139,6 +139,12 @@ describe('Mudlet argument coercion parity', () => {
     });
 
     it('a boolean where Mudlet uses getVerifiedString — lua_isstring is false for one', () => {
+      // hideMapInfo is one of the keys desktop only knows while a mapper exists
+      // (with none it is refused as unknown before the value is looked at), so
+      // the map has to have been shown for the value check to be reached.
+      t.session.windows.registerMapControl('coerced-args', {
+        getZoom: () => null, setZoom() {}, redraw() {}, exportArea: () => null,
+      });
       expect(() => run('setConfig("hideMapInfo", true)')).toThrow(/value as string expected/);
     });
 
@@ -146,7 +152,7 @@ describe('Mudlet argument coercion parity', () => {
       // createStopWatch dispatches on LUA_TBOOLEAN / LUA_TSTRING / LUA_TNIL, and
       // HTTP header tables are checked with lua_type(..) != LUA_TSTRING.
       expect(() => run('createStopWatch(42)')).toThrow(/name as string or autostart as boolean/);
-      expect(() => run('getHTTP("u", {[1]="v"})')).toThrow(/custom headers must be strings/);
+      expect(() => run('getHTTP("u", {[1]="v"})')).toThrow(/custom header names must be strings, got number/);
     });
   });
 });

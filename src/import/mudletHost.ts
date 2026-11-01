@@ -3,6 +3,8 @@ import { SERVER_WRAP_WIDTH_MIN, SERVER_WRAP_WIDTH_MAX } from '../mud/text/server
 import { MIN_CONSOLE_BUFFER_SIZE, MAX_CONSOLE_BUFFER_SIZE } from '../mud/text/Console';
 import { parseMudletXml, type MudletImportResult } from './mudletXmlImport';
 import { parseVariablePackageXml, type MudletVariablePackage } from './mudletVariables';
+import type { SavedStopwatch } from '../scripting/StopwatchManager';
+import { MAP_STYLES, DEFAULT_MAP_STYLE } from '../map/mapStyle';
 
 // Maps the `<HostPackage><Host>` block of a Mudlet profile XML onto Mudlet Web's
 // ProfileSettings. This is the settings half of a full Mudlet-profile import —
@@ -48,6 +50,105 @@ const PROTOCOL_ATTR: ReadonlyArray<readonly [string, BooleanProtocolKey]> = [
     ['mEnableNEWENVIRON', 'newEnviron'],
 ];
 
+// Mudlet's `<Host>` yes/no attribute → key in ProfileSettings.config (the
+// getConfig/setConfig bag), for the preferences that live there rather than in
+// a field of their own. Attribute names from XMLexport.cpp's writeHost.
+const CONFIG_BOOL_ATTR: ReadonlyArray<readonly [string, string]> = [
+    ['USE_IRE_DRIVER_BUGFIX', 'fixUnnecessaryLinebreaks'],
+    ['mUSE_FORCE_LF_AFTER_PROMPT', 'forceLfAfterPrompt'],
+    ['mUSE_UNIX_EOL', 'inputLineStrictUnixEndings'],
+    ['mFORCE_GA_OFF', 'specialForceGAOff'],
+    ['CompactInputLine', 'compactInputLine'],
+    ['f3SearchEnabled', 'f3SearchEnabled'],
+    // XMLimport reads it as yes when absent, as getConfig's default does.
+    ['mMapperStitchAreas', 'mapStitchAreas'],
+];
+
+// Host::CommandEchoMode, by its integer value (Never = 0, ScriptControl = 1,
+// Always = 2) → the showSentText mode string.
+const ECHO_MODES = ['never', 'script', 'always'] as const;
+
+// The Q_ENUM key spellings XMLexport writes (valueToKey) ↔ Mudlet Web's mode strings.
+const CARET_SHORTCUTS: ReadonlyArray<readonly [string, string]> = [
+    ['None', 'none'], ['Tab', 'tab'], ['CtrlTab', 'ctrltab'], ['F6', 'f6'],
+];
+const BLANK_LINE_BEHAVIOURS: ReadonlyArray<readonly [string, string]> = [
+    ['Show', 'show'], ['Hide', 'hide'], ['ReplaceWithSpace', 'replacewithspace'],
+];
+
+// `ControlCharacterHandling` is ControlCharacterMode's integer: AsIs = 0,
+// Picture = 1, OEM = 2. Anything else reads as AsIs (XMLimport's default case).
+const CONTROL_CHARACTER_MODES = ['asis', 'picture', 'oem'] as const;
+
+/** The getConfig-bag preferences a `<Host>` carries. Empty when it has none. */
+function parseHostConfig(host: Element): Record<string, unknown> {
+    const config: Record<string, unknown> = {};
+    for (const [attr, key] of CONFIG_BOOL_ATTR) {
+        const v = attrBool(host, attr);
+        if (v !== undefined) config[key] = v;
+    }
+    // Mudlet 4.19 made the echo a tri-state `commandEchoMode`; older saves only
+    // have the boolean `printCommand`, which XMLimport reads as script control
+    // (yes) or never (no). Out-of-range integers are clamped, as there.
+    const echoMode = attrNum(host, 'commandEchoMode');
+    if (echoMode !== undefined) {
+        config.showSentText = ECHO_MODES[Math.min(2, Math.max(0, Math.trunc(echoMode)))];
+    } else {
+        const printCommand = attrBool(host, 'printCommand');
+        if (printCommand !== undefined) config.showSentText = printCommand ? 'script' : 'never';
+    }
+    const historySize = attrNum(host, 'CommandLineHistorySaveSize');
+    if (historySize !== undefined) config.commandLineHistorySaveSize = Math.trunc(historySize);
+    const caret = host.getAttribute('caretShortcut');
+    const caretMode = CARET_SHORTCUTS.find(([xml]) => xml === caret)?.[1];
+    if (caretMode) config.caretShortcut = caretMode;
+    const blank = host.getAttribute('blankLineBehaviour');
+    const blankMode = BLANK_LINE_BEHAVIOURS.find(([xml]) => xml === blank)?.[1];
+    if (blankMode) config.blankLinesBehaviour = blankMode;
+    // Absent means AsIs too (the default up to Mudlet 4.14.1, when it arrived),
+    // but only a present attribute is recorded, so a merge keeps what was there.
+    const control = attrNum(host, 'ControlCharacterHandling');
+    if (control !== undefined) config.controlCharacterHandling = CONTROL_CHARACTER_MODES[control] ?? 'asis';
+    // Only a present attribute is recorded, as above; XMLimport puts one that
+    // names a style this build does not know on the default.
+    const style = host.getAttribute('mapStyle');
+    if (style !== null) config.mapStyle = MAP_STYLES.includes(style) ? style : DEFAULT_MAP_STYLE;
+    return config;
+}
+
+/** The inverse of {@link parseHostConfig}: write whichever of those
+ *  preferences `config` holds back onto the `<Host>`. */
+function applyHostConfig(host: Element, config: Record<string, unknown>): void {
+    for (const [attr, key] of CONFIG_BOOL_ATTR) {
+        const v = config[key];
+        if (typeof v === 'boolean') host.setAttribute(attr, v ? 'yes' : 'no');
+    }
+    // A legacy boolean in the bag (false ≙ never, true ≙ script), as SettingsModal reads it.
+    const echo = config.showSentText;
+    const mode = echo === false ? 'never' : echo === true ? 'script' : echo;
+    const echoIndex = ECHO_MODES.indexOf(mode as typeof ECHO_MODES[number]);
+    if (echoIndex >= 0) {
+        // Both, as XMLexport writes them: the tri-state for Mudlet 4.19 and up,
+        // the boolean for anything older.
+        host.setAttribute('commandEchoMode', String(echoIndex));
+        host.setAttribute('printCommand', echoIndex === 0 ? 'no' : 'yes');
+    }
+    const size = config.commandLineHistorySaveSize;
+    if (typeof size === 'number' && Number.isFinite(size)) host.setAttribute('CommandLineHistorySaveSize', String(Math.trunc(size)));
+    const caret = CARET_SHORTCUTS.find(([, web]) => web === config.caretShortcut)?.[0];
+    if (caret) host.setAttribute('caretShortcut', caret);
+    const blank = BLANK_LINE_BEHAVIOURS.find(([, web]) => web === config.blankLinesBehaviour)?.[0];
+    if (blank) host.setAttribute('blankLineBehaviour', blank);
+    const control = CONTROL_CHARACTER_MODES.indexOf(config.controlCharacterHandling as typeof CONTROL_CHARACTER_MODES[number]);
+    // XMLexport leaves the attribute out for AsIs, the default.
+    if (control > 0) host.setAttribute('ControlCharacterHandling', String(control));
+    else if (control === 0) host.removeAttribute('ControlCharacterHandling');
+    // XMLexport writes the style on every save, the default included.
+    const style = typeof config.mapStyle === 'string' && MAP_STYLES.includes(config.mapStyle)
+        ? config.mapStyle : DEFAULT_MAP_STYLE;
+    host.setAttribute('mapStyle', style);
+}
+
 // Mudlet's mDisplayFont is "Family,pointSize,…" (a serialized QFont). We only
 // want the family and size.
 function parseFontSpec(spec: string): { family?: string; size?: number } {
@@ -62,6 +163,9 @@ function parseFontSpec(spec: string): { family?: string; size?: number } {
  * present in the XML are set, so the result can be merged over existing/default
  * settings without clobbering anything Mudlet didn't specify.
  */
+/** The largest border, either way, Mudlet's border setters accept. */
+const BORDER_LIMIT = 1000000;
+
 export function parseMudletHost(host: Element): Partial<ProfileSettings> {
     const out: Partial<ProfileSettings> = {};
 
@@ -134,17 +238,20 @@ export function parseMudletHost(host: Element): Partial<ProfileSettings> {
     if (useMaxBuffer !== undefined) out.useMaxConsoleBufferSize = useMaxBuffer.trim() === 'yes';
 
     // ── borders ──────────────────────────────────────────────────────────
-    const top = Number(childText(host, 'borderTopHeight') ?? '');
-    const bottom = Number(childText(host, 'borderBottomHeight') ?? '');
-    const left = Number(childText(host, 'borderLeftWidth') ?? '');
-    const right = Number(childText(host, 'borderRightWidth') ?? '');
-    if ([top, bottom, left, right].some(n => Number.isFinite(n) && n > 0)) {
-        out.outputBorders = {
-            top: Number.isFinite(top) ? top : 0,
-            bottom: Number.isFinite(bottom) ? bottom : 0,
-            left: Number.isFinite(left) ? left : 0,
-            right: Number.isFinite(right) ? right : 0,
-        };
+    // Bounded to the range the setters accept, as XMLimport reads them: a save
+    // from an older build can hold one no setter takes any more, and the
+    // console takes opposite borders off its own size. A negative border is a
+    // border too, so any border given is read, not only a positive one.
+    const border = (tag: string): number | undefined => {
+        const n = Number(childText(host, tag) ?? '');
+        return Number.isFinite(n) ? Math.min(BORDER_LIMIT, Math.max(-BORDER_LIMIT, Math.trunc(n))) : undefined;
+    };
+    const top = border('borderTopHeight');
+    const bottom = border('borderBottomHeight');
+    const left = border('borderLeftWidth');
+    const right = border('borderRightWidth');
+    if ([top, bottom, left, right].some(n => n !== undefined && n !== 0)) {
+        out.outputBorders = { top: top ?? 0, bottom: bottom ?? 0, left: left ?? 0, right: right ?? 0 };
     }
 
     // ── font ─────────────────────────────────────────────────────────────
@@ -168,6 +275,10 @@ export function parseMudletHost(host: Element): Partial<ProfileSettings> {
     }
     if (anyProtocol) out.protocols = protocols;
 
+    // ── preferences kept in the getConfig bag ────────────────────────────
+    const config = parseHostConfig(host);
+    if (Object.keys(config).length) out.config = config;
+
     return out;
 }
 
@@ -177,9 +288,16 @@ export interface MudletProfileIdentity {
     name?: string;
     host?: string;
     port?: number;
+    /** `mSslTsl` — connect over TLS. The profile's `ssl_tsl` file, when it has
+     *  one, is fresher (see buildMudletProfileBundle). */
+    tls?: boolean;
+    sslIgnoreExpired?: boolean;
+    sslIgnoreSelfSigned?: boolean;
+    sslIgnoreAll?: boolean;
 }
 
-/** Read `<name>`/`<url>`/`<port>` (direct children of `<Host>`). */
+/** Read `<name>`/`<url>`/`<port>` (direct children of `<Host>`) and the TLS
+ *  attributes. */
 export function parseMudletHostIdentity(host: Element): MudletProfileIdentity {
     const out: MudletProfileIdentity = {};
     const name = childText(host, 'name');
@@ -188,6 +306,14 @@ export function parseMudletHostIdentity(host: Element): MudletProfileIdentity {
     if (url) out.host = url;
     const port = childText(host, 'port');
     if (port !== undefined && Number.isFinite(Number(port))) out.port = Number(port);
+    const tls = attrBool(host, 'mSslTsl');
+    if (tls !== undefined) out.tls = tls;
+    const ignoreExpired = attrBool(host, 'mSslIgnoreExpired');
+    if (ignoreExpired !== undefined) out.sslIgnoreExpired = ignoreExpired;
+    const ignoreSelfSigned = attrBool(host, 'mSslIgnoreSelfSigned');
+    if (ignoreSelfSigned !== undefined) out.sslIgnoreSelfSigned = ignoreSelfSigned;
+    const ignoreAll = attrBool(host, 'mSslIgnoreAll');
+    if (ignoreAll !== undefined) out.sslIgnoreAll = ignoreAll;
     return out;
 }
 
@@ -249,6 +375,7 @@ export function applyProfileSettingsToHost(host: Element, s: Partial<ProfileSett
     // XMLexport.cpp:617-618.
     if (s.consoleBufferSize !== undefined) setHostEl(host, 'consoleBufferSize', String(s.consoleBufferSize));
     if (s.useMaxConsoleBufferSize !== undefined) setHostEl(host, 'useMaxConsoleBufferSize', s.useMaxConsoleBufferSize ? 'yes' : 'no');
+    if (s.config) applyHostConfig(host, s.config);
 
     if (s.ansiPalette) {
         for (const [name, idx] of ANSI_COLOR_INDEX) {
@@ -327,6 +454,33 @@ export function applyInstalledPackages(host: Element, names: string[]): void {
 }
 
 /**
+ * Replace `<Host><stopwatches>` with the profile's persistent stopwatches,
+ * written as desktop's `XMLexport` writes them, so a save carries them as
+ * desktop's does rather than the copy the document was based on.
+ */
+export function applyStopwatches(host: Element, watches: SavedStopwatch[]): void {
+    let list = host.querySelector(':scope > stopwatches');
+    if (!list) {
+        list = newHostEl(host, 'stopwatches');
+        host.appendChild(list);
+    }
+    while (list.firstChild) list.removeChild(list.firstChild);
+    for (const watch of watches) {
+        const el = newHostEl(host, 'stopwatch');
+        el.setAttribute('id', String(watch.id));
+        if (watch.running) {
+            el.setAttribute('running', 'yes');
+            el.setAttribute('effectiveStartDateTimeEpochMSecs', String(Math.trunc(watch.effectiveStartEpochMs)));
+        } else {
+            el.setAttribute('running', 'no');
+            el.setAttribute('elapsedDateTimeMSecs', String(Math.trunc(watch.elapsedMs)));
+        }
+        el.setAttribute('name', watch.name);
+        list.appendChild(el);
+    }
+}
+
+/**
  * Reduce a full Mudlet profile save to a document holding just its
  * `<HostPackage>`.
  *
@@ -343,9 +497,10 @@ export function applyInstalledPackages(host: Element, names: string[]): void {
  * - the automation and variable packages, which are regenerated from live state
  *   on every write; keeping a copy here would ship the same data twice, in two
  *   formats, and let a stale one resurface.
- * - `<mInstalledModules>`, because import folds a resolved module into an
- *   ordinary package. A surviving reference would make Mudlet load it a second
- *   time from the absolute path it had on the original machine.
+ * - `<mInstalledModules>`, because import re-registers each resolved module
+ *   against a copy of its XML inside the new profile. A surviving reference
+ *   would make Mudlet load it a second time from the absolute path it had on
+ *   the original machine.
  *
  * Returns null if `profileXml` doesn't parse or carries no `<HostPackage>`.
  */

@@ -1,6 +1,7 @@
 import { ItemIdSequence } from '../ItemIdSequence';
 import type { TimerNode } from '../../storage/schema';
-import { buildEffectivelyEnabledIds } from '../../storage/schema';
+import { buildEffectivelyEnabledIds, isTempParentRef, tempParentRef, tempRefId } from '../../storage/schema';
+import { workerClock, type Clock, type ClockHandle } from './workerClock';
 
 export type { TimerNode };
 
@@ -8,7 +9,7 @@ type TempFn = () => void;
 type ExecuteFn = (timer: TimerNode) => void;
 
 interface TimerEntry {
-    handle: ReturnType<typeof setTimeout>;
+    handle: ClockHandle;
     repeat: boolean;
     /** Epoch ms when the timer was scheduled — start point for remainingTime. */
     start: number;
@@ -56,6 +57,11 @@ function permTree(timers: TimerNode[]): PermTree {
     }
     const isOffset = (t: TimerNode): boolean => {
         if (t.isGroup || !t.parentId) return false;
+        // A permanent timer under a temporary one: a temp timer is never a
+        // folder, so this is an offset timer (TTimer::isOffsetTimer: a parent
+        // that is not a folder) — one its parent never arms, since a temp
+        // timer's execute() returns before the offset-children loop.
+        if (isTempParentRef(t.parentId)) return true;
         const parent = byId.get(t.parentId);
         return !!parent && !parent.isGroup;
     };
@@ -83,12 +89,16 @@ export class TimerEngine {
     private firingDepth = 0;
     setIdSequence(seq: ItemIdSequence): void { this.idSeq = seq; }
 
+    /** Every timeout is armed on `clock`, which keeps time in a worker so a
+     *  hidden tab doesn't throttle the timers (see workerClock). */
+    constructor(private readonly clock: Clock = workerClock) {}
+
     /** Number of live session-scoped temp timers (Mudlet `getProfileStats` temp
      *  count). Killed-but-unreaped timers are not live and don't count. */
     get tempCount(): number {
-        let n = 0;
-        for (const entry of this.temp.values()) if (!entry.dead) n++;
-        return n;
+        // Killed ones too, until the cleanup frees them: desktop's
+        // getProfileStats walks the live root list unfiltered.
+        return this.temp.size;
     }
 
     addTemp(seconds: number, fn: TempFn, repeat = false): number {
@@ -101,7 +111,8 @@ export class TimerEngine {
         // Re-arm BEFORE running the body. A repeating timer that kills itself
         // from inside its own callback has to stay dead, and killTimer can only
         // clear a handle that already exists — re-arming afterwards would
-        // resurrect it.
+        // resurrect it. A body slower than the interval then pushes that tick
+        // a full interval past its return (rearmIfOverdue).
         //
         // A one-shot is retired only AFTER its body, as TTimer::execute does:
         // inside its own callback the timer still exists and is active, so
@@ -109,23 +120,33 @@ export class TimerEngine {
         // stopped and marked for cleanup, and TimerUnit::timerFired frees it —
         // along with anything else killed meanwhile — once no timer body is
         // left on the stack.
+        //
+        // Either kind is `firing` while its body runs. Every temp timer is a
+        // single-shot QTimer on desktop (TTimer.cpp: setSingleShot(isTemporary())),
+        // which Qt stops before delivering the timeout and which, for a repeat,
+        // only TimerUnit::timerFired restarts once the body has returned. So
+        // inside its own callback remainingTime() reads QTimer's -1 ("timer is
+        // inactive or expired"), and a nested event loop never fires it again.
         const fire = (): void => {
             if (repeat) arm();
-            else {
-                const entry = this.temp.get(id);
-                if (entry) entry.firing = true;
-            }
+            const firingEntry = this.temp.get(id);
+            if (firingEntry) firingEntry.firing = true;
             this.firingDepth++;
             try {
                 fn();
             } finally {
                 this.firingDepth--;
-                if (!repeat) {
+                if (repeat) {
+                    // Looked up again, as below: the body may have re-armed it.
+                    const entry = this.temp.get(id);
+                    if (entry) entry.firing = false;
+                    this.rearmIfOverdue(this.temp, id);
+                } else {
                     // Looked up again: a disable + enable inside the body
                     // replaced the entry with a freshly armed one.
                     const entry = this.temp.get(id);
                     if (entry) {
-                        clearTimeout(entry.handle);
+                        this.clock.clearTimeout(entry.handle);
                         entry.dead = true;
                     }
                 }
@@ -133,11 +154,30 @@ export class TimerEngine {
             }
         };
         const arm = (): void => {
-            const handle = setTimeout(fire, intervalMs);
+            const handle = this.clock.setTimeout(fire, intervalMs);
             this.temp.set(id, { handle, repeat, start: Date.now(), intervalMs, fire, arm });
         };
         arm();
         return id;
+    }
+
+    /**
+     * After a repeating timer's body returns: if the body ran so long that the
+     * tick armed before it is already due, push that tick a full interval past
+     * now. Desktop's next tick comes at least one interval after a slow body
+     * returns (mudlet-web#293: a 0.2s timer whose body takes 0.5s fires at 0.2
+     * then 0.9, not 0.7), so a late tick must not fire the moment the body
+     * ends. Only the timer's *own* slow body does this — a tick held up by
+     * some other timer's body is re-armed from when it actually fired, which
+     * already is "now". The entry is looked up afresh: a body that killed,
+     * disabled or re-armed its own timer left nothing overdue to move.
+     */
+    private rearmIfOverdue<K>(map: Map<K, TimerEntry>, key: K): void {
+        const entry = map.get(key);
+        if (!entry || entry.dead || entry.disabled || !entry.arm) return;
+        if (Date.now() < entry.start + entry.intervalMs) return;
+        this.clock.clearTimeout(entry.handle);
+        entry.arm();
     }
 
     /**
@@ -167,12 +207,12 @@ export class TimerEngine {
             // Cancel the pending timeout and let `fire` do the bookkeeping — it
             // retires a one-shot and re-arms a repeat, so a repeating timer ends
             // up correctly scheduled for its next tick instead of double-firing.
-            clearTimeout(entry.handle);
+            this.clock.clearTimeout(entry.handle);
             due.push(entry.fire);
         }
         for (const entry of this.perm.values()) {
             if (now < entry.start + entry.intervalMs) continue;
-            clearTimeout(entry.handle);
+            this.clock.clearTimeout(entry.handle);
             // entry.fire retires a one-shot and re-arms a repeat itself.
             due.push(entry.fire);
         }
@@ -181,11 +221,10 @@ export class TimerEngine {
     }
 
     /**
-     * Whether a temporary timer with this id is still present.
-     *
-     * Backs `exists(id, "timer")`. Temp timers aren't in the store and — unlike
-     * temp triggers and aliases — aren't tracked in LuaRuntime's tempIds either,
-     * so this map is the only thing that knows.
+     * Whether a temporary timer with this id is still present — killed or not.
+     * Temp timers aren't in the store: this map is the temporary half of the
+     * one timer tree (exists() asks {@link hasLiveTemp}, which skips a killed
+     * one).
      *
      * Present is not running: a killed timer stays here until the reap, and a
      * disabled one until it is killed — see {@link tempIsActive}.
@@ -212,7 +251,7 @@ export class TimerEngine {
         const entry = this.temp.get(id);
         if (!entry || entry.dead) return false;
         if (!enabled) {
-            if (!entry.disabled) clearTimeout(entry.handle);
+            if (!entry.disabled) this.clock.clearTimeout(entry.handle);
             entry.disabled = true;
         } else if (entry.disabled) {
             // arm() replaces the entry, which drops the disabled flag.
@@ -227,7 +266,7 @@ export class TimerEngine {
         // achieved nothing and has to say so.
         if (!entry || entry.dead) return false;
         // Every temp timer is a setTimeout now, repeating ones included.
-        clearTimeout(entry.handle);
+        this.clock.clearTimeout(entry.handle);
         // Marked rather than dropped — see TimerEntry.dead. reapKilled() frees it.
         entry.dead = true;
         return true;
@@ -238,8 +277,54 @@ export class TimerEngine {
      *  cleanup Mudlet's TimerUnit does (Host::incomingStreamProcessor and
      *  TimerUnit::timerFired). */
     reapKilled(): void {
-        for (const [id, entry] of this.temp) if (entry.dead) this.temp.delete(id);
+        for (const [id, entry] of this.temp) {
+            if (!entry.dead) continue;
+            this.temp.delete(id);
+            // Its permanent children go with it (~TTimer deletes them): their
+            // owner removes them from the store — see takeOrphanedParents.
+            const ref = tempParentRef(id);
+            if (this.tempParentRefs.has(ref)) {
+                this.orphanedParents.add(ref);
+                this.onOrphans?.();
+            }
+        }
     }
+
+    /** Temp parent refs some permanent timer hangs off, as of the last loadPerm. */
+    private tempParentRefs = new Set<string>();
+    private orphanedParents = new Set<string>();
+    private onOrphans: (() => void) | null = null;
+
+    /** Tree keys of freed temp timers that had permanent children, since the
+     *  last call. Their owner removes those subtrees from the store. */
+    takeOrphanedParents(): string[] {
+        if (this.orphanedParents.size === 0) return [];
+        const out = [...this.orphanedParents];
+        this.orphanedParents.clear();
+        return out;
+    }
+
+    /** Told when {@link takeOrphanedParents} has something to hand over. */
+    setOrphanListener(fn: (() => void) | null): void {
+        this.onOrphans = fn;
+    }
+
+    /** Live temp timer ids, ascending, whose name — the id itself — passes `test`. */
+    liveTempIds(test: (name: string) => boolean): number[] {
+        const out: number[] = [];
+        for (const [id, entry] of this.temp) if (!entry.dead && test(String(id))) out.push(id);
+        return out.sort((a, b) => a - b);
+    }
+
+    /** Whether a temp timer is present and not killed — what exists() counts. */
+    hasLiveTemp(id: number): boolean {
+        const entry = this.temp.get(id);
+        return !!entry && !entry.dead;
+    }
+
+    /** The executeFn the last loadPerm was given, for a timer started from
+     *  outside it (an offset timer under a temporary parent, see switchOne). */
+    private executeFn: ExecuteFn | null = null;
 
     /**
      * Cached previous load. `nodes` is the TimerNode keyed by id, `desc` is the
@@ -295,6 +380,9 @@ export class TimerEngine {
 
     loadPerm(timers: TimerNode[], executeFn: ExecuteFn, broken: ReadonlySet<string> = new Set()): void {
         this.broken = broken;
+        this.executeFn = executeFn;
+        this.tempParentRefs.clear();
+        for (const t of timers) if (isTempParentRef(t.parentId)) this.tempParentRefs.add(t.parentId);
         const tree = permTree(timers);
         const { enabledIds, isOffset } = tree;
         const runnable = (t: TimerNode): boolean => enabledIds.has(t.id) && !broken.has(t.id);
@@ -331,7 +419,10 @@ export class TimerEngine {
                 continue;
             }
 
-            const wantRun = runnable(timer) && !(timer.isGroup && !timer.code);
+            // A folder never fires, whatever script or time it carries:
+            // TTimer::execute stops a folder's QTimer and returns before the
+            // body, so only the timers inside it run.
+            const wantRun = runnable(timer) && !timer.isGroup;
             if (!wantRun) {
                 // Drop any live handle for an item that is no longer enabled.
                 if (isLive) this.killPermHandle(timer.id);
@@ -360,6 +451,19 @@ export class TimerEngine {
         for (const [k, v] of nextDesc) this.prevDesc.set(k, v);
         this.permNameToId.clear();
         for (const [k, v] of nextNames) this.permNameToId.set(k, v);
+    }
+
+    /**
+     * Raise the runtime active flags of a profile's permanent timers as its
+     * load leaves them, without arming anything yet. Desktop builds and
+     * activates the timers from the profile XML before any script compiles,
+     * so a script body that runs at load already sees them active, and an
+     * enableTimer/disableTimer it calls is a transition from that state rather
+     * than from "never seen" — which left every other timer reporting inactive
+     * for good. {@link loadPerm} arms them afterwards.
+     */
+    seedPerm(timers: TimerNode[]): void {
+        this.reconcileActive(permTree(timers));
     }
 
     /**
@@ -445,8 +549,17 @@ export class TimerEngine {
             return;
         }
         // An offset timer is reported by its switch, and its own flag belongs
-        // to its parent's firing (TTimer::execute).
-        if (isOffset(t)) return;
+        // to its parent's firing (TTimer::execute). Enabling it is a start of
+        // its own all the same: TTimer::enableTimer starts its QTimer once
+        // (when it and every ancestor can be unlocked), and its own execute()
+        // deactivates it after that one fire. Under a permanent parent the
+        // parent's next fire re-arms it as usual; under a TEMPORARY one
+        // nothing ever does — a temp timer's execute() returns before its
+        // children loop — so this one fire is all there is.
+        if (isOffset(t)) {
+            this.startOffsetOnce(t, enabledIds);
+            return;
+        }
         // setIsActive(true) raises the flag whatever the ancestors say...
         if (t.enabled) this.activePerm.add(t.id);
         // ...and a folder then walks its non-offset descendants with
@@ -500,6 +613,27 @@ export class TimerEngine {
         return tree.isOffset(node) || this.activePerm.has(node.id);
     }
 
+    /** Start a permanent offset timer once, as enabling it does — see
+     *  switchOne. Not while it or an ancestor is switched off, or a temporary
+     *  parent is killed (canBeUnlocked asks the parents too), and not one
+     *  without a script: TTimer::enableTimer keeps a command-only offset timer
+     *  to its parent's firing, which would otherwise give it a schedule of its
+     *  own. */
+    private startOffsetOnce(t: TimerNode, enabledIds: ReadonlySet<string>): void {
+        const executeFn = this.executeFn;
+        if (!executeFn || !t.enabled || !t.code || this.broken.has(t.id)) return;
+        if (isTempParentRef(t.parentId)) {
+            const parent = this.temp.get(tempRefId(t.parentId)!);
+            if (!parent || parent.dead || parent.disabled) return;
+        } else if (!enabledIds.has(t.id)) {
+            return;
+        }
+        this.killPermHandle(t.id);
+        this.startPerm(t, executeFn, false);
+        this.prevDesc.set(t.id, this.descOf(t));
+        if (!this.permNameToId.has(t.name)) this.permNameToId.set(t.name, t.id);
+    }
+
     /** (Re)start every enabled offset timer hanging off `parentId`, each due
      *  its own interval from now. A child still pending from the previous
      *  parent tick is restarted, as QTimer::start does on a running timer. */
@@ -524,10 +658,15 @@ export class TimerEngine {
             // and leave the timer armed for the next one. Re-armed before the
             // body runs, so a body that disables its own timer (which reloads
             // the engine and kills this handle) stays disabled.
-            const tick = (): void => { arm(); fire(); };
+            // A body slower than the interval pushes the next tick a full
+            // interval past its return — see rearmIfOverdue.
+            const tick = (): void => {
+                arm();
+                try { fire(); } finally { this.rearmIfOverdue(this.perm, timer.id); }
+            };
             const arm = (): void => {
-                const handle = setTimeout(tick, intervalMs);
-                this.perm.set(timer.id, { handle, repeat: true, start: Date.now(), intervalMs, fire: tick });
+                const handle = this.clock.setTimeout(tick, intervalMs);
+                this.perm.set(timer.id, { handle, repeat: true, start: Date.now(), intervalMs, fire: tick, arm });
             };
             arm();
         } else {
@@ -538,7 +677,7 @@ export class TimerEngine {
                     this.permNameToId.delete(timer.name);
                 }
             };
-            const handle = setTimeout(() => { retire(); fire(); }, intervalMs);
+            const handle = this.clock.setTimeout(() => { retire(); fire(); }, intervalMs);
             this.perm.set(timer.id, {
                 handle, repeat: false, start, intervalMs,
                 fire: () => { retire(); fire(); },
@@ -549,7 +688,7 @@ export class TimerEngine {
     private killPermHandle(id: string): void {
         const entry = this.perm.get(id);
         if (!entry) return;
-        clearTimeout(entry.handle);
+        this.clock.clearTimeout(entry.handle);
         this.perm.delete(id);
         this.prevDesc.delete(id);
     }
@@ -589,7 +728,8 @@ export class TimerEngine {
         // A killed timer is still present until the reap, but it is stopped — so
         // it reports as inactive, not as an unknown id. That distinction is what
         // tells a caller the timer it just killed is really the one it found.
-        if (entry.dead || entry.disabled) return -1;
+        // A temp timer inside its own callback is stopped as well (see addTemp).
+        if (entry.dead || entry.disabled || entry.firing) return -1;
         const elapsed = Date.now() - entry.start;
         const ms = entry.repeat
             ? entry.intervalMs - (elapsed % entry.intervalMs)
@@ -598,7 +738,7 @@ export class TimerEngine {
     }
 
     private stopPerm(): void {
-        for (const { handle } of this.perm.values()) clearTimeout(handle);
+        for (const { handle } of this.perm.values()) this.clock.clearTimeout(handle);
         this.perm.clear();
         this.offsetChildren.clear();
         this.activePerm.clear();
@@ -609,11 +749,10 @@ export class TimerEngine {
     }
 
     destroy(): void {
-        for (const { handle, repeat } of this.temp.values()) {
-            if (repeat) clearInterval(handle as unknown as number);
-            else clearTimeout(handle);
-        }
+        for (const { handle } of this.temp.values()) this.clock.clearTimeout(handle);
         this.temp.clear();
+        this.orphanedParents.clear();
+        this.tempParentRefs.clear();
         this.stopPerm();
     }
 }

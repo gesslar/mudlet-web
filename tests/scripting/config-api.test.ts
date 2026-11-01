@@ -58,6 +58,35 @@ describe('setConfig / getConfig', () => {
         expect(h.run('return getConfig("autoClearInputLine")')).toBe(true);
     });
 
+    // The map keys live on the Host and a mapper made later picks them up, so
+    // desktop takes them before there is one (its setConfig guards them on
+    // host.mpMap alone, which every profile has).
+    it('takes the map keys before a mapper exists', () => {
+        expect(h.session.windows.hasMapper()).toBe(false);
+        expect(h.run('return getConfig("mapRoomSize")')).toBe(5);
+        expect(h.run('return getConfig("mapExitSize")')).toBe(10);
+        for (const [key, value] of [
+            ['mapRoomSize', '5'], ['mapExitSize', '10'], ['mapRoundRooms', 'true'],
+            ['showRoomIdsOnMap', 'true'], ['mapShowRoomBorders', 'false'], ['mapShowGrid', 'true'],
+            ['showUpperLowerLevels', 'false'], ['show3dMapView', 'false'],
+            ['showMapInfo', '"x"'], ['hideMapInfo', '"x"'],
+        ] as const) {
+            expect(h.run(`local ok, err = setConfig("${key}", ${value}) return tostring(ok) .. "|" .. tostring(err)`))
+                .toBe('true|nil');
+        }
+        expect(useAppStore.getState().connectionProfile[CONN]?.mapper?.roomShape).toBe('roundedRectangle');
+        h.run('setConfig("mapRoundRooms", false) setConfig("showRoomIdsOnMap", false)');
+        // and a value of the wrong type is the raised error it is for any key
+        expect(h.run('return (pcall(setConfig, "mapRoomSize", "big"))')).toBe(false);
+
+        // The map being shown makes the mapper, and it stays made.
+        h.session.windows.registerMapControl('config-api-test', {
+            getZoom: () => null, setZoom() {}, redraw() {}, exportArea: () => null,
+        });
+        h.session.windows.unregisterMapControl('config-api-test');
+        expect(h.session.windows.hasMapper()).toBe(true);
+    });
+
     it('maps mapper keys to renderer settings', () => {
         h.run('setConfig("mapRoundRooms", true)');
         expect(useAppStore.getState().connectionProfile[CONN]?.mapper?.roomShape).toBe('roundedRectangle');
@@ -99,9 +128,9 @@ describe('setConfig / getConfig', () => {
         expect(mapper()?.roomSize).toBeCloseTo(0.5, 10);
         expect(mapper()?.lineWidth).toBeCloseTo(0.05, 10);
 
-        // A non-positive room size is ignored (but still "known key" → true);
-        // an exit size below 1 is refused, since it divides the exit pen.
-        expect(h.run('return setConfig("mapRoomSize", 0)')).toBe(true);
+        // A room size below 1 is refused, as is an exit size below 1, since it
+        // divides the exit pen.
+        expect(h.run('return select(2, setConfig("mapRoomSize", 0))')).toBe('mapRoomSize must be at least 1, got 0');
         expect(h.run('return select(2, setConfig("mapExitSize", -1))')).toContain('at least 1');
         expect(h.run('return select(2, setConfig("mapExitSize", 0/0))')).toContain('at least 1');
         expect(h.run('return select(2, setConfig("mapExitSize", 0.5))')).toContain('at least 1');

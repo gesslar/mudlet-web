@@ -31,11 +31,14 @@ describe('server encoding names', () => {
     });
 
     it('refuses one it cannot decode', () => {
-        // Shift JIS is in the browser's own set but not in Mudlet's list, so it
-        // is a name that reads plausibly and still has to be refused — the list
-        // is the contract, not whatever TextDecoder happens to accept.
-        expect(canonicalServerEncoding('SHIFT_JIS')).toBeNull();
+        // ISO-2022-JP is in the browser's own set but not in Mudlet's list, so
+        // it is a name that reads plausibly and still has to be refused — the
+        // list is the contract, not whatever TextDecoder happens to accept.
+        expect(canonicalServerEncoding('ISO-2022-JP')).toBeNull();
         expect(canonicalServerEncoding('')).toBeNull();
+        // Shift_JIS and EUC-JP joined Mudlet's list
+        expect(canonicalServerEncoding('SHIFT_JIS')).toBe('SHIFT_JIS');
+        expect(canonicalServerEncoding('euc-jp')).toBe('EUC-JP');
     });
 
     // BIG5 and BIG5-HKSCS share a decoder, so a canonicaliser that resolved
@@ -94,10 +97,12 @@ describe('SessionCodec.encodeOutgoing', () => {
         expect(bytes(codec.encodeOutgoing('ląka'))).toEqual([0x6c, 0xb1, 0x6b, 0x61]);
     });
 
-    it('substitutes ? for a character the codepage has no byte for', () => {
+    // Desktop writes these pages through ICU, whose substitute is SUB, not '?'
+    // (Mudlet/mudlet-web#351).
+    it('substitutes SUB for a character the codepage has no byte for', () => {
         const codec = new SessionCodec();
         codec.trySetEncoding('iso-8859-2');
-        expect(codec.encodeOutgoing('a一b')).toBe('a?b');
+        expect(codec.encodeOutgoing('a一b')).toBe('a\x1ab');
     });
 });
 
@@ -169,8 +174,9 @@ describe('SessionCodec.encodeOutgoing — multi-byte encodings', () => {
 
     it('holds EUC-KR to KS X 1001, which is all Mudlet reads', () => {
         // 똠 is UHC-only (0x8C 0x63): the browser decodes it, but a game that
-        // declared EUC-KR need not
-        expect(via('EUC-KR').encodeOutgoing('똠')).toBe('?');
+        // declared EUC-KR need not. What goes out instead is ICU's double-byte
+        // substitute, as desktop writes it (Mudlet/mudlet-web#351).
+        expect(bytes(via('EUC-KR').encodeOutgoing('똠'))).toEqual([0xaf, 0xfe]);
     });
 
     it('round-trips through the inbound decoder', () => {

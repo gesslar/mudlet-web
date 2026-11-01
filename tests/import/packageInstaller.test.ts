@@ -8,6 +8,7 @@
 import { describe, it, expect } from 'vitest';
 import { zipSync, strToU8 } from 'fflate';
 import {
+    archiveXmlEntries,
     installPackageFromBytes,
     preparePackageInstall,
 } from '../../src/import/packageInstaller';
@@ -65,6 +66,7 @@ function stubVfs(): FakeVfs {
     return {
         profilePath: '/profiles/test',
         exists: (p: string) => dirs.has(p) || files.has(p),
+        stat: (p: string) => (files.has(p) ? { type: 'file' } : dirs.has(p) ? { type: 'dir' } : null),
         mkdir: (p: string) => { dirs.add(p.replace(/\/$/, '')); },
         rmdir: (p: string) => {
             for (const d of [...dirs]) if (under(p, d)) dirs.delete(d);
@@ -128,15 +130,19 @@ describe('preparePackageInstall', () => {
         expect(vfs.exists(PKG_DIR)).toBe(false);
     });
 
-    it('replaces the previous copy on commit rather than merging into it', () => {
+    it('moves into a folder of its name already there, keeping what else is in it', () => {
+        // Host::installPackage moves an archive into a folder an uninstall or a
+        // crash left behind, entry by entry: the archive's own files replace
+        // theirs, and anything else in the folder stays.
         const vfs = stubVfs();
         installPackageFromBytes('mypkg.mpackage', goodArchive(), vfs);
         vfs.writeFile(`${PKG_DIR}/stale.txt`, 'left over from the old install');
+        vfs.writeFile(`${PKG_DIR}/mypkg.xml`, 'not the package XML');
 
         const second = zipSync({ 'mypkg.xml': strToU8(XML) });
         installPackageFromBytes('mypkg.mpackage', second, vfs);
-        expect(vfs.exists(`${PKG_DIR}/stale.txt`)).toBe(false);
-        expect(vfs.exists(`${PKG_DIR}/mypkg.xml`)).toBe(true);
+        expect(vfs.exists(`${PKG_DIR}/stale.txt`)).toBe(true);
+        expect(vfs.readFile(`${PKG_DIR}/mypkg.xml`)).toBe(XML);
     });
 
     it('keeps a source archive staged inside the package dir', () => {
@@ -163,5 +169,22 @@ describe('preparePackageInstall', () => {
         expect(() => prepared.commit()).toThrow('quota exceeded');
         // Half an unpack is worse than none: it looks like an installed package.
         expect(vfs.exists(PKG_DIR)).toBe(false);
+    });
+});
+
+// mudlet-web#328 item 6: Host::installPackage imports every .xml at the root of
+// the unpacked archive, in QDir's name order (ignoring case).
+describe('archiveXmlEntries', () => {
+    it('takes every root-level XML, sorted by name ignoring case', () => {
+        expect(archiveXmlEntries(['config.lua', 'b.xml', 'A.xml', 'c.XML', 'sub/d.xml']))
+            .toEqual(['A.xml', 'b.xml', 'c.XML']);
+    });
+
+    it('falls back to the first nested XML when the root has none', () => {
+        expect(archiveXmlEntries(['config.lua', 'pkg/inner.xml', 'pkg/other.xml'])).toEqual(['pkg/inner.xml']);
+    });
+
+    it('is empty when the archive holds no XML at all', () => {
+        expect(archiveXmlEntries(['config.lua', 'img.png'])).toEqual([]);
     });
 });

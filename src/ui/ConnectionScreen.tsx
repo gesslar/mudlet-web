@@ -106,7 +106,14 @@ export function ConnectionScreen({ connections, connecting, connectingId, onConn
      *  folded-in module, and the file/map copy — so this is the one place that
      *  has to read them. */
     const provision = async (bundle: MudletProfileBundle) => {
-        await importMudletProfile(bundle);
+        const connectionId = await importMudletProfile(bundle);
+        // A password desktop kept in the profile folder goes where Mudlet Web
+        // keeps saved logins — the encrypted vault, setting it up or unlocking
+        // it first if need be — and never into the profile's files.
+        if (bundle.password) {
+            if (vaultSaver.canSave) vaultSaver.save(connectionId, bundle.password);
+            else bundle.warnings.push('The saved password was not imported: this browser has nowhere secure to keep it. Enter it again when you connect.');
+        }
         if (bundle.warnings.length > 0) {
             setImportWarnings(w => [...w, { profile: bundle.name, warnings: [...bundle.warnings] }]);
         }
@@ -116,7 +123,7 @@ export function ConnectionScreen({ connections, connecting, connectingId, onConn
     // rest, otherwise provision the profile immediately.
     const beginImport = async (bundle: MudletProfileBundle) => {
         const { resolved, unresolved } = resolveModulesFromTree(bundle);
-        for (const r of resolved) addModuleToBundle(bundle, r.ref.key, r.xmlBytes);
+        for (const r of resolved) addModuleToBundle(bundle, r.ref, r.xmlBytes, r.path);
         if (unresolved.length) { setPendingImports(q => [...q, { bundle, unresolved }]); return; }
         await provision(bundle);
     };
@@ -132,7 +139,17 @@ export function ConnectionScreen({ connections, connecting, connectingId, onConn
     const handleLinkFolder = () => {
         if (!dirPicker) return;
         setImportWarnings([]);
-        void runImport(async () => { await linkMudletFolder(await dirPicker.call(window)); });
+        void runImport(async () => {
+            const dir = await dirPicker.call(window);
+            const { connectionId, password, warnings } = await linkMudletFolder(dir);
+            // As an import does with it (see provision) — the folder's own copy
+            // stays put, since desktop still reads it.
+            if (password) {
+                if (vaultSaver.canSave) vaultSaver.save(connectionId, password);
+                else warnings.push('The saved password was not imported: this browser has nowhere secure to keep it. Enter it again when you connect.');
+            }
+            if (warnings.length > 0) setImportWarnings(w => [...w, { profile: dir.name, warnings: [...warnings] }]);
+        });
     };
 
     // A whole-origin backup taken from a previous Mudlet Web address, written by
@@ -172,7 +189,9 @@ export function ConnectionScreen({ connections, connecting, connectingId, onConn
         if (!p) return;
         setPendingImports(q => q.slice(1));
         void runImport(async () => {
-            for (const u of uploads) addModuleToBundle(p.bundle, u.key, u.bytes);
+            for (const u of uploads) {
+                addModuleToBundle(p.bundle, p.unresolved.find(m => m.key === u.key) ?? u.key, u.bytes);
+            }
             await provision(p.bundle);
         });
     };

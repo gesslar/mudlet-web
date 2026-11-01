@@ -2,6 +2,7 @@ import * as http from 'http';
 import * as net from 'net';
 import * as tls from 'tls';
 import { WebSocketServer, WebSocket } from 'ws';
+import { armGameKeepAlive } from './gameSocket';
 
 const PORT = parseInt(process.env.PORT ?? '3001', 10);
 
@@ -19,6 +20,11 @@ const CORS_HEADERS: Record<string, string> = {
 // the reason as Mudlet (Qt) would word it — HttpService reports that text
 // instead of a generic 502. Must match PROXY_ERROR_HEADER there.
 const PROXY_ERROR_HEADER = 'X-Mudlet-Proxy-Error';
+
+// Set when the target redirected: the url the reply came from. The browser
+// only sees the proxy's own url, and Mudlet reports the final one. Must match
+// PROXY_FINAL_URL_HEADER in HttpService.
+const FINAL_URL_HEADER = 'X-Mudlet-Final-Url';
 
 function fetchFailureReason(err: unknown, host: string): string {
     const cause = (err as { cause?: { code?: string } })?.cause;
@@ -111,6 +117,7 @@ async function forwardHttp(req: http.IncomingMessage, res: http.ServerResponse, 
         if (lk === 'content-encoding' || lk === 'content-length' || lk === 'transfer-encoding') return;
         outHeaders[k] = v;
     });
+    if (upstream.redirected) outHeaders[FINAL_URL_HEADER] = upstream.url;
     Object.assign(outHeaders, CORS_HEADERS);
     res.writeHead(upstream.status, outHeaders);
 
@@ -287,6 +294,8 @@ wss.on('connection', (ws, req) => {
 
     if (tlsPrefs.enabled) {
         const secure = tls.connect({ host, port, servername: host, rejectUnauthorized: false });
+        // Keepalive on, as on the plain path below: see gameSocket.ts (issue #454).
+        armGameKeepAlive(secure);
         secure.on('secureConnect', () => {
             tcpConnected = true;
             const cert = secure.getPeerCertificate();
@@ -320,7 +329,7 @@ wss.on('connection', (ws, req) => {
         });
         tcp = secure;
     } else {
-        tcp = net.connect(port, host);
+        tcp = armGameKeepAlive(net.connect(port, host));
         tcp.on('connect', () => {
             tcpConnected = true;
             console.log(`[proxy] Connected to ${host}:${port}`);

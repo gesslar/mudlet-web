@@ -11,7 +11,7 @@ import { isPackageRemovable } from '../../../import/defaultPackages';
 import { DEFAULT_ANSI_PALETTE } from '../../../mud/text/colors';
 import { colorPatternText, parseColorPattern } from '../../../mud/triggers/legacyColorPatterns';
 import type { AliasNode, ButtonLocation, ButtonNode, ButtonOrientation, ButtonRotation, KeyNode, PackageManifest, ScriptNode, TimerNode, TriggerNode, TriggerPattern, TriggerPatternType } from '../../../storage/schema';
-import { asButtonRotation, clampFillerOffset, isColorizing, isEffectivelyEnabled, MAX_CONDITION_LINE_DELTA } from '../../../storage/schema';
+import { asButtonRotation, clampFillerOffset, isColorizing, isEffectivelyEnabled, MAX_CONDITION_LINE_DELTA, visibleTreeNodes } from '../../../storage/schema';
 import type { MudSession, ScriptLogSource, ScriptLogSourceKind } from '../../../mud/MudSession';
 import type { ProfileVFS } from '../../../scripting/vfs/ProfileVFS';
 import type { ScriptingEngine } from '../../../scripting/ScriptingEngine';
@@ -24,6 +24,7 @@ import { DEFAULT_PROXY_URL } from '../../../storage';
 import { renderMarkdown } from '../../markdown';
 import { useDebounced } from '../../search/useDebounced';
 import xterm256 from '../../../mud/text/xterm256';
+import { bindingFromEvent } from '../../../mud/keybindings/qtKeys';
 import './ScriptEditorPanel.css';
 
 type Category = 'scripts' | 'aliases' | 'triggers' | 'timers' | 'keys' | 'buttons' | 'packages' | 'errors' | 'variables';
@@ -112,9 +113,11 @@ function formatCode(code: string): string {
     return code;
 }
 
-function formatKeyCombo(key: string, modifiers: string[]): string {
+function formatKeyCombo(key: string, modifiers: string[], qtKey?: number): string {
+    // A key bound only by the character it types (AZERTY's é) has no code.
+    if (!key && qtKey !== undefined && qtKey > 0) key = String.fromCharCode(qtKey).toLowerCase();
     if (!key) return '';
-    const parts = [...modifiers.map(m => m[0].toUpperCase() + m.slice(1)), formatCode(key)];
+    const parts = [...modifiers.filter(m => m !== 'keypad' || !key.startsWith('Numpad')).map(m => m[0].toUpperCase() + m.slice(1)), formatCode(key)];
     return parts.join('+');
 }
 
@@ -845,10 +848,17 @@ export const ScriptEditorPanel = forwardRef<ScriptEditorPanelHandle, ScriptEdito
     }, []);
 
     const scripts     = useAppStore(s => s.connectionScripts[connectionId] ?? EMPTY);
-    const aliases     = useAppStore(s => s.connectionAliases[connectionId] ?? EMPTY);
-    const triggers    = useAppStore(s => s.connectionTriggers[connectionId] ?? EMPTY);
-    const timers      = useAppStore(s => s.connectionTimers[connectionId] ?? EMPTY);
-    const keybindings = useAppStore(s => s.connectionKeybindings[connectionId] ?? EMPTY);
+    // A permanent item a script hung under a temporary one is the session's
+    // alone — desktop drops it with its temporary parent's subtree on save —
+    // so it is not offered for editing (see visibleTreeNodes).
+    const aliasesAll  = useAppStore(s => s.connectionAliases[connectionId] ?? EMPTY);
+    const triggersAll = useAppStore(s => s.connectionTriggers[connectionId] ?? EMPTY);
+    const timersAll   = useAppStore(s => s.connectionTimers[connectionId] ?? EMPTY);
+    const keysAll     = useAppStore(s => s.connectionKeybindings[connectionId] ?? EMPTY);
+    const aliases     = useMemo(() => visibleTreeNodes(aliasesAll), [aliasesAll]);
+    const triggers    = useMemo(() => visibleTreeNodes(triggersAll), [triggersAll]);
+    const timers      = useMemo(() => visibleTreeNodes(timersAll), [timersAll]);
+    const keybindings = useMemo(() => visibleTreeNodes(keysAll), [keysAll]);
     const buttons     = useAppStore(s => s.connectionButtons[connectionId] ?? EMPTY);
 
     const addScript        = useAppStore(s => s.addScript);
@@ -925,6 +935,9 @@ export const ScriptEditorPanel = forwardRef<ScriptEditorPanelHandle, ScriptEdito
             // engine's store subscription synchronously loads them into Lua
             // before this call returns. By the time notifyPackageInstalled
             // raises sysInstallPackage, all handlers are already registered.
+            // The package's saved variables go into _G (and onto the
+            // save-list) first, so its scripts see them as they load.
+            scriptingEngineRef?.current?.loadPackageVariables(data);
             installPackage(connectionId, manifest, data);
             scriptingEngineRef?.current?.notifyPackageInstalled(manifest.name);
             const total = data.scripts.length + data.aliases.length + data.triggers.length + data.timers.length + data.keys.length;
@@ -948,6 +961,7 @@ export const ScriptEditorPanel = forwardRef<ScriptEditorPanelHandle, ScriptEdito
         // same store state and emit the same sysInstallPackage event as a file import.
         const { manifest, data } = installPackageFromBytes(entry.filename, bytes, vfs);
         await vfs.flush();
+        scriptingEngineRef?.current?.loadPackageVariables(data);
         installPackage(connectionId, manifest, data);
         scriptingEngineRef?.current?.notifyPackageInstalled(manifest.name);
         const total = data.scripts.length + data.aliases.length + data.triggers.length + data.timers.length + data.keys.length;
@@ -1017,9 +1031,13 @@ export const ScriptEditorPanel = forwardRef<ScriptEditorPanelHandle, ScriptEdito
     const handleReloadModule = useCallback((moduleName: string) => {
         const engine = scriptingEngineRef?.current;
         if (!engine) return;
-        const ok = engine.reloadModuleFromFile(moduleName);
+        const { ok, error } = engine.reloadModuleFromFile(moduleName);
         const now = new Date();
-        setLogs(prev => [...prev, { text: ok ? `Reloaded module "${moduleName}" from file` : `Reload failed for "${moduleName}"`, level: ok ? 'info' : 'error', timestamp: now }]);
+        setLogs(prev => [...prev, {
+            text: ok ? `Reloaded module "${moduleName}" from file` : `Reload failed for "${moduleName}": ${error}`,
+            level: ok ? 'info' : 'error',
+            timestamp: now,
+        }]);
     }, [scriptingEngineRef]);
 
     const handleToggleModuleSync = useCallback((moduleName: string, sync: boolean) => {
@@ -1080,6 +1098,7 @@ export const ScriptEditorPanel = forwardRef<ScriptEditorPanelHandle, ScriptEdito
     // Key extra
     const [editKey, setEditKey]               = useState('');
     const [editModifiers, setEditModifiers]   = useState<string[]>([]);
+    const [editQtKey, setEditQtKey]           = useState<number | undefined>(undefined);
     const [capturing, setCapturing]           = useState(false);
     const [editKeyCommand, setEditKeyCommand] = useState('');
     // Timer extra (command)
@@ -1440,6 +1459,7 @@ export const ScriptEditorPanel = forwardRef<ScriptEditorPanelHandle, ScriptEdito
             const k = selected as KeyNode;
             setEditKey(k.key);
             setEditModifiers(k.modifiers);
+            setEditQtKey(k.qtKey);
             setEditKeyCommand(k.command ?? '');
         }
         if (category === 'buttons') {
@@ -1510,13 +1530,12 @@ export const ScriptEditorPanel = forwardRef<ScriptEditorPanelHandle, ScriptEdito
             e.stopImmediatePropagation();
             if (e.code === 'Escape') { setCapturing(false); return; }
             if (MODIFIER_KEYS.has(e.key)) return;
-            const mods: string[] = [];
-            if (e.ctrlKey)  mods.push('ctrl');
-            if (e.shiftKey) mods.push('shift');
-            if (e.altKey)   mods.push('alt');
-            if (e.metaKey)  mods.push('meta');
-            setEditKey(e.code);
-            setEditModifiers(mods);
+            // Recorded as desktop's recorder would: the Qt key the press
+            // produced, and a NumLock-off numpad key as its own Keypad key.
+            const recorded = bindingFromEvent(e);
+            setEditKey(recorded.key);
+            setEditModifiers(recorded.modifiers);
+            setEditQtKey(recorded.qtKey);
             setCapturing(false);
             setDirty(true);
         };
@@ -1654,7 +1673,11 @@ export const ScriptEditorPanel = forwardRef<ScriptEditorPanelHandle, ScriptEdito
         } else if (category === 'triggers') {
             id = addTrigger(connectionId, {
                 name: asGroup ? 'New Group' : 'New Trigger',
-                patterns: asGroup ? [] : [{ text: '', type: 'regex' }],
+                // Substring, as desktop's editor starts a pattern row
+                // (dlgTriggerEditor REGEX_SUBSTRING, index 0): `[OOC]` or
+                // `(glowing) sword` typed into a new trigger is literal text
+                // there, not a regex (mudlet-web#452).
+                patterns: asGroup ? [] : [{ text: '', type: 'substring' }],
                 language: 'lua',
                 code: '',
                 enabled: true,
@@ -1665,6 +1688,13 @@ export const ScriptEditorPanel = forwardRef<ScriptEditorPanelHandle, ScriptEdito
                 multiline: false,
                 delta: 0,
                 isFilter: false,
+                // TTrigger's own defaults: colorizer off, with red on yellow
+                // ready, so ticking Highlight paints what its swatches show
+                // (TTrigger.h mFgColor{Qt::red}, mBgColor{Qt::yellow};
+                // mudlet-web#452). `colorize` must be explicit — a stored
+                // highlight alone reads as the switch being on.
+                colorize: false,
+                highlight: { fg: '#ff0000', bg: '#ffff00' },
             });
         } else if (category === 'timers') {
             id = addTimer(connectionId, {
@@ -1796,7 +1826,7 @@ export const ScriptEditorPanel = forwardRef<ScriptEditorPanelHandle, ScriptEdito
             const seconds = editHours * 3600 + editMinutes * 60 + editSecs + editMs / 1000;
             updateTimer(connectionId, targetId, { name: editName, seconds, repeat: editRepeat, language: 'lua', code: editCode, command: editTimerCommand || undefined });
         } else if (targetCategory === 'keys') {
-            updateKeybinding(connectionId, targetId, { name: editName, key: editKey, modifiers: editModifiers, language: 'lua', code: editCode, command: editKeyCommand || undefined });
+            updateKeybinding(connectionId, targetId, { name: editName, key: editKey, modifiers: editModifiers, qtKey: editQtKey, language: 'lua', code: editCode, command: editKeyCommand || undefined });
         } else {
             // buttons
             if (target.isGroup) {
@@ -2268,7 +2298,7 @@ export const ScriptEditorPanel = forwardRef<ScriptEditorPanelHandle, ScriptEdito
                                     )}
                                     {'key' in item && (item as KeyNode).key && (
                                         <span className="script-editor__item-key">
-                                            {formatKeyCombo((item as KeyNode).key, (item as KeyNode).modifiers)}
+                                            {formatKeyCombo((item as KeyNode).key, (item as KeyNode).modifiers, (item as KeyNode).qtKey)}
                                         </span>
                                     )}
                                 </span>
@@ -2668,7 +2698,7 @@ export const ScriptEditorPanel = forwardRef<ScriptEditorPanelHandle, ScriptEdito
                                             title={editPatterns.length >= MAX_TRIGGER_PATTERNS
                                                 ? `Mudlet shows at most ${MAX_TRIGGER_PATTERNS} patterns per trigger`
                                                 : undefined}
-                                            onClick={() => { setEditPatterns([...editPatterns, { text: '', type: 'regex' }]); setDirty(true); }}
+                                            onClick={() => { setEditPatterns([...editPatterns, { text: '', type: 'substring' }]); setDirty(true); }}
                                         >+ Add pattern</button>
                                     </div>
                                 </div>
@@ -2903,7 +2933,7 @@ export const ScriptEditorPanel = forwardRef<ScriptEditorPanelHandle, ScriptEdito
                                     >
                                         {capturing
                                             ? 'Press a key… (Esc to cancel)'
-                                            : (formatKeyCombo(editKey, editModifiers) || 'Click to capture key')}
+                                            : (formatKeyCombo(editKey, editModifiers, editQtKey) || 'Click to capture key')}
                                     </button>
                                 </div>
                                 {!selected.isGroup && (

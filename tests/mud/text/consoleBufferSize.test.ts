@@ -3,6 +3,7 @@ import { MudSession } from '../../../src/mud/MudSession';
 import {
     Console,
     DEFAULT_CONSOLE_BUFFER_SIZE,
+    MAIN_CONSOLE_BUFFER_SIZE,
     MIN_CONSOLE_BUFFER_SIZE,
     MAX_CONSOLE_BUFFER_SIZE,
     consoleBatchDeleteSize,
@@ -17,12 +18,18 @@ describe('Console scrollback defaults', () => {
         expect(con.batchDeleteSize).toBe(DEFAULT_CONSOLE_BUFFER_SIZE / 10);
     });
 
-    it('keeps that many lines before evicting', () => {
+    it('keeps that many lines, the open one included, before evicting', () => {
         const con = new Console();
-        for (let i = 0; i < DEFAULT_CONSOLE_BUFFER_SIZE; i++) con.echo(`line ${i}\n`);
-        // getLineCount() is the 0-indexed last line, so nothing has been dropped.
-        expect(con.getLineCount()).toBe(DEFAULT_CONSOLE_BUFFER_SIZE - 1);
+        // Mudlet bounds buffer.size(), which counts the empty line every echo
+        // ending in a newline leaves open — so limit - 1 complete lines fit.
+        for (let i = 0; i < DEFAULT_CONSOLE_BUFFER_SIZE - 1; i++) con.echo(`line ${i}\n`);
+        // getLineCount() is the 0-indexed last complete line, so nothing has
+        // been dropped.
+        expect(con.getLineCount()).toBe(DEFAULT_CONSOLE_BUFFER_SIZE - 2);
         expect(con.getLines(0, 1)).toEqual(['line 0']);
+        // and the line that fills the buffer is the one that trims it
+        con.echo('one more\n');
+        expect(con.getLines(0, 1)).not.toEqual(['line 0']);
     });
 });
 
@@ -37,12 +44,38 @@ describe('MudSession.setConsoleBufferSize', () => {
         return { session, main };
     }
 
-    it('defaults to Mudlet\'s buffer size with a 5% batch', () => {
+    // mudlet-web#341 item 1: desktop's getConsoleBufferSize("main") on a fresh
+    // profile is 100000 20000 — Host::mConsoleBufferSize, not TBuffer's 10,000.
+    it('defaults to the Host\'s main buffer size with its batch', () => {
         const { session, main } = sessionWithMain();
-        expect(session.consoleBufferSize).toBe(DEFAULT_CONSOLE_BUFFER_SIZE);
-        expect(main.maxLines).toBe(DEFAULT_CONSOLE_BUFFER_SIZE);
-        expect(main.batchDeleteSize).toBe(consoleBatchDeleteSize(DEFAULT_CONSOLE_BUFFER_SIZE));
-        expect(main.batchDeleteSize).toBe(2000);
+        expect(session.consoleBufferSize).toBe(MAIN_CONSOLE_BUFFER_SIZE);
+        expect(main.maxLines).toBe(100_000);
+        expect(main.batchDeleteSize).toBe(consoleBatchDeleteSize(MAIN_CONSOLE_BUFFER_SIZE));
+        expect(main.batchDeleteSize).toBe(20_000);
+    });
+
+    it('keeps 25,000 lines of main scrollback without a trim', () => {
+        const { main } = sessionWithMain();
+        let shrinks = 0;
+        main.onBufferShrink = () => { shrinks++; };
+        for (let i = 0; i < 25_000; i++) main.echo(`L${i}\n`);
+        expect(shrinks).toBe(0);
+        expect(main.getLines(0, 1)).toEqual(['L0']);
+    });
+
+    it('takes a size a script saved without re-applying its own batch', () => {
+        const { session, main } = sessionWithMain();
+        main.setMaxLines(5000);
+        main.setBatchDeleteSize(500);
+        session.noteScriptedConsoleBufferSize(5000, false);
+        // the saved preference comes back through the store…
+        session.setConsoleBufferSize(5000, false);
+        expect(main.maxLines).toBe(5000);
+        expect(main.batchDeleteSize).toBe(500);
+        // …and a later preference change applies as usual.
+        session.setConsoleBufferSize(6000, false);
+        expect(main.maxLines).toBe(6000);
+        expect(main.batchDeleteSize).toBe(1200);
     });
 
     it('resizes the live main console', () => {
@@ -125,13 +158,14 @@ describe('evict never removes past the limit', () => {
         // The batch is still 1,000 here: setMaxLines evicts immediately, so the
         // pair is inconsistent for exactly one call — which is all it took.
         c.setMaxLines(100);
-        expect(held(c)).toBe(100);
+        // 99 complete lines and the open one: Mudlet's limit counts both.
+        expect(held(c)).toBe(99);
     });
 
     it('leaves a large buffer trimmed to the limit, not emptied', () => {
         const c = filled(3000);
         c.setMaxLines(100);
-        expect(held(c)).toBe(100);
+        expect(held(c)).toBe(99);
     });
 
     it('goes on trimming as new lines arrive, so line indices keep moving', () => {

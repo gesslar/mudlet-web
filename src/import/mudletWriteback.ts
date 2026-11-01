@@ -1,7 +1,8 @@
 import type { ProfileSettings } from '../storage/schema';
 import { serializeMudletXml, type SerializeInput } from './mudletXmlExport';
 import { serializeVariablePackage, type MudletVariablePackage } from './mudletVariables';
-import { applyInstalledPackages, applyProfileSettingsToHost } from './mudletHost';
+import { applyInstalledPackages, applyProfileSettingsToHost, applyStopwatches } from './mudletHost';
+import type { SavedStopwatch } from '../scripting/StopwatchManager';
 
 // Link mode (phase 2): write the live Mudlet Web state back into a linked Mudlet
 // profile's XML *DOM-preservingly*. We parse the profile's current save, replace
@@ -57,6 +58,9 @@ export function buildLinkedWriteback(
      *  stands — right for an export whose base was already stamped, wrong for a
      *  save based on an older one, whose list predates any install since. */
     installedPackages?: string[],
+    /** The profile's persistent stopwatches, written into `<stopwatches>` as
+     *  desktop's save does. Left out, the base's own copy stands. */
+    stopwatches?: SavedStopwatch[],
 ): string {
     const doc = new DOMParser().parseFromString(baseXml, 'text/xml');
     const err = doc.getElementsByTagName('parsererror')[0];
@@ -68,6 +72,7 @@ export function buildLinkedWriteback(
     const host = doc.getElementsByTagName('Host')[0];
     if (host && settings) applyProfileSettingsToHost(host, settings);
     if (host && installedPackages) applyInstalledPackages(host, installedPackages);
+    if (host && stopwatches) applyStopwatches(host, stopwatches);
 
     // Drop the packages we own; HostPackage and unknown siblings stay.
     for (const child of Array.from(root.children)) {
@@ -89,7 +94,11 @@ export function buildLinkedWriteback(
         root.appendChild(doc.importNode(varRoot, true));
     }
 
-    const xml = new XMLSerializer().serializeToString(doc);
+    // A carriage return in any text goes out as a character reference.
+    // XMLSerializer writes it raw, and an XML reader turns a raw one (and a CR
+    // LF) into a plain line feed, so a saved string or script came back without
+    // it. The base was read by a parser, so the markup itself has none.
+    const xml = new XMLSerializer().serializeToString(doc).replace(/\r/g, '&#13;');
     // The doctype does not survive a DOMParser/XMLSerializer round trip, and the
     // base document does not always carry one to begin with — but every Mudlet
     // save has it (XMLexport::writeXmlHeader appends a node_doctype), and a

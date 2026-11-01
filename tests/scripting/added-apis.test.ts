@@ -12,25 +12,46 @@ import { AnsiAwareBuffer } from '../../src/mud/text/FormatState';
 // exercised here directly (the dispatch pipeline that drives processTemp from
 // network input lives in ScriptingEngine and isn't wired into createTestRuntime).
 describe('tempLineTrigger — TriggerEngine.addTempLine', () => {
-  it('fires on `howMany` lines starting `from` lines ahead, then self-expires', () => {
+  // Armed outside a line pass (alias, timer, event handler), desktop skips
+  // `from` lines and then fires — TTrigger::match decrements mStartOfLineDelta
+  // and fires once it goes negative (mudlet-web#327).
+  it('fires on `howMany` lines after skipping `from`, then self-expires', () => {
     const te = new TriggerEngine();
     const fired: string[] = [];
     te.addTempLine(1, 2, (m) => fired.push(m[0] ?? ''));
-    te.processTemp('line-1');
-    te.processTemp('line-2');
-    te.processTemp('line-3'); // already expired
-    expect(fired).toEqual(['line-1', 'line-2']);
+    te.processTemp('A1'); // skipped
+    te.processTemp('A2');
+    te.processTemp('A3');
+    te.processTemp('A4'); // already expired
+    expect(fired).toEqual(['A2', 'A3']);
   });
 
-  it('skips `from - 1` lines before the first fire', () => {
+  it('skips `from` lines before the first fire', () => {
     const te = new TriggerEngine();
     const fired: string[] = [];
     te.addTempLine(3, 1, (m) => fired.push(m[0] ?? ''));
-    te.processTemp('a');
-    te.processTemp('b');
-    te.processTemp('c'); // from=3 → third line fires
-    te.processTemp('d');
-    expect(fired).toEqual(['c']);
+    for (const l of ['F1', 'F2', 'F3', 'F4', 'F5']) te.processTemp(l);
+    expect(fired).toEqual(['F4']);
+  });
+
+  it('tells `from = 0` (the next line) apart from `from = 1` (the one after)', () => {
+    const te = new TriggerEngine();
+    const zero: string[] = [];
+    const one: string[] = [];
+    te.addTempLine(0, 1, (m) => zero.push(m[0] ?? ''));
+    te.addTempLine(1, 1, (m) => one.push(m[0] ?? ''));
+    for (const l of ['L1', 'L2', 'L3']) te.processTemp(l);
+    expect(zero).toEqual(['L1']);
+    expect(one).toEqual(['L2']);
+  });
+
+  it('counts a prompt among the lines it skips', () => {
+    const te = new TriggerEngine();
+    const fired: string[] = [];
+    te.addTempLine(1, 3, (m) => fired.push(m[0] ?? ''));
+    te.processTemp('hp>', true);
+    for (const l of ['P2', 'P3', 'P4', 'P5']) te.processTemp(l);
+    expect(fired).toEqual(['P2', 'P3', 'P4']);
   });
 
   it('does not tick on the line it was created on (created mid-handler)', () => {
@@ -48,7 +69,7 @@ describe('tempLineTrigger — TriggerEngine.addTempLine', () => {
   it('early disposal cancels remaining fires', () => {
     const te = new TriggerEngine();
     const fired: string[] = [];
-    const kill = te.addTempLine(1, 5, (m) => fired.push(m[0] ?? ''));
+    const kill = te.addTempLine(0, 5, (m) => fired.push(m[0] ?? ''));
     te.processTemp('1');
     kill();
     te.processTemp('2');
@@ -62,8 +83,16 @@ describe('tempLineTrigger — Lua binding', () => {
   afterEach(() => env.dispose());
 
   it('registers from Lua and runs the code on the next line', () => {
-    env.run('tempLineTrigger(1, 1, [[echo("FIRED\\n")]])');
+    env.run('tempLineTrigger(0, 1, [[echo("FIRED\\n")]])');
     env.api.triggers.processTemp('a line of output');
+    expect(env.mainOutput.join('')).toContain('FIRED');
+  });
+
+  it('skips `from` lines when armed outside a line pass', () => {
+    env.run('tempLineTrigger(1, 1, [[echo("FIRED\\n")]])');
+    env.api.triggers.processTemp('first');
+    expect(env.mainOutput.join('')).not.toContain('FIRED');
+    env.api.triggers.processTemp('second');
     expect(env.mainOutput.join('')).toContain('FIRED');
   });
 
@@ -93,10 +122,12 @@ describe('echoPopup / insertPopup / setPopup', () => {
     expect(env.run('return (getCurrentLine("tb"))')).toBe('ABXXCD');
   });
 
-  it('setPopup returns false with no selection and true once a selection exists', () => {
+  // Desktop's setPopup answers true for any console it finds, selection or
+  // not (ConsoleLinksByName_spec); there is just nothing for it to attach to.
+  it('setPopup refuses no selection and returns true once a selection exists', () => {
     env.run('createBuffer("tb"); cecho("tb", "<red>Hello<reset>\\n")');
-    expect(env.run('return (setPopup("tb", {"look"}, {"Look"}))')).toBe(false);
-    env.run('selectCurrentLine("tb")');
+    expect(env.run('return select(2, setPopup("tb", {"look"}, {"Look"}))')).toBe('no text is selected - cannot create popup');
+    env.run('moveCursor("tb", 0, 0); selectCurrentLine("tb")');
     expect(env.run('return (setPopup("tb", {"look"}, {"Look"}))')).toBe(true);
   });
 });
@@ -106,15 +137,45 @@ describe('wrapLine', () => {
   beforeEach(async () => { env = await createTestRuntime(); });
   afterEach(() => env.dispose());
 
-  it('returns true for an in-range line and false out of range', () => {
+  // TLuaInterpreter::wrapLine answers true for a line the window has (or one
+  // past its last, where deleteLine() leaves a trigger's getLineNumber()), and
+  // refuses any other line and a window it cannot find.
+  it('answers true for a line it has, and refuses one it does not', () => {
     env.run('createBuffer("tb"); cecho("tb", "Hello\\n")');
     // one line at index 0; getLineCount is the line *count* (Mudlet semantics),
     // so a single line reports 1 and the last index is getLineCount()-1.
     expect(env.run('return (getLineCount("tb"))')).toBe(1);
-    expect(env.run('return (wrapLine("tb", 0))')).toBe(true);
-    expect(env.run('return (wrapLine("tb", 0))')).toBe(true); // idempotent re-render
-    expect(env.run('return (wrapLine("tb", 5))')).toBe(false);
-    expect(env.run('return (wrapLine("tb", -1))')).toBe(false);
+    expect(env.run('return wrapLine("tb", 0)')).toBe(true);
+    expect(env.run('return wrapLine("tb", getLastLineNumber("tb") + 1)')).toBe(true);
+    expect(env.run('return select(2, wrapLine("tb", 5))')).toBe('line 5 does not exist in window "tb"');
+    expect(env.run('return select(2, wrapLine("tb", -1))')).toBe('line -1 does not exist in window "tb"');
+    expect(env.run('return wrapLine(0)')).toBe(true);
+    expect(env.run('return select(2, wrapLine("nope", 0))')).toBe('window "nope" not found');
+  });
+
+  // mudlet-web#364 item 3: TBuffer::wrapLine re-wraps from the given line to
+  // the end of the buffer, not that one line alone.
+  it('re-wraps every line from the given one to the end', () => {
+    env.run(`createBuffer("tb"); setWindowWrap("tb", 0)
+      for _, l in ipairs({"line zero is long enough", "line one is also long", "line two is also long", "line three is long too"}) do
+        echo("tb", l .. "\\n")
+      end
+      setWindowWrap("tb", 10)`);
+    expect(env.run('return wrapLine("tb", 1)')).toBe(true);
+    expect(String(env.run('return table.concat(getLines("tb", 0, getLineCount("tb")), "|")')).split('|')).toEqual([
+      'line zero is long enough',
+      'line one ', 'is also ', 'long',
+      'line two ', 'is also ', 'long',
+      'line three', 'is long ', 'too',
+    ]);
+  });
+
+  // Item 2: an echo's hanging indent takes the format of the text it starts.
+  it('gives an echo\'s hanging indent the colour of the text it precedes', () => {
+    env.run(`createBuffer("tb"); setWindowWrap("tb", 12); setWindowWrapHangingIndent("tb", 2)
+      cecho("tb", "<red>echo3 ggggg<blue> hhhhh iiiii\\n")`);
+    expect(String(env.run('return table.concat(getLines("tb", 0, 3), "|")')).split('|')).toEqual(['echo3 ggggg ', '  hhhhh ', '  iiiii']);
+    expect(env.run('moveCursor("tb", 0, 1); local r, g, b = getFgColor("tb"); return r .. "," .. g .. "," .. b')).toBe('0,0,255');
   });
 
   it('targets the last line via getLineCount and does not throw', () => {
@@ -152,10 +213,17 @@ describe('getTimestamp', () => {
   beforeEach(async () => { env = await createTestRuntime(); });
   afterEach(() => env.dispose());
 
-  it('returns an "hh:mm:ss.zzz" string for an in-range line', () => {
+  it('returns an "hh:mm:ss.zzz " string (trailing space, as desktop) for an in-range line', () => {
     env.run('createBuffer("tb"); cecho("tb", "hi\\n")');
     const ts = env.run('return (getTimestamp("tb", 1))');
-    expect(ts).toMatch(/^\d{2}:\d{2}:\d{2}\.\d{3}$/);
+    expect(ts).toMatch(/^\d{2}:\d{2}:\d{2}\.\d{3} $/);
+  });
+
+  it('returns "------------ " for a wrapped continuation line', () => {
+    env.run('createBuffer("tb"); setWindowWrap("tb", 10); cecho("tb", "aaaaaaaaaa bbbbbbbbbb cccc\\n")');
+    const count = env.run('return getLineCount("tb")') as number;
+    expect(count).toBeGreaterThan(1);
+    expect(env.run('return (getTimestamp("tb", 2))')).toBe('------------ ');
   });
 
   it('returns nil for an out-of-range line or a missing window', () => {
@@ -195,6 +263,9 @@ describe('getMapZoom / setMapZoom / updateMap — wiring', () => {
   // with no mapper mounted — an area that has never been zoomed reads back the
   // default, and setting one succeeds whether or not a panel is showing it.
   it('answer from the area with no panel open, and do not throw', () => {
+    // ...except that getMapZoom, like desktop, refuses until a mapper exists.
+    expect(env.run('local z, e = getMapZoom() return tostring(z) .. "|" .. e')).toBe('nil|no active mapper');
+    env.run('openMapWidget()');
     expect(env.run('return (getMapZoom())')).toBe(20);
     expect(env.run('return (setMapZoom(5))')).toBe(true);
     expect(() => env.run('updateMap()')).not.toThrow();
@@ -229,8 +300,8 @@ describe('msdp global — setMsdpValue', () => {
   beforeEach(async () => { env = await createTestRuntime(); });
   afterEach(() => env.dispose());
 
-  it('exposes an empty msdp table before any packet', () => {
-    expect(env.run('return type(msdp)')).toBe('table');
+  it('has no msdp table before any packet, as desktop (issue #287)', () => {
+    expect(env.run('return type(msdp)')).toBe('nil');
   });
 
   it('writes a scalar variable to the flat top-level key', () => {
@@ -276,6 +347,24 @@ describe('mssp global — setMsspValue', () => {
     env.rt.setMsspValue('PLAYERS', '52');
     env.rt.setMsspValue('PLAYERS', '60');
     expect(env.run('return mssp.PLAYERS')).toBe('60');
+  });
+});
+
+// setAtcpValue is Mudlet's setAtcpTable rawset: one string per inbound ATCP
+// message under its dotless name (mudlet-web#368). The split itself is covered
+// in tests/mud/connection/atcpMccp1Drift368.test.ts.
+describe('atcp global — setAtcpValue', () => {
+  let env: TestRuntime;
+  beforeEach(async () => { env = await createTestRuntime(); });
+  afterEach(() => env.dispose());
+
+  it('starts empty and fills flat string keys', () => {
+    expect(env.run('return type(atcp) .. "/" .. tostring(next(atcp))')).toBe('table/nil');
+    env.rt.setAtcpValue('CharVitals', 'H:100/120 M:50/60 NL:10/100');
+    env.rt.setAtcpValue('RoomNum', '1234');
+    env.rt.setAtcpValue('RoomNum', '1235');
+    expect(env.run('return atcp.CharVitals')).toBe('H:100/120 M:50/60 NL:10/100');
+    expect(env.run('return atcp.RoomNum')).toBe('1235');
   });
 });
 
@@ -388,7 +477,8 @@ describe('special exits — clearSpecialExits / lockSpecialExit / hasSpecialExit
     expect(env.run('return (next(getSpecialExitsSwap(1)))')).not.toBe(null);
     expect(env.run('return (clearSpecialExits(1))')).toBe(true);
     expect(env.run('return (next(getSpecialExitsSwap(1)))')).toBe(null);
-    expect(env.run('return (clearSpecialExits(999))')).toBe(false);
+    expect(env.run('return (clearSpecialExits(999))')).toBeNull();
+    expect(env.run('return select(2, clearSpecialExits(999))')).toBe('number 999 is not a valid roomID');
   });
 });
 
@@ -470,10 +560,10 @@ describe('getCustomLines1 / removeCustomLine', () => {
     expect(env.run('return (getCustomLines1(999))')).toBe(null);   // missing room
   });
 
-  it('removeCustomLine is false when the room or line is absent', () => {
+  it('removeCustomLine is (nil, errMsg) when the room or line is absent', () => {
     env.run('addRoom(1)');
-    expect(env.run('return (removeCustomLine(1, "north"))')).toBe(false); // no such line
-    expect(env.run('return (removeCustomLine(999, "north"))')).toBe(false); // no such room
+    expect(env.run('return (removeCustomLine(1, "north"))')).toBeNull(); // no such exit or line
+    expect(env.run('return (removeCustomLine(999, "north"))')).toBeNull(); // no such room
   });
 });
 
@@ -531,12 +621,19 @@ describe('connectExitStub', () => {
     expect(env.run('return #getExitStubs1(1)')).toBe(0);
   });
 
+  // Above 12, so the toID is not also weighed as a direction code
   it('toID-only form connects the single matching reverse-stub pair', () => {
+    env.run('addRoom(13); addRoom(14)');
+    env.run('setExitStub(13, "east", true); setExitStub(14, "west", true)');
+    expect(env.run('return (connectExitStub(13, 14))')).toBe(true);
+    expect(env.run('return (getRoomExits(13)).east')).toBe(14);
+    expect(env.run('return (getRoomExits(14)).west')).toBe(13);
+  });
+
+  it('a number from 1 to 12 that is both a room and a stub direction is too ambiguous', () => {
     env.run('addRoom(3); addRoom(4)');
     env.run('setExitStub(3, "east", true); setExitStub(4, "west", true)');
-    expect(env.run('return (connectExitStub(3, 4))')).toBe(true);
-    expect(env.run('return (getRoomExits(3)).east')).toBe(4);
-    expect(env.run('return (getRoomExits(4)).west')).toBe(3);
+    expect(env.run('return select(2, connectExitStub(3, 4))')).toContain('too ambiguous');
   });
 
   it('direction-only form finds the nearest in-area room with a reverse stub', () => {
@@ -656,7 +753,7 @@ describe('gotoRoom', () => {
   // tables and calls the mapper package's doSpeedWalk, which owns the pacing,
   // balance checks and off-path recovery.
   it('hands the path to the mapper doSpeedWalk instead of sending it', () => {
-    env.run('addRoom(1); addRoom(2); addRoom(3); setExit(1, 2, "north"); setExit(2, 3, "north"); centerview(1)');
+    env.run('addRoom(1); addRoom(2); addRoom(3); setExit(1, 2, "north"); setExit(2, 3, "north"); openMapWidget(); centerview(1)');
     env.run('walked = nil; function doSpeedWalk() walked = table.concat(speedWalkDir, ",") end');
     const before = env.mainOutput.length;
     expect(env.run('return (gotoRoom(3))')).toBe(true);
@@ -671,7 +768,7 @@ describe('gotoRoom', () => {
   // move; Mudlet Web keeps the pre-delegation behaviour so a profile with no mapper
   // package installed still walks.
   it('falls back to sending the moves when no mapper defines doSpeedWalk', () => {
-    env.run('addRoom(1); addRoom(2); setExit(1, 2, "north"); centerview(1)');
+    env.run('addRoom(1); addRoom(2); setExit(1, 2, "north"); openMapWidget(); centerview(1)');
     const before = env.mainOutput.length;
     expect(env.run('return (gotoRoom(2))')).toBe(true);
     expect(env.run('return #speedWalkDir')).toBe(1);
@@ -690,7 +787,7 @@ describe('gotoRoom', () => {
   });
 
   it('fails for an invalid target room', () => {
-    env.run('addRoom(1); centerview(1)');
+    env.run('addRoom(1); openMapWidget(); centerview(1)');
     expect(env.run('return (gotoRoom(999))')).toBeNull();
   });
 });
@@ -708,19 +805,19 @@ describe('map double-click speedwalk', () => {
   afterEach(() => env.dispose());
 
   it('pathfinds from the player room and hands the route to doSpeedWalk', () => {
-    env.run('addRoom(1); addRoom(2); addRoom(3); setExit(1, 2, "east"); setExit(2, 3, "east"); centerview(1)');
+    env.run('addRoom(1); addRoom(2); addRoom(3); setExit(1, 2, "east"); setExit(2, 3, "east"); openMapWidget(); centerview(1)');
     env.run('walked = nil; function doSpeedWalk() walked = table.concat(speedWalkDir, ",") end');
     expect(env.session.windows.startSpeedWalk(3)).toBe(true);
     expect(env.run('return walked')).toBe('e,e');
   });
 
   it('ignores a double-click on a room that is not in the map', () => {
-    env.run('addRoom(1); centerview(1)');
+    env.run('addRoom(1); openMapWidget(); centerview(1)');
     expect(env.session.windows.startSpeedWalk(999)).toBe(false);
   });
 
   it('reports the mapper message when no path exists', () => {
-    env.run('addRoom(1); addRoom(2); centerview(1)'); // no exits between them
+    env.run('addRoom(1); addRoom(2); openMapWidget(); centerview(1)'); // no exits between them
     env.run('walked = nil; function doSpeedWalk() walked = "walked" end');
     const before = env.mainOutput.length;
     expect(env.session.windows.startSpeedWalk(2)).toBe(true);
@@ -740,7 +837,7 @@ describe('map double-click speedwalk', () => {
   // mudlet.custom_speedwalk hands the endpoints to a mapper that does its own
   // pathfinding; Mudlet computes no path at all in that case.
   it('honours mudlet.custom_speedwalk', () => {
-    env.run('addRoom(1); addRoom(2); centerview(1)'); // no path between them
+    env.run('addRoom(1); addRoom(2); openMapWidget(); centerview(1)'); // no path between them
     env.run('mudlet = mudlet or {}; mudlet.custom_speedwalk = true');
     env.run('endpoints = nil; function doSpeedWalk() endpoints = speedWalkFrom .. "->" .. speedWalkTo end');
     expect(env.session.windows.startSpeedWalk(2)).toBe(true);
@@ -802,9 +899,9 @@ describe('createCommandLine — overlay primitive + routing', () => {
   it('creates an overlay cmd line and registers it under the cmdLines manager', () => {
     expect(env.run('return (createCommandLine("c1", 10, 20, 200, 24))')).toBe(true);
     expect(env.session.cmdLines.has('c1')).toBe(true);
-    // Re-creating one under the same name is refused with nil and Mudlet's
-    // message (TMainConsole::createCommandLine), not a bare false.
-    expect(env.run('return (createCommandLine("c1", 0, 0, 100, 20))')).toBeNull();
+    // Re-creating one under the same name is refused with false and Mudlet's
+    // message (TMainConsole::createCommandLine).
+    expect(env.run('return (createCommandLine("c1", 0, 0, 100, 20))')).toBe(false);
     expect(env.run('return select(2, createCommandLine("c1", 0, 0, 100, 20))')).toBe("couldn't create commandLine");
   });
 
@@ -888,24 +985,30 @@ describe('lockExit / hasExitLock', () => {
   it('locks and unlocks a stock-direction exit by name', () => {
     env.run('addRoom(100); addRoom(101); setExit(100, 101, "north")');
     expect(env.run('return (hasExitLock(100, "north"))')).toBe(false);
-    expect(env.run('return (lockExit(100, "north", true))')).toBe(true);
+    // Desktop's lockExit answers true once the room is found.
+    expect(env.run('return lockExit(100, "north", true)')).toBe(true);
     expect(env.run('return (hasExitLock(100, "north"))')).toBe(true);
-    expect(env.run('return (lockExit(100, "north", false))')).toBe(true);
+    expect(env.run('return lockExit(100, "north", false)')).toBe(true);
     expect(env.run('return (hasExitLock(100, "north"))')).toBe(false);
   });
 
   it('accepts the 1-12 integer direction code', () => {
     env.run('addRoom(200)');
-    expect(env.run('return (lockExit(200, 4, true))')).toBe(true); // 4 = east
+    env.run('lockExit(200, 4, true)'); // 4 = east
     expect(env.run('return (hasExitLock(200, "east"))')).toBe(true);
     expect(env.run('return (hasExitLock(200, 4))')).toBe(true);
   });
 
   it('rejects an unknown direction or missing room', () => {
     env.run('addRoom(300)');
-    expect(env.run('return (lockExit(300, "sideways", true))')).toBe(false);
-    expect(env.run('return (lockExit(9999, "north", true))')).toBe(false);
+    // Other.lua's own wrapper answers nil and a message for a name it does not know.
+    expect(env.run('return (lockExit(300, "sideways", true))')).toBeNull();
+    expect(env.run('return select(2, lockExit(300, "sideways", true))')).toBe('"sideways" is not a valid direction');
+    expect(env.run('return (hasExitLock(300, "north"))')).toBe(false);
+    expect(env.run('return (lockExit(9999, "north", true))')).toBeNull();
+    expect(env.run('return select(2, lockExit(9999, "north", true))')).toBe('number 9999 is not a valid roomID');
     expect(env.run('return (hasExitLock(9999, "north"))')).toBeNull();
+    expect(env.run('return select(2, hasExitLock(9999, "north"))')).toBe('number 9999 is not a valid roomID');
   });
 
   it('honoured by pathfinding (locked direction is routed around)', () => {
@@ -1043,7 +1146,7 @@ describe('Mudlet-API batch — Lua bindings', () => {
       .toContain('does not exist');
     // A type there is no family for is told apart from a plain miss.
     expect(env.run('local _, err = isAncestorsActive(1, "sandwich"); return err'))
-      .toContain("invalid item type 'sandwich' given");
+      .toBe('item type must be "alias", "button", "script", "keybind", "timer" or "trigger", got "sandwich"');
   });
 
   it('setModuleInfo / setPackageInfo are callable (no-op without an install)', () => {
@@ -1132,7 +1235,9 @@ describe('map labels — createMapLabel / createMapImageLabel / deleteMapLabel',
     // delete
     expect(env.run(`return (deleteMapLabel(${a}, 0))`)).toBe(true);
     expect(env.run(`return next(getMapLabels(${a}))`)).toBe(null);
-    expect(env.run(`return (deleteMapLabel(${a}, 0))`)).toBe(false); // already gone
+    // already gone
+    expect(env.run(`return (deleteMapLabel(${a}, 0))`)).toBeNull();
+    expect(env.run(`return select(2, deleteMapLabel(${a}, 0))`)).toBe(`labelID 0 does not exist in area with areaID ${a}`);
   });
 
   // TLuaInterpreter::createMapLabel gates its optional tail on lua_gettop, and
@@ -1187,12 +1292,16 @@ describe('map labels — createMapLabel / createMapImageLabel / deleteMapLabel',
       .toThrow('bad argument #14 type (showOnTop as boolean expected');
   });
 
-  it('createMapImageLabel stores the image path in Pixmap; both reject a missing area', () => {
+  // Desktop keeps the image, never the path (issue #334) — see
+  // tests/map/mapFileDesktopParity.test.ts. With no profile filesystem there
+  // is no file to read, which desktop refuses rather than make a blank label;
+  // an unknown area is -1 before the image is looked at.
+  it('createMapImageLabel refuses an image it cannot read; both reject a missing area', () => {
     const a = env.run('return (addAreaName("Img"))') as number;
-    const id = env.run(`return (createMapImageLabel(${a}, "pic.png", 0, 0, 0, 32, 32, 1, true, true))`);
-    expect(id).toBe(0);
-    expect(env.run(`return (getMapLabel(${a}, 0)).Pixmap`)).toBe('pic.png');
-    expect(env.run(`return (getMapLabel(${a}, 0)).Width`)).toBe(32);
+    expect(env.run(`return (createMapImageLabel(${a}, "pic.png", 0, 0, 0, 32, 32, 1, true))`)).toBeNull();
+    expect(env.run(`return select(2, createMapImageLabel(${a}, "pic.png", 0, 0, 0, 32, 32, 1, true))`))
+      .toBe("image file 'pic.png' could not be read");
+    expect(env.run(`return next(getMapLabels(${a}))`)).toBe(null);
     expect(env.run('return (createMapLabel(999, "x", 0,0,0, 0,0,0, 0,0,0, 1, 12, true, false))')).toBe(-1);
     expect(env.run('return (createMapImageLabel(999, "p", 0,0,0, 1,1, 1, true, true))')).toBe(-1);
   });
@@ -1270,9 +1379,11 @@ describe('getTextFormat bold on SGR-coloured text (issue #239)', () => {
   afterEach(() => env.dispose());
 
   // Mudlet's TBuffer writes Bold as `mIsDefaultColor ? mBold : false`: SGR 1 on
-  // a colour only brightens it.
+  // a colour only brightens it. Seeded as a decoded game line: an echo() keeps
+  // an ESC as text rather than decoding it (mudlet-web#289).
+  const gameLine = (ansi: string) => env.api.beginLine(new AnsiAwareBuffer(ansi));
   it('reports bold false for ESC[1;32m and true for bold on the default colour', () => {
-    env.run('echo("\\27[1;32mXX\\27[0m \\27[1mYY\\27[0m")');
+    gameLine('\x1b[1;32mXX\x1b[0m \x1b[1mYY\x1b[0m');
     expect(env.run('selectString("XX", 1) return getTextFormat().bold')).toBe(false);
     expect(env.run('selectString("YY", 1) return getTextFormat().bold')).toBe(true);
   });
@@ -1280,7 +1391,7 @@ describe('getTextFormat bold on SGR-coloured text (issue #239)', () => {
   // Only the sixteen ANSI colours clear mIsDefaultColor: a 24-bit or 256-colour
   // foreground keeps bold text bold (Telnet_spec pins the 24-bit case).
   it('keeps bold on a 24-bit or 256-colour foreground', () => {
-    env.run('echo("\\27[1;38;2;120;134;94mTT\\27[0m \\27[1;38;5;196mEE\\27[0m")');
+    gameLine('\x1b[1;38;2;120;134;94mTT\x1b[0m \x1b[1;38;5;196mEE\x1b[0m');
     expect(env.run('selectString("TT", 1) return getTextFormat().bold')).toBe(true);
     expect(env.run('selectString("EE", 1) return getTextFormat().bold')).toBe(true);
   });
@@ -1291,7 +1402,7 @@ describe('getTextFormat bold on SGR-coloured text (issue #239)', () => {
   });
 
   it('still brightens a colour that arrives after the bold', () => {
-    env.run('echo("\\27[1mA\\27[31mB\\27[0m")');
+    gameLine('\x1b[1mA\x1b[31mB\x1b[0m');
     expect(env.run('selectString("B", 1) return getTextFormat().bold')).toBe(false);
     expect(env.run('selectString("B", 1) return getTextFormat().foreground[1]')).toBe(255);
   });
@@ -1356,7 +1467,7 @@ describe('misc forwarders — appendLog / getProfileTabNumber / getProfiles / io
 
   it('ioprint / clearVisitedLinks / closeMudlet are callable without throwing', () => {
     expect(() => env.run('ioprint("hello", 42, nil)')).not.toThrow();
-    expect(() => env.run('clearVisitedLinks()')).not.toThrow();
+    expect(() => env.run('clearVisitedLinks("noSuchLabel")')).not.toThrow();
     // closeMudlet → disconnect() (no socket) + close callback (unwired) — clean.
     expect(() => env.run('closeMudlet()')).not.toThrow();
   });
@@ -1530,12 +1641,13 @@ describe('exportAreaImage — Lua binding', () => {
     expect((msg as string).length).toBeGreaterThan(0);
   });
 
-  it('rejects a non-numeric areaID', () => {
-    expect(env.run('return (exportAreaImage("nope", "a.png"))')).toBeNull();
+  it('raises on a non-numeric areaID, as desktop does', () => {
+    expect(() => env.run('exportAreaImage("nope", "a.png")'))
+      .toThrow('exportAreaImage: bad argument #1 type (areaID as number expected, got string!)');
   });
 
   it('delegates to ScriptingAPI.exportAreaImage with coerced args', () => {
-    const calls: Array<[number, string, number | undefined]> = [];
+    const calls: Array<[number, string, number | true | undefined]> = [];
     env.api.setHost({
       ...env.api.engineHost,
       exportAreaImageToVfs: (areaId, filePath, zLevel) => {
@@ -1561,9 +1673,17 @@ describe('resetProfile — Lua binding', () => {
 
   it('is callable and invokes the wired callback without throwing', () => {
     let called = 0;
-    env.api.setHost({ ...env.api.engineHost, resetProfile: () => { called++; } });
+    env.api.setHost({ ...env.api.engineHost, resetProfile: () => { called++; return true; } });
     expect(() => env.run('resetProfile()')).not.toThrow();
     expect(called).toBe(1);
+  });
+
+  it('answers what the engine does — true once armed, false when refused (#354)', () => {
+    let armed = true;
+    env.api.setHost({ ...env.api.engineHost, resetProfile: () => armed });
+    expect(env.run('return resetProfile()')).toBe(true);
+    armed = false;
+    expect(env.run('return resetProfile()')).toBe(false);
   });
 
   it('is a no-op (no throw) when no engine is bound', () => {
@@ -1590,7 +1710,7 @@ describe('engine tempCount — live session-scoped temp items', () => {
     const e = new TriggerEngine();
     expect(e.tempCount).toBe(0);
     const dispose = e.addTemp('hit', () => {}, 'substring');
-    e.addTempLine(1, 1, () => {});
+    e.addTempLine(0, 1, () => {});
     expect(e.tempCount).toBe(2);
     dispose();
     expect(e.tempCount).toBe(1);
@@ -1605,6 +1725,10 @@ describe('engine tempCount — live session-scoped temp items', () => {
     const id = e.addTemp(100, () => {});
     expect(e.tempCount).toBe(1);
     e.killTimer(id);
+    // Still in the tree, and counted, until the deferred cleanup frees it —
+    // desktop's getProfileStats walks the root list unfiltered.
+    expect(e.tempCount).toBe(1);
+    e.reapKilled();
     expect(e.tempCount).toBe(0);
   });
 
@@ -1614,6 +1738,10 @@ describe('engine tempCount — live session-scoped temp items', () => {
     const id = e.addTemp('KeyA', [], () => {});
     expect(e.tempCount).toBe(1);
     e.killKey(id);
+    // Counted until the deferred cleanup frees it, as KeyUnit's report does.
+    expect(e.tempCount).toBe(1);
+    expect(e.tempActiveCount).toBe(0);
+    e.reapKilled();
     expect(e.tempCount).toBe(0);
   });
 });

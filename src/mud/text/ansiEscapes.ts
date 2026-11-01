@@ -68,28 +68,32 @@ export function scanEscape(text: string, start: number): EscapeScan {
     // CSI — ESC [ <params 0x30-0x3F> <intermediates 0x20-0x2F> <final 0x40-0x7E>
     if (next === "[") {
         let j = start + 2;
-        // An ESC ends the scan without being part of it. A CSI that never
-        // reaches a final byte is unusable, but the byte that cut it short
-        // belongs to whatever comes next: reading through it swallowed the
-        // following sequence whole, so "ESC[0;4> ESC[0m text" lost its reset and
-        // printed "0m" as if the game had sent it.
-        while (j < n && isCsiParameter(text[j]) && text[j] !== ESC) j++;
-        if (j >= n) return { kind: "incomplete", end: n };
-        if (text[j] === ESC) return { kind: "csi", end: j, params: text.slice(start + 2, j) };
-        const params = text.slice(start + 2, j);
-        // A parameter string past the cap is thrown away rather than buffered
-        // without bound — a server that never sends a final byte would
-        // otherwise grow it for as long as it kept typing. The comparison is
-        // on the parameters ALONE, excluding the introducer and the final byte
-        // (TBuffer's MAX_CSI_SEQUENCE_LENGTH).
-        if (params.length >= MAX_CSI_SEQUENCE_LENGTH) {
-            return { kind: "csi", end: Math.min(j + 1, n), params: "" };
+        while (j < n && isCsiParameter(text[j])) j++;
+        const parametersEnd = j;
+        // Then over any intermediate bytes, and the parameter bytes a malformed
+        // sequence has after them ("ESC[1 m", "ESC[38;5;-1m"), or that tail would
+        // reach the screen as text.
+        while (j < n && (isCsiIntermediate(text[j]) || isCsiParameter(text[j]))) j++;
+        const hasIntermediates = j !== parametersEnd;
+        // A sequence past the cap is thrown away rather than buffered without
+        // bound — a server that never sends a final byte would otherwise grow it
+        // for as long as it kept typing. It counts everything ahead of the final
+        // byte, intermediates included, and takes the final byte only when that
+        // is what stopped the scan (TBuffer's MAX_CSI_SEQUENCE_LENGTH). Checked
+        // before running off the end, so an over-long tail is never held.
+        if (j - (start + 2) >= MAX_CSI_SEQUENCE_LENGTH) {
+            return { kind: "csi", end: j < n && isCsiFinal(text[j]) ? j + 1 : j, params: "" };
         }
-        // An intermediate byte ENDS the sequence. The parameters and the
-        // intermediate are consumed and whatever follows stays ordinary text —
-        // there is no look-ahead for a final byte, so where the packet happened
-        // to break makes no difference to what is drawn.
-        if (isCsiIntermediate(text[j])) return { kind: "csi", end: j + 1, params };
+        if (j >= n) return { kind: "incomplete", end: n };
+        const params = text.slice(start + 2, j);
+        // Only a final byte belongs to the sequence. Whatever else cut it short —
+        // an ESC, a newline, a character's lead byte — belongs to what comes
+        // next: reading through it swallowed the following sequence whole, so
+        // "ESC[0;4> ESC[0m text" lost its reset and printed "0m".
+        if (!isCsiFinal(text[j])) return { kind: "csi", end: j, params };
+        // Mudlet acts on no sequence with an intermediate byte, so one is
+        // consumed with its final byte but reported without it.
+        if (hasIntermediates) return { kind: "csi", end: j + 1, params };
         return { kind: "csi", end: j + 1, finalByte: text[j], params };
     }
 
@@ -142,6 +146,63 @@ export function scanEscape(text: string, start: number): EscapeScan {
 
     // A stray ESC: consumed on its own, leaving whatever followed as text.
     return { kind: "esc", end: start + 1 };
+}
+
+/**
+ * Where the escape sequence `text` leaves unfinished begins, scanning from
+ * `from`, or -1 when every sequence in it is complete. Sequences are walked
+ * from the start rather than from the last ESC, as an ESC inside an OSC or
+ * string payload belongs to that sequence.
+ */
+export function unfinishedEscapeStart(text: string, from = 0): number {
+    let i = text.indexOf(ESC, from);
+    while (i !== -1) {
+        const scan = scanEscape(text, i);
+        if (scan.kind === "incomplete") return i;
+        i = text.indexOf(ESC, Math.max(scan.end, i + 1));
+    }
+    return -1;
+}
+
+/**
+ * How many spaces a `CSI n C` (CUF, cursor forward) stands for — the one cursor
+ * movement Mudlet emulates (TBuffer::translateToPlainText's 'C' case, added for
+ * games that column-align with it). The parameter has to read whole as a
+ * positive integer (`QByteArray::toInt`): `ESC[C`, `ESC[0C` and anything like
+ * `ESC[1;2C` stand for nothing and return 0.
+ */
+export function cursorForwardCount(params: string | undefined): number {
+    if (!params) return 0;
+    let n = 0;
+    for (let i = 0; i < params.length; i++) {
+        const d = params.charCodeAt(i) - 0x30;
+        if (d < 0 || d > 9) return 0;
+        n = n * 10 + d;
+    }
+    // Past INT_MAX toInt fails, and Mudlet ignores the sequence.
+    if (n > 0x7fffffff) return 0;
+    // Clamped here too, ahead of the margin {@link cursorForwardSpaces} puts
+    // on it, so a caller measuring a line (visibleText) never builds a string
+    // a billion spaces long either.
+    return Math.min(n, MAX_CURSOR_FORWARD);
+}
+
+/** TBuffer::translateToPlainText's `rightMargin`: the column a cursor-forward
+ *  stops at. See {@link cursorForwardSpaces}. */
+export const MAX_CURSOR_FORWARD = 1000;
+
+/**
+ * How many spaces a cursor-forward of `count` (from {@link cursorForwardCount})
+ * actually writes at `column` (the line's length so far) —
+ * TBuffer::translateToPlainText's 'C' case. Like a terminal's, the cursor stops
+ * at the right margin: the count comes from the game, and unbounded, one
+ * sequence (or a run of them) could ask for gigabytes of spaces. The margin is
+ * {@link MAX_CURSOR_FORWARD}, not the window's wrap: games send lines longer
+ * than that, and the spaces have to survive the wrap that splits them.
+ */
+export function cursorForwardSpaces(count: number, column: number): number {
+    if (count <= 0) return 0;
+    return Math.max(0, Math.min(count, MAX_CURSOR_FORWARD - 1 - column));
 }
 
 // ── OSC 8 hyperlink protocol ──────────────────────────────────────────────
@@ -228,81 +289,27 @@ export function classifyHyperlinkUri(uri: string): HyperlinkAction | null {
     }
 }
 
-// ── OSC 4 / 104 colour palette protocol ───────────────────────────────────
-// OSC 4 redefines a palette entry: `ESC ] 4 ; index ; spec ST` (repeatable as
-// `4;i1;s1;i2;s2…`). OSC 104 resets entries: `ESC ] 104 ST` clears the whole
-// palette, `ESC ] 104 ; i1 ; i2 … ST` resets the listed indices. `spec` is an
-// XParseColor string — `rgb:RR/GG/BB` (1–4 hex digits per channel) or
-// `#RGB` / `#RRGGBB` / `#RRRRGGGGBBBB`. The query form `4;index;?` (server asks
-// us to report a colour) is parsed but produces no op — we don't answer.
+// ── Linux-console palette OSC ────────────────────────────────────────────
+// The two palette commands Mudlet's TBuffer::decodeOSC obeys, both only while
+// "Allow server to redefine your colors" is on:
+//   `ESC ] P <i> <rr> <gg> <bb> ST` — set ANSI colour i (one hex digit, 0–f)
+//   `ESC ] R ST`                    — reset the sixteen colours
+// The payload is exactly the 8 characters `Pirrggbb`; any other length is
+// dropped. xterm's OSC 4 / OSC 104 are NOT among them — desktop ignores those,
+// so they are consumed here like any other unrecognised OSC.
 
 export type OscPaletteOp =
     | { kind: "set"; index: number; color: string }  // color is "#rrggbb"
-    | { kind: "reset"; index: number }
-    | { kind: "reset-all" };
+    | { kind: "reset" };
 
-/** Scale a `width`-hex-digit channel value to 8 bits, per XParseColor (each
- *  field is treated as a fraction of its max, e.g. `f` → 255, `ffff` → 255). */
-function scaleHexChannel(hex: string): number {
-    const max = (1 << (4 * hex.length)) - 1;
-    const v = parseInt(hex, 16);
-    return Math.round((v / max) * 255);
-}
-
-function toHex2(n: number): string {
-    return Math.max(0, Math.min(255, n)).toString(16).padStart(2, "0");
-}
-
-/**
- * Parse an XParseColor spec into a `#rrggbb` string, or null if unrecognised.
- * Handles the two forms MUDs use in practice — `rgb:r/g/b` and `#`-hex — and
- * rejects named colours and other X forms (`rgbi:`, `cmyk:`, …).
- */
-export function parseXColorSpec(spec: string): string | null {
-    const rgb = /^rgb:([0-9a-f]{1,4})\/([0-9a-f]{1,4})\/([0-9a-f]{1,4})$/i.exec(spec);
-    if (rgb) {
-        return `#${toHex2(scaleHexChannel(rgb[1]))}${toHex2(scaleHexChannel(rgb[2]))}${toHex2(scaleHexChannel(rgb[3]))}`;
-    }
-    const hash = /^#([0-9a-f]+)$/i.exec(spec);
-    if (hash && hash[1].length % 3 === 0) {
-        const w = hash[1].length / 3;
-        if (w >= 1 && w <= 4) {
-            const r = hash[1].slice(0, w), g = hash[1].slice(w, 2 * w), b = hash[1].slice(2 * w);
-            return `#${toHex2(scaleHexChannel(r))}${toHex2(scaleHexChannel(g))}${toHex2(scaleHexChannel(b))}`;
-        }
-    }
-    return null;
-}
-
-/**
- * Parse an OSC payload as an OSC 4 (set) or OSC 104 (reset) palette command.
- * Returns the ordered list of operations, or null if the payload is neither.
- * Malformed index/spec pairs are skipped rather than aborting the whole list.
- */
-export function parseOscColorPalette(payload: string): OscPaletteOp[] | null {
-    if (payload === "104" || payload.startsWith("104;")) {
-        const rest = payload.slice(3);
-        if (rest === "") return [{ kind: "reset-all" }];
-        const ops: OscPaletteOp[] = [];
-        for (const part of rest.split(";")) {
-            if (part === "") continue;
-            const idx = Number(part);
-            if (Number.isInteger(idx) && idx >= 0 && idx <= 255) ops.push({ kind: "reset", index: idx });
-        }
-        return ops;
-    }
-    if (payload === "4" || payload.startsWith("4;")) {
-        const fields = payload.split(";").slice(1); // drop the leading "4"
-        const ops: OscPaletteOp[] = [];
-        for (let i = 0; i + 1 < fields.length; i += 2) {
-            const idx = Number(fields[i]);
-            const spec = fields[i + 1];
-            if (!Number.isInteger(idx) || idx < 0 || idx > 255) continue;
-            if (spec === "?") continue; // query form — we don't report colours back
-            const color = parseXColorSpec(spec);
-            if (color) ops.push({ kind: "set", index: idx, color });
-        }
-        return ops;
+/** Parse an OSC payload as a Linux-console palette command, or null if it is
+ *  not one (or is a malformed one). */
+export function parseOscPalette(payload: string): OscPaletteOp | null {
+    if (payload.startsWith("R")) return { kind: "reset" };
+    if (payload.startsWith("P")) {
+        const m = /^P([0-9a-f])([0-9a-f]{6})$/i.exec(payload);
+        if (!m) return null;
+        return { kind: "set", index: parseInt(m[1], 16), color: `#${m[2].toLowerCase()}` };
     }
     return null;
 }

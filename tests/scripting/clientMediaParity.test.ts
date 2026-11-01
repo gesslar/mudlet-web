@@ -25,7 +25,7 @@ const { KeyEngine } = await import('../../src/mud/keybindings/KeyEngine');
 const { ScriptingEngine } = await import('../../src/scripting/ScriptingEngine');
 const { useAppStore } = await import('../../src/storage/appStore');
 
-// Enough DOM for the engine's constructor (beforeunload + visibilitychange).
+// Enough DOM for the engine's constructor (pagehide + visibilitychange).
 // Installed AFTER the imports above, never at import time: pcre2 picks its
 // node-vs-browser WASM loading during its own module init, and a `document`
 // visible then flips it to fetch mode and it dies. Same rule as
@@ -50,6 +50,7 @@ type EngineInternals = {
     handleClientMedia: (action: string, value: unknown) => Promise<void>;
     resolveMediaFile: (file: string, baseUrl: string | undefined, logPrefix: string, debug: boolean) => Promise<string | null>;
     mediaPathCandidates: (path: string) => string[];
+    resolveMediaPath: (name: string) => string | null;
     gmcpMediaDefaultUrl: string;
     vfs: unknown;
 };
@@ -84,7 +85,7 @@ describe('GMCP Client.Media parity', () => {
         await media('stop', { type: 'sound', tag: 'A', key: 'k', name: 'long.wav', priority: 40 });
         expect(stopMusic).not.toHaveBeenCalled();
         expect(stopSounds).toHaveBeenCalledWith({
-            name: 'long.wav', key: 'k', tag: 'a', priority: 40, fadeout: undefined, origin: 'game',
+            name: 'long.wav', key: 'k', tag: 'a', priority: 40, fadeout: undefined, fadeaway: false, origin: 'game',
         });
     });
 
@@ -148,5 +149,97 @@ describe('GMCP Client.Media parity', () => {
         expect(candidates('media/short.wav')[1]).toBe('/profiles/p/media/short.wav');
         expect(candidates('/media/short.wav')).toEqual(['/media/short.wav', '/profiles/p/media/short.wav']);
         internals().vfs = null;
+    });
+    // Issue #350.
+    it('raises sysMediaPaused when media is paused', () => {
+        const raised: unknown[][] = [];
+        vi.spyOn(engine, 'raiseEvent').mockImplementation((e: string, args?: unknown[]) => { raised.push([e, ...(args ?? [])]); });
+        session.sounds.onMediaPaused?.('x.wav', '/profiles/p/media/x.wav', 'sound', 'k', 't');
+        expect(raised).toEqual([['sysMediaPaused', 'x.wav', '/profiles/p/media/x.wav', 'sound', 'k', 't']]);
+    });
+
+    it('passes finish to a Play and fadeaway to a Stop', async () => {
+        vi.spyOn(internals(), 'resolveMediaFile').mockResolvedValue('/profiles/p/media/long.wav');
+        const play = vi.spyOn(session.sounds, 'playSound').mockResolvedValue(1);
+        await media('play', { name: 'long.wav', finish: 1000 });
+        expect(play).toHaveBeenCalledWith(expect.objectContaining({ finish: 1000 }));
+
+        const stopSounds = vi.spyOn(session.sounds, 'stopSounds').mockReturnValue(undefined);
+        const stopMusic = vi.spyOn(session.sounds, 'stopMusic').mockReturnValue(undefined);
+        await media('stop', { fadeaway: true });
+        expect(stopSounds).toHaveBeenCalledWith(expect.objectContaining({ fadeaway: true, origin: 'game' }));
+        expect(stopMusic).toHaveBeenCalledWith(expect.objectContaining({ fadeaway: true, origin: 'game' }));
+    });
+
+    it('plays a name from the file it finds, by its full path, and expands a wildcard', () => {
+        const files = new Set(['/profiles/p/media/long3.wav', '/profiles/p/media/mid.wav', '/profiles/p/media/middle.wav']);
+        internals().vfs = {
+            profilePath: '/profiles/p',
+            exists: (p: string) => files.has(p),
+            readdir: (dir: string) => [...files].filter(f => f.startsWith(`${dir}/`)).map(f => f.slice(dir.length + 1)),
+            stat: (p: string) => (files.has(p) ? { type: 'file' } : null),
+        };
+        const resolve = (n: string) => internals().resolveMediaPath(n);
+        expect(resolve('long3.wav')).toBe('/profiles/p/media/long3.wav');
+        expect(resolve('mid*.wav')).toMatch(/^\/profiles\/p\/media\/mid(dle)?\.wav$/);
+        expect(resolve('mi?.wav')).toBe('/profiles/p/media/mid.wav');
+        // Nothing matches: no file to play. A URL is played as given.
+        expect(resolve('nosuch*.wav')).toBeNull();
+        expect(resolve('nosuch.wav')).toBeNull();
+        expect(resolve('https://h/x.wav')).toBe('https://h/x.wav');
+        internals().vfs = null;
+    });
+    it('resumes what the server paused from a Play that names only a key or tag', async () => {
+        const resolve = vi.spyOn(internals(), 'resolveMediaFile');
+        const resume = vi.spyOn(session.sounds, 'resume').mockReturnValue(1);
+        await media('play', { key: 'k' });
+        expect(resume).toHaveBeenLastCalledWith('sound', { key: 'k', tag: undefined, origin: 'game' });
+        await media('play', { type: 'music', tag: 'A' });
+        expect(resume).toHaveBeenLastCalledWith('music', { key: undefined, tag: 'a', origin: 'game' });
+        expect(resolve).not.toHaveBeenCalled();
+    });
+
+    it('moves music too when an Update names no type, and only music when it says so', async () => {
+        const update = vi.spyOn(session.sounds, 'updateSounds').mockReturnValue(0);
+        await media('update', { key: 'k', volume: 30 });
+        expect(update).toHaveBeenLastCalledWith(
+            expect.objectContaining({ key: 'k', origin: 'game', kinds: ['sound', 'music'] }),
+            expect.objectContaining({ volume: 30 }),
+        );
+        await media('update', { type: 'Music', key: 'k', volume: 30 });
+        expect(update).toHaveBeenLastCalledWith(expect.objectContaining({ kinds: ['music'] }), expect.anything());
+        update.mockClear();
+        await media('update', { type: 'video', key: 'k', volume: 30 });
+        expect(update).not.toHaveBeenCalled();
+    });
+
+    it('applies an Update sent while the file downloads once the Play goes ahead', async () => {
+        let finish!: (path: string) => void;
+        vi.spyOn(internals(), 'resolveMediaFile').mockReturnValue(new Promise(r => { finish = r; }));
+        vi.spyOn(session.sounds, 'updateSounds').mockReturnValue(0);
+        const play = vi.spyOn(session.sounds, 'playSound').mockResolvedValue(1);
+        const played = media('play', { name: 'rain.wav', key: 'k', volume: 60, pan: -10 });
+        await media('update', { key: 'k', volume: 20, direction: 'east' });
+        await media('update', { key: 'other', volume: 90 });
+        finish('/profiles/p/media/rain.wav');
+        await played;
+        // The direction takes over from the Play's own pan, as on a playing sound.
+        expect(play).toHaveBeenCalledWith(expect.objectContaining({
+            name: '/profiles/p/media/rain.wav', key: 'k', volume: 20, pan: undefined, direction: 'east',
+        }));
+    });
+
+    it('leaves a Load alone while it downloads', async () => {
+        let finish!: (path: string) => void;
+        vi.spyOn(internals(), 'resolveMediaFile').mockReturnValue(new Promise(r => { finish = r; }));
+        vi.spyOn(session.sounds, 'updateSounds').mockReturnValue(0);
+        const preload = vi.spyOn(session.sounds, 'preload').mockReturnValue(undefined as never);
+        const play = vi.spyOn(session.sounds, 'playSound');
+        const loaded = media('load', { name: 'rain.wav', key: 'k' });
+        await media('update', { name: 'rain.wav', volume: 20 });
+        finish('/profiles/p/media/rain.wav');
+        await loaded;
+        expect(preload).toHaveBeenCalled();
+        expect(play).not.toHaveBeenCalled();
     });
 });

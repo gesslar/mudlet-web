@@ -226,8 +226,8 @@ export interface ProfileSettings {
      *  the built-in default). `undefined` for the whole array = no override. */
     ansiPalette?: (string | undefined)[];
     /** Mudlet "Allow server to redefine your colors". When enabled, the server
-     *  may remap the ANSI/256 palette at runtime via OSC 4 (set color) / OSC 104
-     *  (reset). When disabled, those sequences are ignored and the user palette
+     *  may remap the sixteen ANSI colours at runtime via `ESC]P<i><rrggbb>` (set
+     *  colour) / `ESC]R` (reset). When disabled, those sequences are ignored and the user palette
      *  stands. Off by default — only an explicit `true` enables it. */
     serverRedefineColors?: boolean;
     /** Mudlet 5.0's `Host::mEnableOSC8Hyperlinks` ("Enable OSC 8 hyperlinks").
@@ -254,11 +254,11 @@ export interface ProfileSettings {
     /** Mudlet's `Host::mConsoleBufferSize` ("Main display size") — how many
      *  lines of scrollback the main output keeps before the oldest are dropped
      *  in batches. Bounded 100 … 1,000,000; `undefined` uses
-     *  {@link DEFAULT_CONSOLE_BUFFER_SIZE} (10,000 lines, `TBuffer.h:386`).
+     *  {@link MAIN_CONSOLE_BUFFER_SIZE} (100,000 lines, `Host.h`).
      *  Round-trips through the profile XML as `consoleBufferSize`
-     *  (XMLexport.cpp:617). Scripts reach the same cap via
-     *  `setConsoleBufferSize()`, which does not write the preference back —
-     *  matching Mudlet, where the Lua call resizes the live buffer only. */
+     *  (XMLexport.cpp:617). `setConsoleBufferSize("main", …)` writes it (and
+     *  {@link useMaxConsoleBufferSize}) back, as desktop's
+     *  `Host::setMainConsoleBufferSize` does, so a script's size is saved. */
     consoleBufferSize?: number;
     /** Mudlet's `Host::mUseMaxConsoleBufferSize` ("use the maximum buffer size
      *  your system can handle", `checkBox_useMaxBufferSize`). When true the
@@ -301,7 +301,10 @@ export interface ProfileSettings {
     doubleClickIgnore?: string;
     /** Mudlet's "Make 'Ambiguous' E. Asian width characters wide": render the
      *  Unicode East Asian *Ambiguous* characters (box-drawing glyphs, ★ ♠ and
-     *  friends) two columns wide instead of one. Off unless explicitly true. */
+     *  friends) two columns wide instead of one. A tri-state, like Mudlet's
+     *  checkbox: true or false is a chosen width, unset is "auto" — wide only
+     *  for the CJK server encodings (see effectiveAmbiguousWidthWide). Read and
+     *  written by `get/setConfig("ambiguousEAsianWidthCharacters")` as well. */
     ambiguousWidthWide?: boolean;
     /** Mudlet's "Enable text analyzer" (`Host::mEnableTextAnalyzer`): put an
      *  "Analyse characters" entry on a console's right-click menu, reporting the
@@ -703,12 +706,21 @@ export function symbolFontSource(font: string | OutputFontSource | undefined): O
 }
 
 export const MAPPER_DEFAULTS: Required<MapperSettings> = {
-    roomSize: 0.6,
+    // Mudlet's own: Host::mRoomSize 0.5 of a grid cell, and exits drawn
+    // 1/mLineSize (10) of the room — 0.5 / 10 = 0.05 of a cell
+    // (T2DMap: exitWidth = 1 / eSize * mRoomWidth * rSize). So a fresh
+    // profile draws the map as desktop does, and getConfig("mapRoomSize") /
+    // getConfig("mapExitSize") answer desktop's 5 and 10. Applied to the
+    // renderer explicitly (applyMapperSettings) rather than left to its own
+    // createSettings() values, which are not these.
+    roomSize: 0.5,
     roomShape: 'rectangle',
     borders: true,
-    lineWidth: 0.025,
+    lineWidth: 0.05,
     backgroundColor: '#000000',
-    lineColor: '#e1ffe1',
+    // Host::mFgColor_2, Qt::lightGray — what desktop draws exits in and what
+    // getMapRoomExitsColor() answers on a fresh profile.
+    lineColor: '#c0c0c0',
     showDefaultArea: true,
     gridEnabled: false,
     // Both mirror mudlet-map-renderer's createSettings() defaults, so leaving
@@ -898,16 +910,14 @@ export interface TriggerNode extends BaseNode {
                                  // condition within which the rest must match. 0 = the same line only.
     isFilter: boolean;           // filter chain: pass captured/matched text to children instead of full line
     /**
-     * Session-scoped: created by `tempComplexRegexTrigger`, which needs a real
-     * trigger node rather than the flat temp-trigger primitive because it can
-     * ask for multiline-AND, a filter chain, a fire length, a line delta — all
-     * of them properties of a node in the tree — and can be named as another
-     * trigger's parent.
+     * Session-scoped: an `isTempTrigger="yes"` trigger from a package or
+     * profile XML, which desktop loads as a temporary TTrigger in the tree.
+     * (Script-created temporary triggers, tempComplexRegexTrigger's included,
+     * never reach the store: they live in the trigger engine — see
+     * TEMP_PARENT_PREFIX.) killTrigger can remove it.
      *
-     * Not persisted (see serializeProfileData), and neither is anything hanging
-     * under it: a permanent trigger parented to a temporary one goes when its
-     * parent does, so saving it would restore a child pointing at a parent that
-     * no longer exists.
+     * Not persisted (see persistableNodes), and neither is anything hanging
+     * under it: desktop's XMLexport skips a temporary root's whole subtree.
      */
     temporary?: boolean;
     /**
@@ -961,11 +971,25 @@ export interface TimerNode extends BaseNode {
     language: 'lua' | 'js';
     repeat: boolean;
     command?: string;    // plain command to send when the timer fires
+    /**
+     * Session-scoped: an `isTempTimer="yes"` timer from a package or profile
+     * XML. Desktop loads it as a TTimer with mIsTempTimer set, so it fires once
+     * — its script only, never its command — and is then deleted, the way a
+     * `tempTimer` is. Not persisted (see persistableNodes), and neither is
+     * anything hanging under it.
+     */
+    temporary?: boolean;
 }
 
 export interface KeyNode extends BaseNode {
     key: string;         // KeyboardEvent.code value, e.g. "F1", "KeyA", "Numpad1"
-    modifiers: string[]; // subset of ["ctrl", "shift", "alt", "meta"]
+                         // (a numpad key with NumLock off: the key it produces, e.g. "ArrowUp", flagged "keypad")
+    modifiers: string[]; // subset of ["ctrl", "shift", "alt", "meta", "keypad"]
+    /** The Qt::Key the binding was made with (permKey, desktop XML, the key
+     *  recorder), when known. `key` alone is lossy — `!` and `1` are both
+     *  Digit1 — and desktop matches on this, so a Key_Exclam binding without
+     *  Shift never fires for a plain 1. getKeyCode and XML export report it. */
+    qtKey?: number;
     code: string;
     language: 'lua' | 'js';
     command?: string;    // plain command to send when the keybinding fires
@@ -1069,6 +1093,106 @@ export function isColorizing(t: Pick<TriggerNode, 'colorize' | 'highlight'>): bo
 
 // ── Tree utilities ────────────────────────────────────────────────────────────
 
+/**
+ * The items that belong in a save: everything except the session-scoped
+ * (`temporary`) ones, and anything hanging under them.
+ *
+ * The descendants matter as much as the temporaries themselves. A permanent
+ * item can be parented to a temporary one — Mudlet allows it, and its own
+ * specs do it — and that child dies with its parent at the end of the session.
+ * Saving it alone would restore an item whose `parentId` names a node that
+ * was never written, leaving it orphaned in the tree. Desktop's XMLexport
+ * skips a temporary item the same way, subtree and all.
+ */
+export function persistableNodes<T extends { id: string; parentId: string | null; temporary?: boolean }>(items: T[]): T[] {
+    if (!items.some(t => t.temporary || isTempParentRef(t.parentId))) return items;
+    const byId = new Map(items.map(t => [t.id, t]));
+    const isTemporary = (node: T): boolean => {
+        let cur: T | undefined = node;
+        const guard = new Set<string>();
+        while (cur && !guard.has(cur.id)) {
+            if (cur.temporary || isTempParentRef(cur.parentId)) return true;
+            guard.add(cur.id);
+            cur = cur.parentId ? byId.get(cur.parentId) : undefined;
+        }
+        return false;
+    };
+    return items.filter(t => !isTemporary(t));
+}
+
+// ── Permanent items under temporary parents ─────────────────────────────────
+//
+// Desktop Mudlet keeps temporary and permanent items of a kind in ONE tree, and
+// a perm*() call resolves its parent by name among both — so
+// `permRegexTrigger("c", tostring(tempTriggerId), …)` hangs a permanent trigger
+// under a temporary one. The permanent child is an ordinary store node here
+// (the editor's tree, enable/disable by name, the engines' loadPerm all work on
+// it unchanged), but its parent is not: temporary items live only in their
+// engine, keyed by the numeric id the script was handed, and never touch the
+// store.
+//
+// So such a child's `parentId` names its parent in a form no store node can
+// carry — `temp:<id>` (store ids are UUIDs) — rather than inventing a store
+// node for the temporary parent. That keeps temporary items out of the store
+// entirely (no store write, save or re-render per temp item), lets every
+// engine tell a temp parent from a missing one by the prefix alone, and makes
+// "this node hangs off a temporary item" a property of the node itself:
+//
+//  - persistableNodes drops it with its whole subtree, as desktop's XMLexport
+//    skips a temporary root and so everything under it;
+//  - the script editor and the package exporter hide it (see visibleTreeNodes);
+//  - when the temporary parent is freed (the deferred cleanup after a kill) the
+//    engine reports it and ScriptingEngine removes the subtree from the store,
+//    as desktop's ~TTrigger deletes its children with it.
+
+/** Prefix of a `parentId` that names a temporary item rather than a node. */
+export const TEMP_PARENT_PREFIX = 'temp:';
+
+/** The `parentId` a permanent child of temporary item `id` carries. */
+export function tempParentRef(id: number): string {
+    return TEMP_PARENT_PREFIX + id;
+}
+
+/** Whether `parentId` names a temporary item (see TEMP_PARENT_PREFIX). */
+export function isTempParentRef(parentId: string | null | undefined): parentId is string {
+    return typeof parentId === 'string' && parentId.startsWith(TEMP_PARENT_PREFIX);
+}
+
+/** The temporary item's id a temp parent ref names, or null for anything else. */
+export function tempRefId(parentId: string | null | undefined): number | null {
+    if (!isTempParentRef(parentId)) return null;
+    const n = Number(parentId.slice(TEMP_PARENT_PREFIX.length));
+    return Number.isInteger(n) ? n : null;
+}
+
+/**
+ * The temporary item a node ultimately hangs off, or null when its whole
+ * ancestry is in the store. Temporary items are always roots (no temp* API
+ * takes a parent), so this is the top store ancestor's parent ref.
+ */
+export function tempRootOf<T extends { id: string; parentId: string | null }>(
+    node: T,
+    byId: ReadonlyMap<string, T>,
+): number | null {
+    let cur: T | undefined = node;
+    const guard = new Set<string>();
+    while (cur && !guard.has(cur.id)) {
+        if (isTempParentRef(cur.parentId)) return tempRefId(cur.parentId);
+        guard.add(cur.id);
+        cur = cur.parentId ? byId.get(cur.parentId) : undefined;
+    }
+    return null;
+}
+
+/** The nodes the script editor shows: everything but the permanent items that
+ *  hang off a temporary one, which desktop's editor drops along with their
+ *  parent's subtree whenever it saves (see TEMP_PARENT_PREFIX). */
+export function visibleTreeNodes<T extends { id: string; parentId: string | null }>(items: T[]): T[] {
+    if (!items.some(t => isTempParentRef(t.parentId))) return items;
+    const byId = new Map(items.map(t => [t.id, t]));
+    return items.filter(t => tempRootOf(t, byId) === null);
+}
+
 /** Returns true if the item and all its ancestors are enabled. */
 export function isEffectivelyEnabled<T extends { id: string; enabled: boolean; parentId: string | null }>(
     item: T,
@@ -1082,6 +1206,40 @@ export function isEffectivelyEnabled<T extends { id: string; enabled: boolean; p
         node = byId.get(node.parentId);
     }
     return true;
+}
+
+/**
+ * The items in tree order: Mudlet's pre-order walk, each node immediately
+ * followed by its whole subtree, siblings in the order the flat array holds
+ * them. The flat array alone is not that order — an item added to an older
+ * group (`permAlias`/`permKey` into a group made earlier) is appended at the
+ * end, after root items created since, while desktop puts it inside its group.
+ * An item whose parent is missing is walked as a root where it stands; a
+ * malformed cycle is broken rather than dropped.
+ */
+export function inTreeOrder<T extends { id: string; parentId: string | null }>(items: readonly T[]): T[] {
+    const ids = new Set(items.map(i => i.id));
+    const children = new Map<string, T[]>();
+    for (const item of items) {
+        if (!item.parentId || !ids.has(item.parentId)) continue;
+        let list = children.get(item.parentId);
+        if (!list) children.set(item.parentId, list = []);
+        list.push(item);
+    }
+    const out: T[] = [];
+    const seen = new Set<string>();
+    const walk = (item: T): void => {
+        if (seen.has(item.id)) return;
+        seen.add(item.id);
+        out.push(item);
+        for (const child of children.get(item.id) ?? []) walk(child);
+    };
+    for (const item of items) {
+        if (!item.parentId || !ids.has(item.parentId)) walk(item);
+    }
+    // Whatever is left hangs off a cycle with no root above it.
+    for (const item of items) walk(item);
+    return out;
 }
 
 /**
@@ -1321,17 +1479,6 @@ export function proxyCanInspectCertificates(proxyUrl: string): boolean {
 export function connectionDisplayAddr(c: MudConnection): string {
     if (c.mode === 'mud') return `${c.host ?? ''}:${c.port ?? 23}`;
     return c.url ?? '';
-}
-
-/** Whether the connection's link to the *game server* is TLS-encrypted — the
- *  signal reported as the NEW-ENVIRON `TLS` variable. In `websocket` mode the
- *  browser connects straight to the game, so a `wss://` URL is end-to-end TLS.
- *  In `mud` (proxy) mode the browser↔proxy hop being `wss://` says nothing about
- *  the proxy↔game hop: that leg is a plaintext telnet socket unless `tls` is set,
- *  which makes the proxy perform a TLS handshake with the game instead. */
-export function connectionSecureTransport(c: MudConnection): boolean {
-    if (c.mode === 'mud') return !!c.tls;
-    return (c.url ?? '').trim().toLowerCase().startsWith('wss://');
 }
 
 /**

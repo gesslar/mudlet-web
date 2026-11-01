@@ -30,6 +30,10 @@ export class GlobalEventChannel {
     ) {
         if (typeof BroadcastChannel === 'undefined') return;
         this.channel = new BroadcastChannel('mudlet:global-events');
+        // Dispatched straight from the message event — no timer, await or
+        // batching. The BroadcastChannel hop is the only delay between tabs
+        // (mudlet-web#453; desktop runs other profiles' handlers inline), so
+        // nothing here may add another.
         this.channel.onmessage = (e: MessageEvent) => {
             const msg = e.data as GlobalEventMessage | null;
             if (!msg || typeof msg.name !== 'string') return;
@@ -53,7 +57,7 @@ export class GlobalEventChannel {
                 out.push(a);
             } else {
                 throw new Error(
-                    `raiseGlobalEvent: bad argument type #${i + 1} (boolean, number, string or nil expected, got ${typeof a}!)`,
+                    `raiseGlobalEvent: bad argument #${i + 1} type (boolean, number, string or nil expected, got a ${typeof a}!)`,
                 );
             }
         }

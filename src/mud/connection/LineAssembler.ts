@@ -1,4 +1,5 @@
-import { scanEscape } from "../text/ansiEscapes";
+import { cursorForwardCount, scanEscape } from "../text/ansiEscapes";
+import { workerClock } from "../timers/workerClock";
 import {
     SERVER_WRAP_FLUSH_DELAY_MS,
     SERVER_WRAP_MAX_JOINED_LENGTH,
@@ -29,11 +30,11 @@ export interface LineAssemblerCallbacks {
     /** Deliver assembled whole lines (or a flushed prompt tail) downstream —
      *  the trigger pipeline and rendering treat each chunk as complete lines. */
     onChunk(text: string, ts: number): void;
-    /** Fired for every prompt marker (IAC GA/EOR), after it flushed the held
-     *  tail — the owner emits its `prompt` event here. `promptLine` is false
-     *  for a bare marker that had no text to end: there is no prompt line then,
-     *  and the next line the game sends is not one either. */
-    onPrompt(promptLine: boolean): void;
+    /** Fired for every prompt marker (IAC GA/EOR), after it flushed the line
+     *  it ends — the owner emits its `prompt` event here, and the line just
+     *  handed to `onChunk` is the prompt. A bare marker ends an empty line, so
+     *  there always is one. */
+    onPrompt(): void;
     /** Fired after an idle-timer flush so the owner can render any messages
      *  the flushed chunk produced (MudClient.flushMessageBuffer). */
     onIdleFlush(): void;
@@ -78,12 +79,6 @@ export class LineAssembler {
      *  partial lines here, because our render path finalizes every emitted
      *  chunk and has no downstream open-line carry. */
     private _gaDriver = false;
-    /** True at the start of a GA-driven data block — i.e. before any content of
-     *  the current post-GA transmission has been seen. Drives the
-     *  `fixUnnecessaryLinebreaks` leading-newline strip, which fires at most once
-     *  per block. Set true on connect and after each prompt flush, cleared once
-     *  the block's leading-newline question has been settled. */
-    private atPromptBlockStart = true;
     private fixUnnecessaryLinebreaks: boolean;
 
     // ── server-wrap join (Mudlet TBuffer::append's mUndoServerWrap block) ────
@@ -129,9 +124,44 @@ export class LineAssembler {
     }
 
     /** Mudlet `setConfig("fixUnnecessaryLinebreaks", …)`. Takes effect on the
-     *  next GA-driven block; never retroactive. */
+     *  next block that ends in a prompt marker; never retroactive. */
     setFixUnnecessaryLinebreaks(enabled: boolean): void {
         this.fixUnnecessaryLinebreaks = enabled;
+    }
+
+    /**
+     * Mudlet's "Fix unnecessary linebreaks on GA servers" (cTelnet::gotPrompt
+     * under `mUSE_IRE_DRIVER_BUGFIX`): from a block of one read that ENDS in
+     * IAC GA/EOR, drop a single leading newline — after any leading SGR
+     * escapes, none of which it removes. `block` is that run's raw text, up to
+     * the marker; it is returned unchanged when the option is off.
+     *
+     * Only such a block is touched. Text that arrives on its own, with no
+     * prompt marker after it — the reply that follows a prompt a moment later,
+     * say — keeps its newline, as desktop's gotRest posts it untouched.
+     *
+     * Desktop strips from `mMudData`, which once GA-driven holds only this
+     * block (every read's leftovers are posted straight away). Before the first
+     * marker it also still holds whatever partial line the previous reads left
+     * waiting for the posting timer, so a block continuing one does not start
+     * at its own first byte — which is what the held tail stands in for here.
+     */
+    stripPromptBlockNewline(block: string): string {
+        if (!this.fixUnnecessaryLinebreaks) return block;
+        if (!this._gaDriver && this.pendingLineTail.length > 0) return block;
+        return stripLeadingPromptNewline(block);
+    }
+
+    /**
+     * The fix-up above for text posted ahead of an encoding change in a read
+     * (cTelnet::postHeldDataBeforeEncodingChange): it may open a prompt whose
+     * GA the posting hides it from, so once GA-driven its leading newline is
+     * dropped there instead. Null when the fix does not apply — then the GA
+     * still judges the rest of the block.
+     */
+    stripPostedPromptStart(text: string): string | null {
+        if (!this.fixUnnecessaryLinebreaks || !this._gaDriver) return null;
+        return stripLeadingPromptNewline(text);
     }
 
     /** Mudlet `setConfig("undoServerWrap", …)`. Turning it off commits anything
@@ -147,11 +177,17 @@ export class LineAssembler {
         this.undoServerWrapWidth = width;
     }
 
+    /** Nothing held back: no partial tail and no line waiting on a wrap
+     *  continuation, so no timer of ours has anything to fire on. MudClient
+     *  only pauses between slices of a large read at such a point. */
+    get idle(): boolean {
+        return this.pendingLineTail.length === 0 && this.serverWrapPending === null;
+    }
+
     /** Drop all held state (call on connect and after close). */
     reset(): void {
         this.pendingLineTail = "";
         this._gaDriver = false;
-        this.atPromptBlockStart = true;
         this.clearTailTimer();
         this.serverWrapPending = null;
         this.serverWrapPendingSegmentLength = 0;
@@ -167,25 +203,8 @@ export class LineAssembler {
     feed(decoded: string, hasPrompt: boolean, ts: number): void {
         if (decoded.length > 0) {
             this.clearTailTimer();
-            let combined = this.pendingLineTail + decoded;
-            // Mudlet's "Fix unnecessary linebreaks on GA servers": at the start
-            // of a GA-driven block, drop a single spurious leading newline (the
-            // IRE-driver bug). Done at block-start rather than at the GA — like
-            // Mudlet's cTelnet::gotPrompt — because our render path emits whole
-            // lines eagerly and can't retract them once the GA arrives. The block
-            // after a GA begins at the very next byte, so its leading newline is
-            // the same one Mudlet would strip from mMudData at the next GA.
-            // (Deviation: Mudlet also strips the first block at the first GA via
-            // buffering; we can't see that block is GA-driven until the GA lands,
-            // so the very first transmission keeps its leading newline.)
-            if (this.fixUnnecessaryLinebreaks && this._gaDriver && this.atPromptBlockStart) {
-                const { result, decided } = stripLeadingPromptNewline(combined);
-                if (decided) {
-                    combined = result;
-                    this.atPromptBlockStart = false;
-                }
-            }
-            const lastNl = combined.lastIndexOf('\n');
+            const combined = this.pendingLineTail + decoded;
+            const lastNl = lastLineEnd(combined);
             if (lastNl === -1) {
                 this.pendingLineTail = combined;
             } else {
@@ -196,12 +215,20 @@ export class LineAssembler {
         }
 
         if (hasPrompt) {
-            const promptLine = this.flush(ts);
+            // A marker with no text in front of it still ends a line: an empty
+            // one, flagged as the prompt. Mudlet's gotPrompt posts the '\xff'
+            // on its own and TBuffer::commitLineData commits the empty open
+            // line with promptBuffer set and runs the triggers on it — only an
+            // empty *timer* posting ('\r') is dropped. So `l1\r\n` + GA stores
+            // `[l1][]` with prompt triggers firing on "", and a game that ends
+            // every prompt with `\r\n` + GA still gets its prompt triggers.
+            // (A held incomplete escape stays held for the next line.)
+            if (!this.flush(ts)) {
+                this.commitServerWrapPending(ts);
+                this.callbacks.onChunk('\n', ts);
+            }
             this._gaDriver = true;
-            // The next data block (the next transmission) starts fresh, so its
-            // leading newline is again a candidate for the IRE-bug strip above.
-            this.atPromptBlockStart = true;
-            this.callbacks.onPrompt(promptLine);
+            this.callbacks.onPrompt();
         } else if (this.pendingLineTail.length > 0 && !this._gaDriver) {
             // Once GA-driven, only a newline or the next prompt marker ends a
             // line — Mudlet's gotRest posts the fragment into TBuffer's open
@@ -269,15 +296,26 @@ export class LineAssembler {
      */
     private emitServerLines(ready: string, ts: number): void {
         if (!this.undoServerWrap) {
-            this.callbacks.onChunk(ready, ts);
+            this.callbacks.onChunk(ready.replace(EOT_PATTERN, '\n'), ts);
             return;
         }
-        // `ready` always ends in '\n', so the split's last element is the empty
-        // string after it rather than a line of its own.
-        const lines = ready.split('\n');
-        lines.pop();
+        // `ready` always ends in a line end, so the split's last element is the
+        // empty string after it rather than a line of its own.
+        const parts = ready.split(LINE_END_SPLIT);
         let out = '';
-        for (const line of lines) out += this.consumeServerLine(line);
+        for (let i = 0; i + 1 < parts.length; i += 2) {
+            const line = parts[i];
+            if (parts[i + 1] === '\n') {
+                out += this.consumeServerLine(line);
+                continue;
+            }
+            // An EOT is never a wrap the game made: Mudlet's server-wrap join
+            // looks only at '\n', and any other line ending commits the held
+            // line on its own first (TBuffer::flushPendingServerWrapJoin).
+            const pending = this.takeServerWrapPending();
+            if (pending !== null) out += pending + '\n';
+            out += line + '\n';
+        }
         if (out.length > 0) this.callbacks.onChunk(out, ts);
     }
 
@@ -371,7 +409,7 @@ export class LineAssembler {
     private startServerWrapTimer(): void {
         this.clearServerWrapTimer();
         this.serverWrapDeadline = Date.now() + SERVER_WRAP_FLUSH_DELAY_MS;
-        this.serverWrapTimer = window.setTimeout(() => {
+        this.serverWrapTimer = workerClock.setTimeout(() => {
             this.serverWrapTimer = null;
             this.serverWrapDeadline = null;
             if (this.commitServerWrapPending(Date.now())) this.callbacks.onIdleFlush();
@@ -380,17 +418,28 @@ export class LineAssembler {
 
     private clearServerWrapTimer(): void {
         if (this.serverWrapTimer !== null) {
-            clearTimeout(this.serverWrapTimer);
+            workerClock.clearTimeout(this.serverWrapTimer);
             this.serverWrapTimer = null;
         }
         this.serverWrapDeadline = null;
     }
 
+    // Both idle flushes run on the worker clock: a prompt without GA reaches
+    // prompt triggers after promptTimeoutMs in a hidden tab too, not on the
+    // next throttled main-thread wake-up (mudlet-web#441).
     private scheduleTailFlush(): void {
         if (this.pendingTailTimer !== null) return;
-        this.pendingTailTimer = window.setTimeout(() => {
+        this.pendingTailTimer = workerClock.setTimeout(() => {
             this.pendingTailTimer = null;
             if (this.pendingLineTail.length === 0) return;
+            // A fragment with nothing to show — colour changes and other
+            // escapes only — is not a line. Mudlet's timer posting ('\r')
+            // applies its escapes and then drops the empty line it was left
+            // with (TBuffer::commitLineData: "empty timer posting"), so the
+            // colours carry on into the next text. Holding the fragment
+            // in front of that text does the same; flushing it made an empty
+            // line that triggers fired on and that shifted getLines().
+            if (!hasVisibleText(this.pendingLineTail)) return;
             this.flush(Date.now());
             this.callbacks.onIdleFlush();
         }, this.promptTimeoutMs);
@@ -398,10 +447,25 @@ export class LineAssembler {
 
     private clearTailTimer(): void {
         if (this.pendingTailTimer !== null) {
-            clearTimeout(this.pendingTailTimer);
+            workerClock.clearTimeout(this.pendingTailTimer);
             this.pendingTailTimer = null;
         }
     }
+}
+
+/**
+ * EOT (0x04) from the game ends a line exactly as '\n' does: Mudlet's TBuffer
+ * counts it among the characters that commit a line (CHAR_IS_COMMIT_CHAR), drops
+ * the byte, and stores the line as an ordinary, non-prompt one. Unlike '\n' it is
+ * never taken for a server wrap, and the "fix unnecessary linebreaks" strip —
+ * done on the raw block before this — does not touch it.
+ */
+const EOT_PATTERN = /\x04/g;
+const LINE_END_SPLIT = /([\n\x04])/;
+
+/** Index of the last line end ('\n' or EOT) in `s`, or -1. */
+function lastLineEnd(s: string): number {
+    return Math.max(s.lastIndexOf('\n'), s.lastIndexOf('\x04'));
 }
 
 /**
@@ -409,36 +473,26 @@ export class LineAssembler {
  * `cTelnet::gotPrompt` (gated there on `mUSE_IRE_DRIVER_BUGFIX && mGA_Driver`).
  * IRE-style servers prepend a spurious <LF> to each GA-terminated transmission,
  * which renders as a blank line before every prompt block. This removes a single
- * leading newline from the front of a GA-driven block — first skipping any
+ * leading newline from the front of a block that ends in GA — first skipping any
  * leading ANSI SGR escape sequence, exactly as Mudlet does (`if (mMudData[j] ==
- * 0x1B) … scan to 'm'`).
- *
- * Returns the (possibly trimmed) string and `decided`:
- *  - `decided: true`  — the leading-newline question is settled for this block
- *    (a newline was removed, or the first real byte wasn't a newline).
- *  - `decided: false` — so far the block is *only* ANSI escapes, or ends inside
- *    an incomplete escape (no terminating 'm' yet). The caller should keep the
- *    block-start flag set and retry once more bytes arrive. (Mudlet never hits
- *    this case — it has the whole block in hand at GA time — but we decide
- *    incrementally as frames stream in.)
+ * 0x1B) … scan to 'm'`). A block that is only escapes, or ends inside one, is
+ * returned as it is.
  */
-function stripLeadingPromptNewline(s: string): { result: string; decided: boolean } {
+function stripLeadingPromptNewline(s: string): string {
     let i = 0;
     while (i < s.length) {
         if (s.charCodeAt(i) === 0x1b) {
             // Skip an ANSI escape up to and including its 'm' (SGR) terminator.
             let j = i + 1;
             while (j < s.length && s[j] !== 'm') j++;
-            if (j >= s.length) return { result: s, decided: false }; // incomplete — wait
+            if (j >= s.length) return s;
             i = j + 1;
             continue;
         }
         // First non-escape byte reached: strip it iff it's the spurious newline.
-        if (s[i] === '\n') return { result: s.slice(0, i) + s.slice(i + 1), decided: true };
-        return { result: s, decided: true };
+        return s[i] === '\n' ? s.slice(0, i) + s.slice(i + 1) : s;
     }
-    // Ran off the end with only complete ANSI escapes — no content byte yet.
-    return { result: s, decided: false };
+    return s;
 }
 
 /**
@@ -454,4 +508,19 @@ function incompleteEscapeTailStart(s: string): number {
     const esc = s.lastIndexOf("\x1b");
     if (esc === -1) return -1;
     return scanEscape(s, esc).kind === "incomplete" ? esc : -1;
+}
+
+/**
+ * Whether `s` holds anything besides escape sequences — anything that would
+ * put a character in the line. A cursor-forward counts: it stands for spaces.
+ */
+function hasVisibleText(s: string): boolean {
+    let i = 0;
+    while (i < s.length) {
+        if (s.charCodeAt(i) !== 0x1b) return true;
+        const scan = scanEscape(s, i);
+        if (scan.kind === "csi" && scan.finalByte === "C" && cursorForwardCount(scan.params) > 0) return true;
+        i = scan.end;
+    }
+    return false;
 }

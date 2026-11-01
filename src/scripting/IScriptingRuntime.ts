@@ -46,6 +46,17 @@ export type VariableEdit =
     | { op: 'move'; path: VariablePathSegment[]; to: VariablePathSegment }
     | { op: 'delete'; path: VariablePathSegment[] };
 
+/** A script's event-handler-list registration (Host::mEventHandlerMap entry):
+ *  the name its handler function is looked up by, whether it may run right now
+ *  (isActive() && ancestorsActive()), and the events it lists. No events means
+ *  the script is not registered at all. */
+export interface ScriptHandlerEntry {
+    id: string;
+    name: string;
+    active: boolean;
+    events: string[];
+}
+
 export interface IScriptingRuntime {
     load(code: string, name: string): void;
     /** Execute a code chunk once, without match context. Used for timers and
@@ -76,6 +87,11 @@ export interface IScriptingRuntime {
      * Both halves are the raw bytes the subnegotiation carried.
      */
     setChannel102Value(variable: number, value: number): void;
+    /**
+     * Write one ATCP message into the runtime's `atcp` table: `name` is the
+     * dotless message name (`CharVitals`), `value` its string.
+     */
+    setAtcpValue(name: string, value: string): void;
     runWithMatches(
         code: string,
         name: string,
@@ -93,6 +109,17 @@ export interface IScriptingRuntime {
          *  it are undisturbed. */
         chunkName?: string,
     ): void;
+    /** Run `fn` with a fire's captures in place for selectCaptureGroup and the
+     *  like, leaving the script-facing `matches` table alone — what a trigger
+     *  whose command is sent, or which has no script, hands on (desktop's
+     *  setCaptureGroups without the call that builds `matches`). */
+    withCaptures?(
+        matches: (string | undefined)[],
+        captureSpans: CaptureSpan[] | undefined,
+        namedSpans: Record<string, CaptureSpan> | undefined,
+        fullMatchSpan: CaptureSpan | undefined,
+        fn: () => void,
+    ): void;
     destroy(): void;
     /** Bytes behind a path in the runtime's read-only bundled namespace, or null
      *  when it has none / the path is not one of them. Optional because it is a
@@ -109,6 +136,15 @@ export interface IScriptingRuntime {
      * stock "Repeat Last Command" key (`send(command)`).
      */
     setCommand(command: string): void;
+    /** Start an alias pass for `command`: {@link setCommand}, and drop what an
+     *  enclosing pass kept for {@link settleCommandAfterAliasPass}. */
+    setExpandedCommand?(command: string): void;
+    /** End of an alias pass, at every depth: `command` holds the last command
+     *  expanded unless a script set it (TLuaInterpreter::settleCommandAfterAliasPass). */
+    settleCommandAfterAliasPass?(): void;
+    /** Run `fn`, whose entry into the runtime is an alias's script — the only
+     *  caller expandAlias() hands its own `command` back to. */
+    asAliasScript?<T>(fn: () => T): T;
     /**
      * Evaluate a Lua-function trigger pattern. Side effects (raiseEvent, etc.)
      * always run; the trigger "matches" only when the body returns truthy.
@@ -134,36 +170,21 @@ export interface IScriptingRuntime {
      */
     startSpeedWalk(from: number, to: number): void;
     /**
-     * Kill every event handler registered by `wrapScript` for the given
-     * script id. Called when a script is removed or disabled so its handlers
-     * stop firing without waiting for a full runtime reload.
+     * Bring scripts' event-handler-list registrations up to date: register,
+     * re-register after a list change (to the end, as setEventHandlerList
+     * does), rename, flip the active flag, or drop one (empty `events`).
      */
-    killScriptHandlers(scriptId: string): void;
-    /**
-     * True when a script-created (temp) alias/trigger with this id is live and of
-     * the given type. Backs exists(id, "alias"/"trigger") for temp items, which
-     * (unlike permanent items) don't live in the persisted store.
-     */
-    tempItemExists(id: number, type: string): boolean;
-    /** A live temp item of `type` carrying this script-supplied name (Mudlet's
-     *  tempComplexRegexTrigger is the one temp API that takes one), or null. */
-    tempItemIdByName(name: string, type: string): number | null;
+    syncScriptHandlers(entries: ScriptHandlerEntry[]): void;
     /** Publish one use of a server-defined MXP element as `mxp.<element>`. */
     setMxpElement(
         name: string,
         attrs: Record<string, string>,
         body?: { text: string; actions: string[] },
     ): void;
-    /** Whether a live temp item is enabled — backs `isActive(id, type)`. */
-    tempItemEnabled(id: number): boolean;
-    /** enable/disable a live temp item by id — backs enableTrigger/disableTrigger
-     *  (and the alias pair) when handed the numeric id rather than a name. */
-    setTempItemEnabled(id: number, enabled: boolean): boolean;
-    /** Free every temp item killed since the last call, or only those of `type`.
-     *  A killed item stops firing immediately but stays findable until here,
-     *  which is Mudlet's deferred per-unit cleanup: aliases are reaped when
-     *  nested alias processing unwinds, triggers when the line batch finishes. */
-    reapKilledTempItems(type?: 'alias' | 'trigger'): void;
+    /** Whether the capture globals are being built, when a pass a __gc
+     *  finaliser starts is refused (TLuaInterpreter::buildingCaptureTables).
+     *  Optional: a runtime with no finalisers never builds under one. */
+    buildingCaptureTables?(): boolean;
     /** Rebuild saved Lua globals (a Mudlet `<VariablePackage>` tree) into `_G`. */
     restoreVariables(vars: MudletVariable[]): void;
     /** Snapshot the save-listed globals out of `_G` into a variable tree. */

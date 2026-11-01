@@ -77,6 +77,22 @@ that file as the source of truth.
 - **`profileMode`** — `'single'` (default: one shared profile regardless of
   the account entered) or `'perLogin'` (find-or-create a profile per account
   name, so each login keeps its own scripts/layout/files).
+- **`profileDefaults`** — profile settings a managed profile starts with
+  (`Partial<ProfileSettings>`), applied once when the profile is created. The
+  player can change them in Settings afterwards and the change sticks; editing
+  this field reaches new profiles only, not ones a browser already has.
+  `setConfig` options go in its `config` bag — but only the ones with no field
+  of their own: clear-input-after-send is `autoClearInput`, not
+  `config.autoClearInputLine`, and a key in the wrong place is silently ignored.
+  The `ProfileSettings` type (exported) lists the fields.
+
+  ```ts
+  profileDefaults: {
+      fontSize: 12,
+      autoClearInput: true,
+      config: { versionInTTYPE: true, enableBlinkText: true },
+  },
+  ```
 - **`packages`** — the exact `BrandPackage[]` preinstalled into every profile on
   first open, **replacing** Mudlet Web's stock defaults rather than adding to
   them. Leave it unset to get the stock defaults (`run-lua-code` plus one
@@ -85,6 +101,11 @@ that file as the source of truth.
   returns the exact list, so you can drop one without vendoring the rest —
   `packages: stock => stock.filter(p => p.name !== 'mudlet-base-ui')`.
   See [Bundling Lua packages](#bundling-lua-packages) below.
+- **`requestPersistentStorage`** — `false` stops the client from calling
+  `navigator.storage.persist()` when a profile is opened or imported (default
+  `true`). Firefox turns that call into a permission prompt; opt out if your
+  players' data lives server-side or you'd rather not show it. Profiles then
+  stay in best-effort storage, which the browser may evict under pressure.
 - **`themes`** / **`availableThemes`** / **`defaultTheme`** — brand color
   themes and picker configuration (see [Theming](#theming) below).
 - **`toolbar`** — hide stock buttons, place your own commands, rebuild or remove

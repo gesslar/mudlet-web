@@ -43,7 +43,7 @@ export { BrandLoginScreen } from "./ui/BrandLoginScreen";
 export { useBrandLogin, type UseBrandLoginResult } from "./ui/useBrandLogin";
 export { BrandLoginFields, type BrandLoginFieldsProps } from "./ui/BrandLoginFields";
 export { setSessionCredentials, getSessionCredentials, getLastSessionCredentials, type SessionCredentials } from "./utils/sessionCredentials";
-export type { MudConnection, ConnectionMode } from "./storage/schema";
+export type { MudConnection, ConnectionMode, ProfileSettings } from "./storage/schema";
 
 // Core
 export { EventBus } from "./core/EventBus";
@@ -101,7 +101,6 @@ export type { OutputRendererControls } from "./ui/output/OutputRenderer";
 // Client (lower-level API)
 export { MudClient } from "./mud/connection/MudClient";
 export type { MudClientOptions } from "./mud/connection/MudClient";
-export { PingTracker } from "./mud/connection/PingTracker";
 export { createPassthroughProcessor } from "./mud/triggers/ChunkProcessor";
 export type { ChunkProcessor } from "./mud/triggers/ChunkProcessor";
 export { TriggerEngine } from "./mud/triggers/TriggerEngine";

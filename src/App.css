@@ -40,6 +40,40 @@
     font-display: swap;
 }
 
+/* Bitstream Vera Sans — the proportional face of the same family, which Mudlet
+ * also registers at startup (src/fonts/ttf-bitstream-vera-1.10), so scripts can
+ * ask for it by name and get a proportional font everywhere: calcFontSize's
+ * column width and MXP's proportional frames are measured against it. Same
+ * licence, see src/assets/fonts/bitstream-vera-sans/COPYRIGHT.TXT. */
+@font-face {
+    font-family: 'Bitstream Vera Sans';
+    src: url('./assets/fonts/bitstream-vera-sans/Vera.woff2') format('woff2');
+    font-weight: 400;
+    font-style: normal;
+    font-display: swap;
+}
+@font-face {
+    font-family: 'Bitstream Vera Sans';
+    src: url('./assets/fonts/bitstream-vera-sans/VeraBd.woff2') format('woff2');
+    font-weight: 700;
+    font-style: normal;
+    font-display: swap;
+}
+@font-face {
+    font-family: 'Bitstream Vera Sans';
+    src: url('./assets/fonts/bitstream-vera-sans/VeraIt.woff2') format('woff2');
+    font-weight: 400;
+    font-style: italic;
+    font-display: swap;
+}
+@font-face {
+    font-family: 'Bitstream Vera Sans';
+    src: url('./assets/fonts/bitstream-vera-sans/VeraBI.woff2') format('woff2');
+    font-weight: 700;
+    font-style: italic;
+    font-display: swap;
+}
+
 /* Ubuntu / Ubuntu Mono — bundled for the same reason as Vera above: Mudlet
  * registers both families into Qt's font database at startup (src/main.cpp
  * copies src/fonts/ubuntu-font-family-0.83 into the Mudlet home dir), so
@@ -2141,6 +2175,37 @@ body.is-sorting {
     display: block;
 }
 
+/* Scrollback off screen skips style, layout and paint (#443, #457). Rows are
+   grouped into blocks of 100 (src/ui/output/outputRows.ts) and the block, not
+   the row, carries `content-visibility`: on every row it made tens of
+   thousands of elements the browser had to track for visibility each frame,
+   and that tracking grew to the largest cost in a frame. `auto` keeps a
+   skipped block in the DOM, the accessibility tree, find-in-page and the
+   selection, and renders it again the moment it nears the viewport or a
+   selection reaches into it.
+
+   The open block — the newest, still being written to — is left out: it is
+   at most a hundred rows, it is where the reader is, and while they are
+   scrolled up (split view) its height then stays its real one rather than
+   what it measured before its last rows arrived.
+
+   Placeholder height is a full block until a block has been laid out once;
+   `auto` then remembers its real height, wrapped rows included.
+
+   Paint containment comes with it and clips a block to its own box, so the
+   clip edge is pushed out: a span's 2px padding and a tall glyph may still
+   reach past the first or last row as they always could. */
+.output-block {
+    display: block;
+}
+
+.output-block:not(.output-block--open) {
+    content-visibility: auto;
+    contain-intrinsic-block-size: auto 130em;
+    contain-intrinsic-block-size: auto 100lh;
+    overflow-clip-margin: 0.5em;
+}
+
 .output-msg-text {
     display: flex;
     align-items: baseline;
@@ -2293,6 +2358,10 @@ body.is-sorting {
     font-size: 13px;
     padding: 4px 8px;
     outline: none;
+    /* A one-row <textarea> (Shift+Enter stages more lines, as on desktop). */
+    display: block;
+    resize: none;
+    overflow: auto;
 }
 .window-cmdline:focus {
     border-color: var(--accent);

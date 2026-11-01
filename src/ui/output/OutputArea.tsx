@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type React from 'react';
 import type { MudSession } from '../../mud/MudSession';
 import { useStickyOutput, DEFAULT_STICKY_LINES } from '../../hooks/useOutput';
@@ -6,8 +6,11 @@ import { useAppStore, useProfileField, useConnectionId } from '../../storage';
 import { StickyOutputPanel } from './StickyOutputPanel';
 import { OutputSearchBar } from './OutputSearchBar';
 import { searchStepDirection } from './outputSearch';
-import { matchClearSplitKey } from './clearSplit';
+import { matchClearSplitKey, matchPageScrollKey } from './clearSplit';
+import { claimShortcutKeys } from '../../hooks/useKeyboardShortcuts';
 import type { OutputMenuExtraItem } from './OutputContextMenu';
+import type { SelectionBounds } from './outputCopy';
+import { mouseEventMenuItems } from '../MouseEventRegistry';
 import { ScreenReaderLog } from './ScreenReaderLog';
 import { CaretReviewPanel } from './CaretReviewPanel';
 import { LabelOverlay } from '../labels/LabelOverlay';
@@ -63,6 +66,11 @@ export function OutputArea({ session, stickyLines = DEFAULT_STICKY_LINES, comman
     // Bumped on every Ctrl+F so a second press re-focuses and re-seeds the
     // already-open bar instead of being a no-op.
     const [searchFocusNonce, setSearchFocusNonce] = useState(0);
+    // Whether that open moves focus into the find box. Ctrl+F does; F3 under
+    // f3SearchEnabled does not — desktop's search box sits in the toolbar and
+    // F3 drives it from wherever focus is, so typing still reaches the command
+    // line (mudlet-web#379).
+    const [searchTakesFocus, setSearchTakesFocus] = useState(true);
 
     // The split-view panel shows cloned lines, so search highlights only appear
     // there if it is rebuilt from the freshly marked originals. No-op when the
@@ -73,8 +81,9 @@ export function OutputArea({ session, stickyLines = DEFAULT_STICKY_LINES, comman
         if (isSplitViewRef.current) controls?.populateStickyArea();
     }, [controls]);
 
-    const openSearch = useCallback(() => {
+    const openSearch = useCallback((takeFocus = true) => {
         setSearchOpen(true);
+        setSearchTakesFocus(takeFocus);
         setSearchFocusNonce(n => n + 1);
     }, []);
 
@@ -125,6 +134,20 @@ export function OutputArea({ session, stickyLines = DEFAULT_STICKY_LINES, comman
         return () => document.removeEventListener('keydown', onKey, true);
     }, [scrollToBottom]);
 
+    // PageUp / PageDown in the command line page the main console up and down
+    // (TCommandLine::event) — the textarea would otherwise swallow them moving
+    // its own caret. Capture phase, like Ctrl+Return above.
+    useEffect(() => {
+        const onKey = (e: KeyboardEvent) => {
+            const direction = matchPageScrollKey(e);
+            if (!direction) return;
+            e.preventDefault();
+            session.windows.scrollPage('main', direction);
+        };
+        document.addEventListener('keydown', onKey, true);
+        return () => document.removeEventListener('keydown', onKey, true);
+    }, [session]);
+
     // Mudlet's f3SearchEnabled: F3 / Shift+F3 reach buffer search even when the
     // find bar is closed. Mudlet's search box lives permanently in the console
     // toolbar, so its F3 always has something to drive; ours is a transient
@@ -138,26 +161,33 @@ export function OutputArea({ session, stickyLines = DEFAULT_STICKY_LINES, comman
     // reach rather than taking a working shortcut away.
     const searchOpenRef = useRef(searchOpen);
     searchOpenRef.current = searchOpen;
+    //
+    // While the setting is on the search HOLDS F3 / Shift+F3, open or closed:
+    // desktop makes them QShortcuts, which Qt resolves before the command line
+    // offers the key to the key unit, so a key binding on F3 does not fire
+    // (mudlet-web#379). Claimed like a menu accelerator, so the Lua keybinding
+    // listener leaves the key to us — and the bar opens without taking focus,
+    // so the player's typing and their other bindings keep working.
     useEffect(() => {
         if (!a11ySearch) return;
+        const release = claimShortcutKeys(e => searchStepDirection(e) !== null);
         const onKey = (e: KeyboardEvent) => {
             if (searchStepDirection(e) === null) return;
             if (searchOpenRef.current) return;
             e.preventDefault();
-            openSearch();
+            openSearch(false);
         };
         document.addEventListener('keydown', onKey, true);
-        return () => document.removeEventListener('keydown', onKey, true);
+        return () => {
+            release();
+            document.removeEventListener('keydown', onKey, true);
+        };
     }, [a11ySearch, openSearch]);
 
     // Mudlet addMouseEvent: custom entries folded into the output right-click
     // menu. Evaluated lazily when the menu opens (the registry can change).
-    const getMenuExtraItems = useCallback((): OutputMenuExtraItem[] =>
-        session.mouseEvents.list().map(item => ({
-            label: item.displayName,
-            tooltip: item.tooltip || undefined,
-            onClick: () => session.mouseEvents.dispatch(item.uniqueName),
-        })), [session]);
+    const getMenuExtraItems = useCallback((selection: SelectionBounds): OutputMenuExtraItem[] =>
+        mouseEventMenuItems(session.mouseEvents, 'main', selection), [session]);
 
     useEffect(() => {
         session.markOutputReady();
@@ -175,16 +205,35 @@ export function OutputArea({ session, stickyLines = DEFAULT_STICKY_LINES, comman
         };
     }, [session, outputRef]);
 
+    // NAWS follows the main console's font and timestamp gutter as desktop's
+    // does (cTelnet::sendCurrentNAWS reads the screen width in characters and
+    // takes the gutter off it). A font change leaves the element's box alone,
+    // so no resize observer fires: re-measure the grid once the new size is
+    // laid out, and again a frame later in case the face was still loading.
+    const outputFontFamily = useProfileField('outputFont')?.family;
+    useLayoutEffect(() => {
+        session.setTimestampsShown(!!showTimestamps);
+    }, [session, showTimestamps]);
+    useLayoutEffect(() => {
+        session.windows.remeasureMainGrid();
+        if (typeof requestAnimationFrame !== 'function') return;
+        const frame = requestAnimationFrame(() => session.windows.remeasureMainGrid());
+        return () => cancelAnimationFrame(frame);
+    }, [session, fontSize, outputFontFamily]);
+
     // Mudlet setBorderTop/Bottom/Left/Right insets the console; labels still
     // own the full main-viewport so they can be placed in the carved area.
     // MXP frames add their own insets on top, so a server that tiles frames
     // against the edges pushes the console out of their way instead of having
     // them paint over it.
+    // A negative border (Profile Preferences offer one, to push the text off the
+    // screen) has no padding to stand for, so it insets nothing.
+    const inset = (border: number | undefined, mxp: number) => Math.max(0, border ?? 0) + mxp || undefined;
     const contentStyle: React.CSSProperties = {
-        paddingTop: (borders?.top ?? 0) + mxpBorders.top || undefined,
-        paddingRight: (borders?.right ?? 0) + mxpBorders.right || undefined,
-        paddingBottom: (borders?.bottom ?? 0) + mxpBorders.bottom || undefined,
-        paddingLeft: (borders?.left ?? 0) + mxpBorders.left || undefined,
+        paddingTop: inset(borders?.top, mxpBorders.top),
+        paddingRight: inset(borders?.right, mxpBorders.right),
+        paddingBottom: inset(borders?.bottom, mxpBorders.bottom),
+        paddingLeft: inset(borders?.left, mxpBorders.left),
         background: borderColor
             ? `rgba(${borderColor.r}, ${borderColor.g}, ${borderColor.b}, ${borderColor.a / 255})`
             : undefined,
@@ -213,7 +262,7 @@ export function OutputArea({ session, stickyLines = DEFAULT_STICKY_LINES, comman
                     foreground={outputForeground}
                     showTimestamps={showTimestamps}
                     onToggleTimestamps={() => connectionId && patchConnectionProfile(connectionId, { showTimestamps: !showTimestamps })}
-                    onFind={openSearch}
+                    onFind={() => openSearch()}
                     sourceName={connectionName}
                     getMenuExtraItems={getMenuExtraItems}
                     commandInputRef={commandInputRef}
@@ -230,6 +279,7 @@ export function OutputArea({ session, stickyLines = DEFAULT_STICKY_LINES, comman
                         session={session}
                         outputRef={outputRef}
                         focusNonce={searchFocusNonce}
+                        takeFocus={searchTakesFocus}
                         onClose={() => setSearchOpen(false)}
                         refreshSticky={refreshSticky}
                         commandInputRef={commandInputRef}

@@ -1,9 +1,13 @@
 import {
-    cssEscape, cssTextToParts, extractQtAlignment, extractQtScaledContents, extractQtWordWrap,
+    cssTextToParts, extractQtAlignment, extractQtScaledContents, extractQtWordWrap, extractQtText,
     patchStyleSheetBackgroundColor,
 } from './qtCss';
 import type { MoviePlayer } from './gifMovie';
+import { containsAnchorTag, linkStyledText, restyledText, type LinkStyleState } from './labelModel';
 import { OverlayLayerOrder } from '../layout/overlayLayerOrder';
+
+/** The point size of `.label`'s 12px (LabelOverlay.css) at the CSS 96 dpi. */
+const LABEL_DEFAULT_FONT_PT = 9;
 
 export interface LabelCreateOptions {
     /** Parent window id ('main' for main viewport). Defaults to 'main'. */
@@ -61,6 +65,9 @@ export interface LabelState {
      *  font database spells it (ScriptingAPI.resolveFontFamily), because
      *  Geyser.Label:setFont reads it straight back through getFont(). */
     fontFamily?: string;
+    /** Point size set via `setFontSize(labelName, size)` — the other half of
+     *  the widget font, kept and applied the same way as {@link fontFamily}. */
+    fontSize?: number;
     /** Sticky Qt `alignment` widget property, captured from a
      *  `qproperty-alignment` declaration in any setStyleSheet call. In Qt,
      *  qproperty-* declarations set the widget property permanently — a later
@@ -96,6 +103,10 @@ export interface LabelState {
      *  same reason (Qt won't style them either). Only populated while a visited
      *  color is set, as Mudlet does. */
     visitedLinks?: Set<string>;
+    /** What the last link-styling pass was given and made of it, so a styled
+     *  tag read back with getLabelText can be given back as it was written —
+     *  see labelModel.ts. */
+    linkText?: LinkStyleState;
     /** Click handler installed by setLabelClickCallback. The event table mirrors
      *  Mudlet's `mudlet.mouse_button` shape: `{button, x, y, alt, ctrl, shift, meta}`. */
     onClick?: (event: LabelMouseEvent) => void;
@@ -115,11 +126,27 @@ export interface LabelState {
     onMouseLeave?: (event: LabelMouseEvent) => void;
     /** Tooltip text rendered via the title attribute. */
     tooltip?: string;
+    /** Mudlet setLabelAccessibleName — the name a screen reader gives the
+     *  label. Empty means none of its own: TLabelModel::effectiveAccessibleName
+     *  then names it after the text it shows, or else its tooltip. */
+    accessibleName?: string;
+    /** Mudlet setLabelAccessibleRole — `true` for "button", `false` for "text",
+     *  unset for "" (decided by the label's click and release callbacks, as
+     *  TLabelModel::actsAsButton does). */
+    accessibleButton?: boolean;
+    /** Mudlet setLabelLiveRegion — how a change to the label's text is spoken
+     *  while the profile's `accessibleLabels` setting is on. Unset is "off". */
+    liveRegion?: LabelLiveRegion;
     /** CSS cursor value (e.g. 'pointer', 'crosshair', 'none'). */
     cursor?: string;
     /** Animated GIF player installed by Mudlet's setMovie. Rendered as a
      *  <canvas> instead of the html content (QLabel shows one or the other). */
     movie?: MoviePlayer;
+    /** A movie text has taken the place of: QLabel::setText drops the movie
+     *  from the label's display, but TLabel still owns the QMovie, so the
+     *  profile goes on counting it (getProfileStats().gifs) until setMovie
+     *  replaces it or the label is deleted. Nothing drives it any more. */
+    hiddenMovie?: MoviePlayer;
 }
 
 /** Event payload for label mouse callbacks. `button` is the Qt button *name*
@@ -153,6 +180,45 @@ export interface LabelWheelEvent extends LabelMouseEvent {
 
 type Listener = (labels: LabelState[]) => void;
 
+/** TLabelLiveRegion, by the name setLabelLiveRegion takes and getLabelLiveRegion gives. */
+export type LabelLiveRegion = 'off' | 'polite' | 'assertive';
+
+/** What getLabelAccessibleRole reports (Host::labelAccessibleRole). */
+export type LabelAccessibleRole = 'button' | 'graphic' | 'animation' | 'text';
+
+const BLOCK_TAGS = /^(?:ADDRESS|BLOCKQUOTE|CENTER|DD|DIV|DL|DT|H[1-6]|HR|LI|OL|P|PRE|TABLE|TD|TH|TR|UL)$/;
+
+/** QTextDocumentFragment::fromHtml(html).toPlainText(), simplified — the text
+ *  TLabelModel's plainName() names a label after. A block or line break is a
+ *  break in Qt's plain text, so it parts the words on either side here too,
+ *  where textContent would run them together. */
+export function labelPlainName(html: string): string {
+    if (!html) return '';
+    if (typeof document === 'undefined') return stripTagsNoDom(html.replace(/<br\s*\/?>/gi, ' ')).replace(/\s+/g, ' ').trim();
+    const probe = document.createElement('div');
+    probe.innerHTML = html;
+    let out = '';
+    const walk = (node: Node): void => {
+        if (node.nodeType === 3) { out += node.nodeValue ?? ''; return; }
+        if (node.nodeType !== 1) return;
+        const tag = (node as Element).tagName.toUpperCase();
+        if (tag === 'BR') { out += ' '; return; }
+        if (tag === 'STYLE' || tag === 'SCRIPT' || tag === 'HEAD' || tag === 'TITLE') return;
+        const block = BLOCK_TAGS.test(tag);
+        if (block) out += ' ';
+        for (const child of node.childNodes) walk(child);
+        if (block) out += ' ';
+    };
+    walk(probe);
+    // QString::simplified: every run of whitespace (U+00A0 included, as QChar::isSpace has it) is one space
+    return out.replace(/[\s\u00a0]+/g, ' ').trim();
+}
+
+/** Qt::mightBeRichText, closely enough to tell a tag-carrying tooltip from plain text. */
+function mightBeRichText(text: string): boolean {
+    return /<\/?[a-zA-Z][^<>]*>|&[a-zA-Z]+;|&#\d+;/.test(text);
+}
+
 /** Runs the action behind an `<a href>` clicked inside a label — installed by
  *  ScriptingAPI, which owns the send/prompt/openUrl/Lua machinery the schemes
  *  map onto (see {@link LabelManager.setLinkActivator}). */
@@ -163,41 +229,6 @@ type LinkActivator = (href: string) => void;
 // emit as `left: NaN` and warn about. Coerce non-finite inputs to 0 so the
 // label still renders (matches Mudlet's int-cast behaviour) instead of
 // poisoning the inline style.
-/**
- * Mudlet's `TLabel::setText` link-styling pass: every `<a href=…>` in the text a
- * label is given gets an inline `style` carrying the colours `setLinkStyle`
- * asked for, because QTextDocument reads neither the widget stylesheet nor the
- * palette for link colours. The DOM does honour a stylesheet — LabelOverlay
- * injects one — but `getLabelText` answers with the styled text, so the pass has
- * to happen here as well as there.
- *
- * The pattern is Mudlet's, deliberately strict (lowercase tag, href first, no
- * spacing around `=`): that is the shape Mudlet's own HTML generation produces.
- * The separator is `\s+`, so an anchor whose attributes start on the next line
- * is styled like any other.
- */
-const ANCHOR_RE = /<a\s+href=(["'][^"']*["'])([^>]*)>/g;
-
-function styleAnchors(
-    html: string,
-    style: { color?: string; visitedColor?: string; underline: boolean } | undefined,
-    visited: Set<string> | undefined,
-): string {
-    if (!style || (!style.color && !style.visitedColor)) return html;
-    return html.replace(ANCHOR_RE, (whole, hrefPart: string, otherAttrs: string) => {
-        const url = hrefPart.slice(1, -1);
-        const decls: string[] = [];
-        if (visited?.has(url) && style.visitedColor) decls.push(`color: ${style.visitedColor};`);
-        else if (style.color) decls.push(`color: ${style.color};`);
-        if (!style.underline) decls.push('text-decoration: none;');
-        if (decls.length === 0) return whole;
-        // An anchor that already carries a style attribute has it REPLACED, not
-        // merged — Mudlet keeps the simple case simple and says so.
-        const rest = otherAttrs.replace(/style=(["'][^"']*["'])/g, '');
-        return `<a href=${hrefPart} style="${decls.join(' ')}"${rest}>`;
-    });
-}
-
 /** `html` with every `<…>` run dropped: from each `<` up to the next `>`, and
  *  text after a `<` that never closes kept as is. The same string the regex
  *  `/<[^>]*>/g` replace gave, as a scanner — only renderedText's no-DOM
@@ -260,37 +291,61 @@ function safeCoord(n: number): number {
     return Number.isFinite(n) ? n : 0;
 }
 
+/** A width or height: what safeCoord gives, but never below 0. QWidget::resize
+ *  bounds a widget's size by its minimum, so desktop's resizeWindow("lbl", -20, 30)
+ *  and createLabel(..., -10, -10) leave a 0-wide label behind, not a negative one. */
+function safeSize(n: number): number {
+    return Math.max(0, safeCoord(n));
+}
+
 /**
- * Natural size of a label's HTML, measured off-screen.
+ * Natural size of a label's HTML, measured off-screen — the text extent
+ * QLabel::sizeHint hands back, before the stylesheet's chrome is added.
  *
- * Backs getSizeHint when the label has no element in the document — a script
- * that creates a label and asks for its hint in one chunk runs entirely before
- * React paints. The probe is absolutely positioned with no width, so it
- * shrink-to-fits its content, which is exactly what a size hint is. Any font
- * declarations from the label's own stylesheet are applied so the metrics match
- * what will actually be drawn.
+ * Always a detached probe, never the label's own element: a hint is what the
+ * contents want whatever box the label has now, and a measurement taken inside
+ * that box is bounded by it (a block-level echo `<div>` spans the whole label,
+ * so the old in-place reading reported the box width, and an autoWidth label
+ * could never grow). A probe also answers the same way before and after React
+ * has mounted the label, where the two paths used to disagree by the 4px
+ * document margin. The probe carries the `.label` class, so it picks up the
+ * font a rendered label has, and is absolutely positioned with no width, so it
+ * shrink-to-fits its content.
  *
- * Null when there is nothing to measure or no DOM at all.
+ * No document margin: QLabel lays its rich text out with the root frame's
+ * margin set to 0 (QLabelPrivate::ensureTextLayouted), which is why desktop's
+ * hint for one 8pt line is exactly that line's height. An empty label still has
+ * its one empty line, so it measures as a zero-width line rather than nothing.
+ *
+ * Null when there is no DOM, or no layout to read (a test environment).
  */
-function measureHtmlContent(html: string, styleSheet?: string): { width: number; height: number } | null {
-    if (typeof document === 'undefined' || !document.body || !html) return null;
+function measureHtmlContent(
+    html: string, styleSheet: string | undefined, fontFamily: string | undefined, wordWrap: boolean,
+): { width: number; height: number } | null {
+    if (typeof document === 'undefined' || !document.body) return null;
     const probe = document.createElement('div');
-    probe.style.cssText = 'position:absolute;left:-99999px;top:0;'
-        // nowrap for the same reason the rendered label carries it: QLabel's
-        // wordWrap is off, so the size a label "wants" is its text on one line
-        // (broken only where the HTML breaks it), not the text folded to fit.
-        + 'visibility:hidden;width:auto;height:auto;white-space:nowrap;';
+    probe.className = 'label';
+    probe.style.cssText = 'position:absolute;left:-99999px;top:0;display:block;padding:0;border:0;'
+        // nowrap (from .label) for the reason the rendered label carries it:
+        // QLabel's wordWrap is off, so the size a label "wants" is its text on
+        // one line, broken only where the HTML breaks it.
+        + 'visibility:hidden;width:auto;height:auto;min-width:0;min-height:0;';
+    if (wordWrap) probe.style.whiteSpace = 'normal';
+    // The widget font first, then the stylesheet's, which wins over it in Qt.
+    if (fontFamily) probe.style.fontFamily = fontFamily;
     for (const prop of ['font-family', 'font-size', 'font-weight', 'font-style'] as const) {
-        const found = styleSheet?.match(new RegExp(`(?:^|[;\\s])${prop}\\s*:\\s*([^;]+)`, 'i'));
+        const found = styleSheet?.match(new RegExp(`(?:^|[;\\s{])${prop}\\s*:\\s*([^;}]+)`, 'i'));
         if (found) probe.style.setProperty(prop, found[1].trim());
     }
-    // The 4px QTextDocument margin every label:echo() renders with (see the
-    // .label-doc wrapper in LabelOverlay) belongs in the hint too.
-    probe.innerHTML = `<div style="margin:4px">${html}</div>`;
+    const content = document.createElement('div');
+    // A zero-width space keeps an empty label's one empty line, as QTextDocument
+    // keeps an empty block.
+    content.innerHTML = html || '​';
+    probe.appendChild(content);
     document.body.appendChild(probe);
     try {
         const rect = probe.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) return null;
+        if (rect.width <= 0 && rect.height <= 0) return null;
         return { width: Math.ceil(rect.width), height: Math.ceil(rect.height) };
     } finally {
         probe.remove();
@@ -309,7 +364,36 @@ const scheduleFlush: (fn: () => void) => void =
         ? (fn) => { requestAnimationFrame(() => fn()); }
         : (fn) => { setTimeout(fn, 0); };
 
+/** TLabelModel::actsAsButton: a role chosen for it, else whether it has a
+ *  click or release callback to press — never while clicks pass through it. */
+export function labelActsAsButton(lbl: Readonly<LabelState>): boolean {
+    return !lbl.clickThrough && (lbl.accessibleButton ?? (!!lbl.onClick || !!lbl.onMouseUp));
+}
+
+/** TLabelModel::effectiveAccessibleName. */
+export function effectiveAccessibleName(lbl: Readonly<LabelState>): string {
+    if (lbl.accessibleName) return lbl.accessibleName;
+    const text = labelPlainName(lbl.html);
+    if (text) return text;
+    const tip = lbl.tooltip ?? '';
+    return mightBeRichText(tip) ? labelPlainName(tip) : tip.replace(/[\s\u00a0]+/g, ' ').trim();
+}
+
+/** Host::labelAccessibleRole: a button whatever it shows, else what it shows —
+ *  a movie is an animation, an image with no text over it a graphic
+ *  (TLabel::showsImage), anything else text. */
+export function accessibleRole(lbl: Readonly<LabelState>): LabelAccessibleRole {
+    if (labelActsAsButton(lbl)) return 'button';
+    if (lbl.movie) return 'animation';
+    if (lbl.backgroundImage && labelPlainName(lbl.html) === '') return 'graphic';
+    return 'text';
+}
+
 export class LabelManager {
+    /** Where a press or release a label has no callback for goes: TLabel hands
+     *  it to the window under the label (`parent`), which raises it as that
+     *  window's sysWindowMousePressEvent / ReleaseEvent. Wired by MudSession. */
+    onUnhandledMouse?: (kind: 'press' | 'release', parent: string, e: MouseEvent) => void;
     private readonly labels = new Map<string, LabelState>();
     // Labels bucketed by parent, insertion-ordered within each bucket (which is
     // the render/z order list() has always produced). Kept in sync at the four
@@ -320,6 +404,10 @@ export class LabelManager {
     private readonly byParent = new Map<string, Map<string, LabelState>>();
     private readonly listeners = new Map<string, Set<Listener>>();
     private linkActivator: LinkActivator | null = null;
+    /** The profile's `accessibleLabels` setting (Host::mAccessibleLabels): with it
+     *  on, a label that acts as a button takes keyboard focus and is pressed with
+     *  Space or Return, and a live region speaks its label's text changes. */
+    private accessibleLabelsOn = false;
 
     private indexAdd(lbl: LabelState): void {
         let bucket = this.byParent.get(lbl.parent);
@@ -347,7 +435,7 @@ export class LabelManager {
         const state: LabelState = {
             name, parent,
             x: safeCoord(opts.x), y: safeCoord(opts.y),
-            width: safeCoord(opts.width), height: safeCoord(opts.height),
+            width: safeSize(opts.width), height: safeSize(opts.height),
             fillBackground: opts.fillBackground,
             clickThrough: opts.clickThrough ?? false,
             visible: true,
@@ -386,6 +474,7 @@ export class LabelManager {
         const lbl = this.labels.get(name);
         if (!lbl) return false;
         lbl.movie?.stop();
+        lbl.hiddenMovie?.stop();
         this.labels.delete(name);
         this.indexRemove(lbl.parent, name);
         this.overlayZ.forget(lbl.parent, 'labels', name);
@@ -411,7 +500,7 @@ export class LabelManager {
     resize(name: string, width: number, height: number): boolean {
         const lbl = this.labels.get(name);
         if (!lbl) return false;
-        const nw = safeCoord(width), nh = safeCoord(height);
+        const nw = safeSize(width), nh = safeSize(height);
         if (lbl.width === nw && lbl.height === nh) return true;
         lbl.width = nw; lbl.height = nh;
         this.notify(lbl.parent);
@@ -437,60 +526,30 @@ export class LabelManager {
         return true;
     }
 
-    /** Mudlet `getLabelSizeHint(name)` → the label's preferred `{width,height}`.
-     *  Mudlet returns the QLabel sizeHint (the size its content wants); the
-     *  browser analogue is the rendered node's content extent
-     *  (`scrollWidth`/`scrollHeight`), read off the `data-mudlet-label` element.
-     *  Falls back to the configured geometry when the label isn't in the DOM
-     *  yet (hidden, or rendered before mount). null when no such label. */
+    /** Mudlet `getLabelSizeHint(name)` → the label's preferred `{width,height}`:
+     *  TLabel::sizeHint, which is QLabel's — the extent of the label's contents
+     *  (its text laid out unwrapped, or its movie frame) plus the margin, border
+     *  and padding its stylesheet puts around them. It never depends on the box
+     *  the label has now, which is what lets Geyser's adjustSize/autoWidth grow a
+     *  label as well as shrink it. Falls back to the configured geometry only
+     *  where there is no layout to measure at all. null when no such label. */
     getSizeHint(name: string): { width: number; height: number } | null {
         const lbl = this.labels.get(name);
         if (!lbl) return null;
         const svgHint = this.svgSizeHint(lbl);
         if (svgHint) return svgHint;
-        if (typeof document !== 'undefined') {
-            const el = document.querySelector(
-                `[data-mudlet-label="${cssEscape(name)}"]`,
-            ) as HTMLElement | null;
-            if (el) {
-                // Qt's sizeHint is what the widget *wants*, so it has to be able
-                // to come out smaller than the widget currently is. scrollWidth
-                // can't: it is the box width whenever the content is narrower,
-                // which made every hint exactly the label's own size. A Range
-                // over the contents measures the laid-out text itself.
-                // Range over the *inline* content: `.label-doc` is a block, so
-                // ranging over the outer element just re-measures the box. Its
-                // children are the text and spans echo() produced, whose client
-                // rects are the actual laid-out extent.
-                const doc = el.querySelector('.label-doc');
-                const range = document.createRange();
-                range.selectNodeContents(doc ?? el);
-                const rect = range.getBoundingClientRect();
-                if (rect.width > 0 && rect.height > 0) {
-                    // Padding and border belong to the hint — Qt includes the
-                    // widget's own chrome around the content it sizes for.
-                    const style = getComputedStyle(el);
-                    const pad = (...vals: string[]): number =>
-                        vals.reduce((n, v) => n + (parseFloat(v) || 0), 0);
-                    return {
-                        width: Math.ceil(rect.width + pad(
-                            style.paddingLeft, style.paddingRight,
-                            style.borderLeftWidth, style.borderRightWidth)),
-                        height: Math.ceil(rect.height + pad(
-                            style.paddingTop, style.paddingBottom,
-                            style.borderTopWidth, style.borderBottomWidth)),
-                    };
-                }
-                return { width: el.scrollWidth, height: el.scrollHeight };
-            }
-            // No mounted element: a label created and measured inside one
-            // synchronous script chunk hasn't been through React yet. Falling
-            // back to the label's own size would make the hint meaningless — it
-            // would always report exactly the box we were asked to size — so
-            // measure the same HTML in a detached, unconstrained probe instead.
-            const measured = measureHtmlContent(lbl.html, lbl.styleSheet);
-            if (measured) return measured;
+        const chrome = stylesheetChrome(lbl.styleSheet);
+        // A raster image is QLabel's pixmap, and the pixmap is what it measures.
+        const img = lbl.backgroundImage;
+        if (!lbl.movie && img && !img.svg && img.width != null && img.height != null) {
+            return { width: img.width + chrome.width, height: img.height + chrome.height };
         }
+        if (lbl.movie) {
+            const { width, height } = lbl.movie.gif;
+            return { width: width + chrome.width, height: height + chrome.height };
+        }
+        const measured = measureHtmlContent(lbl.html, lbl.styleSheet, lbl.fontFamily, !!lbl.wordWrap);
+        if (measured) return { width: measured.width + chrome.width, height: measured.height + chrome.height };
         return { width: lbl.width, height: lbl.height };
     }
 
@@ -564,10 +623,22 @@ export class LabelManager {
         if (!lbl) return false;
         // QLabel shows one content at a time — setText replaces a running
         // movie, so echo()/setLabelText after setMovie drops the animation.
-        if (lbl.movie) { lbl.movie.stop(); lbl.movie = undefined; }
-        lbl.html = styleAnchors(html, lbl.linkStyle, lbl.visitedLinks);
+        if (lbl.movie) { lbl.movie.stop(); lbl.hiddenMovie = lbl.movie; lbl.movie = undefined; }
+        const styled = linkStyledText(html, lbl.linkStyle, lbl.visitedLinks, lbl.linkText, lbl.html);
+        lbl.html = styled.text;
+        lbl.linkText = styled.state;
         this.notify(lbl.parent);
         return true;
+    }
+
+    /** TLabel::reapplyLinkStyle: the links already shown are styled again from
+     *  the text the last pass was given, after the link style or the visited
+     *  links changed. A picture or movie took the text out, so there is none. */
+    private reapplyLinkStyle(lbl: LabelState): void {
+        if (!lbl.html || !lbl.linkText || !containsAnchorTag(lbl.html)) return;
+        const styled = restyledText(lbl.linkStyle, lbl.visitedLinks, lbl.linkText);
+        lbl.html = styled.text;
+        lbl.linkText = styled.state;
     }
 
     /** Mudlet setMovie — install (or replace) the label's GIF player. */
@@ -575,7 +646,11 @@ export class LabelManager {
         const lbl = this.labels.get(name);
         if (!lbl) return false;
         lbl.movie?.stop();
+        lbl.hiddenMovie?.stop();
+        lbl.hiddenMovie = undefined;
         lbl.movie = player;
+        // QLabel shows one content at a time: setMovie takes the text away.
+        lbl.html = '';
         this.notify(lbl.parent);
         return true;
     }
@@ -590,7 +665,10 @@ export class LabelManager {
     movieStats(): { total: number; active: number } {
         let total = 0, active = 0;
         for (const lbl of this.labels.values()) {
-            if (!lbl.movie) continue;
+            if (!lbl.movie) {
+                if (lbl.hiddenMovie) total++;
+                continue;
+            }
             total++;
             if (lbl.movie.isPlaying) active++;
         }
@@ -641,6 +719,9 @@ export class LabelManager {
         const lbl = this.labels.get(name);
         if (!lbl) return false;
         lbl.backgroundImage = { url, ...(svg ? { svg } : {}), ...(size ?? {}) };
+        // A raster image goes in with QLabel::setPixmap, which empties the text;
+        // an SVG is a layer of its own and leaves the text alone.
+        if (!svg) lbl.html = '';
         this.notify(lbl.parent);
         return true;
     }
@@ -652,6 +733,19 @@ export class LabelManager {
         const lbl = this.labels.get(name);
         if (!lbl?.backgroundImage || lbl.backgroundImage.url !== url) return false;
         lbl.backgroundImage = { ...lbl.backgroundImage, url, width, height };
+        this.notify(lbl.parent);
+        return true;
+    }
+
+    /** TLabel::setBackgroundImage with an empty path: an empty pixmap, which
+     *  takes away the picture (raster or SVG), a movie and — as setPixmap()
+     *  does — the text. */
+    clearPixmap(name: string): boolean {
+        const lbl = this.labels.get(name);
+        if (!lbl) return false;
+        lbl.backgroundImage = undefined;
+        if (lbl.movie) { lbl.movie.stop(); lbl.hiddenMovie = lbl.movie; lbl.movie = undefined; }
+        lbl.html = '';
         this.notify(lbl.parent);
         return true;
     }
@@ -683,6 +777,36 @@ export class LabelManager {
         return lbl.fontFamily ?? '';
     }
 
+    /** Mudlet `setFontSize(labelName, size)` on a label: the point size of its
+     *  widget font. */
+    setFontSize(name: string, size: number): boolean {
+        const lbl = this.labels.get(name);
+        if (!lbl) return false;
+        lbl.fontSize = size;
+        this.notify(lbl.parent);
+        return true;
+    }
+
+    /**
+     * The point size the label's text is drawn in, or null when there is no
+     * such label. A stylesheet `font-size` wins over the widget font, as QSS
+     * does in Qt; one in pixels is read as points at the CSS 96 dpi (QFont's
+     * pointSizeF for a pixel-sized font). With neither, the `.label` default
+     * of 12px.
+     */
+    getFontSize(name: string): number | null {
+        const lbl = this.labels.get(name);
+        if (!lbl) return null;
+        const found = lbl.styleSheet?.match(/(?:^|[;\s{])font-size\s*:\s*([\d.]+)\s*(pt|px)?/i);
+        if (found) {
+            const value = Number(found[1]);
+            if (Number.isFinite(value) && value > 0) {
+                return found[2]?.toLowerCase() === 'pt' ? value : Math.round(value * 72 / 96);
+            }
+        }
+        return lbl.fontSize ?? LABEL_DEFAULT_FONT_PT;
+    }
+
     setStyleSheet(name: string, css: string): boolean {
         const lbl = this.labels.get(name);
         if (!lbl) return false;
@@ -699,6 +823,10 @@ export class LabelManager {
         // ...as is qproperty-wordWrap, the opt-in to wrapping label text.
         const wrap = extractQtWordWrap(css);
         if (wrap !== undefined) lbl.wordWrap = wrap;
+        // ...and qproperty-text, which Qt hands straight to QLabel::setText
+        // as the style is applied — past TLabel's link-styling pass.
+        const text = extractQtText(css);
+        if (text !== undefined) lbl.html = text;
         this.notify(lbl.parent);
         return true;
     }
@@ -712,6 +840,7 @@ export class LabelManager {
             visitedColor: visitedColor || undefined,
             underline,
         };
+        this.reapplyLinkStyle(lbl);
         this.notify(lbl.parent);
         return true;
     }
@@ -733,8 +862,9 @@ export class LabelManager {
      */
     activateLink(name: string, href: string): void {
         const lbl = this.labels.get(name);
-        if (lbl?.linkStyle?.visitedColor && !lbl.visitedLinks?.has(href)) {
+        if (lbl?.linkStyle?.visitedColor) {
             (lbl.visitedLinks ??= new Set()).add(href);
+            this.reapplyLinkStyle(lbl);
             this.notify(lbl.parent);
         }
         this.linkActivator?.(href);
@@ -745,6 +875,19 @@ export class LabelManager {
         const lbl = this.labels.get(name);
         if (!lbl) return false;
         lbl.linkStyle = undefined;
+        // the styles written into the anchors would otherwise stay
+        this.reapplyLinkStyle(lbl);
+        this.notify(lbl.parent);
+        return true;
+    }
+
+    /** Mudlet `clearVisitedLinks(labelName)` — forget which links were clicked,
+     *  so they take the link colour again. */
+    clearVisitedLinks(name: string): boolean {
+        const lbl = this.labels.get(name);
+        if (!lbl) return false;
+        lbl.visitedLinks = undefined;
+        this.reapplyLinkStyle(lbl);
         this.notify(lbl.parent);
         return true;
     }
@@ -823,6 +966,74 @@ export class LabelManager {
         return true;
     }
 
+    /** TLabelModel::setAccessibleName. An empty name hands naming back to the
+     *  label's text and tooltip. */
+    setAccessibleName(name: string, accessibleName: string): boolean {
+        const lbl = this.labels.get(name);
+        if (!lbl) return false;
+        const next = accessibleName === '' ? undefined : accessibleName;
+        if (lbl.accessibleName !== next) {
+            lbl.accessibleName = next;
+            this.notify(lbl.parent);
+        }
+        return true;
+    }
+
+    /** TLabelModel::effectiveAccessibleName: the name set, else the text the
+     *  label shows, else its tooltip (read literally unless it is rich text,
+     *  as Qt shows it). Undefined for a label that is not there. */
+    getAccessibleName(name: string): string | undefined {
+        const lbl = this.labels.get(name);
+        if (!lbl) return undefined;
+        return effectiveAccessibleName(lbl);
+    }
+
+    /** TLabelModel::setAccessibleButton — `undefined` decides by the callbacks. */
+    setAccessibleButton(name: string, button: boolean | undefined): boolean {
+        const lbl = this.labels.get(name);
+        if (!lbl) return false;
+        if (lbl.accessibleButton !== button) {
+            lbl.accessibleButton = button;
+            this.notify(lbl.parent);
+        }
+        return true;
+    }
+
+    /** Host::labelAccessibleRole. Undefined for a label that is not there. */
+    getAccessibleRole(name: string): LabelAccessibleRole | undefined {
+        const lbl = this.labels.get(name);
+        if (!lbl) return undefined;
+        return accessibleRole(lbl);
+    }
+
+    setLiveRegion(name: string, liveRegion: LabelLiveRegion): boolean {
+        const lbl = this.labels.get(name);
+        if (!lbl) return false;
+        const next = liveRegion === 'off' ? undefined : liveRegion;
+        if (lbl.liveRegion !== next) {
+            lbl.liveRegion = next;
+            this.notify(lbl.parent);
+        }
+        return true;
+    }
+
+    getLiveRegion(name: string): LabelLiveRegion | undefined {
+        const lbl = this.labels.get(name);
+        if (!lbl) return undefined;
+        return lbl.liveRegion ?? 'off';
+    }
+
+    /** Host::setAccessibleLabels — every label's keyboard access follows it. */
+    setAccessibleLabels(on: boolean): void {
+        if (this.accessibleLabelsOn === on) return;
+        this.accessibleLabelsOn = on;
+        for (const parent of this.listeners.keys()) this.notify(parent);
+    }
+
+    get accessibleLabels(): boolean {
+        return this.accessibleLabelsOn;
+    }
+
     setClickThrough(name: string, value: boolean): boolean {
         const lbl = this.labels.get(name);
         if (!lbl) return false;
@@ -878,6 +1089,7 @@ export class LabelManager {
         for (const l of this.labels.values()) {
             parents.add(l.parent);
             l.movie?.stop();
+            l.hiddenMovie?.stop();
         }
         this.labels.clear();
         this.byParent.clear();

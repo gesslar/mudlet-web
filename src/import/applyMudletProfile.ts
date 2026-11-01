@@ -5,10 +5,11 @@ import { saveProfileData } from '../storage/profileVfsData';
 import { saveMap } from '../storage/mapStorage';
 import { saveFolderHandle } from '../scripting/vfs/folderHandleStore';
 import { parseMudletProfile } from './mudletHost';
-import { buildMudletProfileBundle, type MudletProfileBundle } from './mudletProfileImport';
+import { buildMudletProfileBundle, CONSUMED_PROFILE_FILES, DESKTOP_HISTORY_FILE, readDesktopProfileFiles, type MudletProfileBundle } from './mudletProfileImport';
 import { CONNECTION_SIDECAR_PATH, LEGACY_CONNECTION_SIDECAR_PATH, RETAINED_HOST_PATH, type ConnectionSidecar } from './mudletProfileExport';
 import type { MudConnection } from '../storage/schema';
 import { describeThrown } from '../utils/describeThrown';
+import { DEFAULT_HISTORY_SAVE_SIZE, historyStorageKey, saveHistory } from '../ui/commandHistory';
 
 // Apply a parsed Mudlet profile bundle (see mudletProfileImport.ts) as a NEW
 // native Mudlet Web profile: create the connection, provision its VFS (copy map +
@@ -20,7 +21,7 @@ import { describeThrown } from '../utils/describeThrown';
 /** The per-connection store slices a bundle maps to. Pure — no side effects, so
  *  it's unit-testable; `importMudletProfile` applies it. Automation is imported
  *  profile-owned (as authored in Mudlet), not package-tagged. */
-export function bundleToConnectionData(bundle: MudletProfileBundle, installedAt: string) {
+export function bundleToConnectionData(bundle: MudletProfileBundle, installedAt: string, profilePath?: string) {
     const a = bundle.profile.automation;
     const vars = bundle.profile.variables.variables;
     return {
@@ -33,7 +34,14 @@ export function bundleToConnectionData(bundle: MudletProfileBundle, installedAt:
         // Register the profile's installed packages so package managers (mpkg)
         // and getPackageInfo see them as installed. Stamp the install time here
         // (the bundle leaves it empty to stay pure/deterministic).
-        packages: bundle.packages.map(p => (p.installedAt ? p : { ...p, installedAt })),
+        // A folded-in module's XML path is relative to the profile root until
+        // here, where the new profile's VFS location is known.
+        packages: bundle.packages.map(p => {
+            const out = p.installedAt ? p : { ...p, installedAt };
+            return profilePath && out.xmlVfsPath && !out.xmlVfsPath.startsWith('/')
+                ? { ...out, xmlVfsPath: `${profilePath}/${out.xmlVfsPath}` }
+                : out;
+        }),
         profile: bundle.profile.settings,
         // Every saved variable in the imported <VariablePackage> seeds the
         // save-list; its current value is restored into _G on first open.
@@ -65,6 +73,16 @@ export function bundleToConnectionRecord(bundle: MudletProfileBundle): Omit<MudC
         // profile that doesn't already carry them.
         mudletImported: true,
     };
+    // TLS goes through the proxy in `mud` mode, which is what desktop's
+    // "secure connection" amounts to here (see MudConnection.tls).
+    if (bundle.tls !== undefined) base.tls = bundle.tls;
+    const id = bundle.profile.connection;
+    if (id.sslIgnoreExpired) base.sslIgnoreExpired = true;
+    if (id.sslIgnoreSelfSigned) base.sslIgnoreSelfSigned = true;
+    if (id.sslIgnoreAll) base.sslIgnoreAll = true;
+    // Desktop sends this name two seconds after connecting; TextAutoLogin does
+    // the same with it, and the GMCP Char.Login path offers it as the account.
+    if (bundle.login) base.charLoginAccount = bundle.login;
     const raw = bundle.files[CONNECTION_SIDECAR_PATH] ?? bundle.files[LEGACY_CONNECTION_SIDECAR_PATH];
     if (!raw) return base;
     let side: ConnectionSidecar;
@@ -86,8 +104,26 @@ export function bundleToConnectionRecord(bundle: MudletProfileBundle): Omit<MudC
     if (out.mode === 'websocket') {
         if (!out.url && base.host) out.url = base.host;
         delete out.host;
+        // The ws(s):// scheme decides it there.
+        delete out.tls;
     }
     return out;
+}
+
+/**
+ * Seed a new profile's command-bar history from the bundle's
+ * `command_history_main`, so Up arrow recalls what it did on desktop. Capped at
+ * the profile's own `commandLineHistorySaveSize` when it has one, as every
+ * later save of that history is.
+ */
+export function seedCommandHistory(connectionId: string, bundle: MudletProfileBundle): void {
+    if (!bundle.commandHistory?.length) return;
+    const size = bundle.profile.settings.config?.commandLineHistorySaveSize;
+    saveHistory(
+        bundle.commandHistory,
+        historyStorageKey(connectionId),
+        typeof size === 'number' && Number.isFinite(size) ? size : DEFAULT_HISTORY_SAVE_SIZE,
+    );
 }
 
 /**
@@ -130,12 +166,13 @@ export async function importMudletProfile(bundle: MudletProfileBundle): Promise<
         // it's durable for when the user opens the profile (which re-hydrates
         // from that file). Hydrating a non-active connection doesn't disturb any
         // open session — its subscription keys on its own connection id.
-        useAppStore.getState().hydrateConnectionData(connectionId, bundleToConnectionData(bundle, new Date().toISOString()));
+        useAppStore.getState().hydrateConnectionData(connectionId, bundleToConnectionData(bundle, new Date().toISOString(), vfs.profilePath));
         saveProfileData(vfs, connectionId);
         await vfs.flush();
     } finally {
         vfs.unmount();
     }
+    seedCommandHistory(connectionId, bundle);
 
     if (bundle.mapBytes) {
         try {
@@ -212,23 +249,53 @@ async function newestFileIn(
     return newest;
 }
 
+/** A file at the root of a picked directory, or undefined when it has none. */
+async function readRootFileOf(dir: FileSystemDirectoryHandle, name: string): Promise<Uint8Array | undefined> {
+    try {
+        const file = await (await dir.getFileHandle(name)).getFile();
+        return new Uint8Array(await file.arrayBuffer());
+    } catch {
+        return undefined;
+    }
+}
+
+/** What {@link linkMudletFolder} made, and what it leaves to the caller. */
+export interface LinkedFolderResult {
+    connectionId: string;
+    /** Desktop's saved password (the folder's `password` file), for the
+     *  caller to hand to the credential vault. The folder's copy is left
+     *  where it is: desktop still reads it. */
+    password?: string;
+    /** What could not be carried over, for the import UI to show. */
+    warnings: string[];
+}
+
 /**
  * Link a Mudlet profile *directory* as a new Mudlet Web profile (Link mode): the
  * folder stays the source of truth — its `current/*.xml` is re-read on every
  * open — rather than being copied in. Reads the connection identity from the
- * newest save, registers the connection, persists the folder handle so the VFS
- * mounts it, and copies the current map. Returns the new connection id.
+ * newest save, and TLS and the character name from desktop's own files for
+ * them, as an import does (#450); registers the connection, persists the
+ * folder handle so the VFS mounts it, and copies the current map. The server
+ * encoding and command history are read when the profile opens
+ * (loadMudletLinkedProfile), every time, so desktop's later changes arrive too.
  */
-export async function linkMudletFolder(dir: FileSystemDirectoryHandle): Promise<string> {
+export async function linkMudletFolder(dir: FileSystemDirectoryHandle): Promise<LinkedFolderResult> {
     const xmlFile = await newestFileIn(dir, 'current', n => n.toLowerCase().endsWith('.xml'));
     if (!xmlFile) throw new Error('Not a Mudlet profile: no current/*.xml found in the selected folder');
     const profile = parseMudletProfile(await xmlFile.text());
+
+    const rootFiles: Record<string, Uint8Array | undefined> = {};
+    for (const name of [...CONSUMED_PROFILE_FILES, DESKTOP_HISTORY_FILE]) rootFiles[name] = await readRootFileOf(dir, name);
+    const desktop = readDesktopProfileFiles(name => rootFiles[name], profile.connection.tls);
 
     const connectionId = useAppStore.getState().addConnection({
         name: profile.connection.name || dir.name || 'Linked profile',
         mode: 'mud',
         host: profile.connection.host ?? '',
         port: profile.connection.port ?? 23,
+        ...(desktop.tls !== undefined ? { tls: desktop.tls } : {}),
+        ...(desktop.login ? { charLoginAccount: desktop.login } : {}),
         mudletLinked: true,
     });
 
@@ -245,5 +312,9 @@ export async function linkMudletFolder(dir: FileSystemDirectoryHandle): Promise<
         }
     }
 
-    return connectionId;
+    return {
+        connectionId,
+        ...(desktop.password ? { password: desktop.password } : {}),
+        warnings: desktop.warnings,
+    };
 }

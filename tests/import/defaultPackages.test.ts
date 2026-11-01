@@ -10,6 +10,9 @@ import {
     IRE_MAPPER_GAMES,
     ownUiArrives,
     isNewProfile,
+    gameLoader,
+    setupIreDriverBugfix,
+    IRE_DRIVER_BUGFIX_GAMES,
 } from '../../src/import/defaultPackages';
 import { installPackageFromBytes } from '../../src/import/packageInstaller';
 import { useAppStore } from '../../src/storage/appStore';
@@ -59,6 +62,10 @@ const ARCHIVE_PATHS: Record<string, string> = {
     'echo.mpackage': 'src/import/defaults/echo/echo.mpackage',
     'enable-accessibility.mpackage': 'src/import/defaults/enable-accessibility/enable-accessibility.mpackage',
     'deleteOldProfiles.mpackage': 'src/import/defaults/deleteOldProfiles/deleteOldProfiles.mpackage',
+    'CF-loader.mpackage': 'src/import/defaults/CF-loader/CF-loader.mpackage',
+    'icesus-loader.mpackage': 'src/import/defaults/icesus-loader/icesus-loader.mpackage',
+    'mg-loader.mpackage': 'src/import/defaults/mg-loader/mg-loader.mpackage',
+    'MedBootstrap.mpackage': 'src/import/defaults/MedBootstrap/MedBootstrap.mpackage',
 };
 
 /** What a profile on `host` ends up with. Defaults to a newly-created profile —
@@ -230,7 +237,67 @@ describe('default packages', () => {
             for (const def of stockDefaults(host)) expect(ALL_DEFAULTS).toContain(def);
         }
         expect(ALL_DEFAULTS.map(d => d.name))
-            .toEqual(['run-lua-code', 'echo', 'enable-accessibility', 'deleteOldProfiles', 'mudlet-mapper', 'generic_mapper', 'mpkg', 'gui-drop', 'mudlet-base-ui']);
+            .toEqual(['run-lua-code', 'echo', 'enable-accessibility', 'deleteOldProfiles', 'mudlet-mapper', 'generic_mapper', 'mpkg', 'gui-drop', 'mudlet-base-ui',
+                'CF_Loader', 'icesus-loader', 'mg-loader', 'MedBootstrap']);
+    });
+
+    describe('game loaders', () => {
+        // Mirrors the loader rows of mudlet.cpp's defaultScripts: each game gets
+        // its own loader, and only its own.
+        const LOADERS: Record<string, string> = {
+            'carrionfields.net': 'CF_Loader',
+            'icesus.org': 'icesus-loader',
+            'mg.mud.de': 'mg-loader',
+            'mud.morgengrauen.info': 'mg-loader',
+            'mg.morgengrauen.info': 'mg-loader',
+            'morgengrauen.info': 'mg-loader',
+            'medievia.com': 'MedBootstrap',
+        };
+        const loaderNames = new Set(Object.values(LOADERS));
+
+        it('installs the game\'s loader on the game\'s hosts', () => {
+            for (const [host, loader] of Object.entries(LOADERS)) {
+                const names = namesFor(host);
+                expect(names, `host ${host}`).toContain(loader);
+                expect(names.filter(n => loaderNames.has(n)), `host ${host}`).toEqual([loader]);
+            }
+        });
+
+        it('covers every game the catalogue says brings a bundled loader', () => {
+            // Otherwise the starter UI would stand aside for an interface that
+            // never arrives — a new profile with no UI at all (#442).
+            for (const host of LOADER_UI_HOSTS) {
+                expect(gameLoader(host), `host ${host}`).toBeDefined();
+                expect(ownUiArrives(host, true), `host ${host}`).toBe(true);
+            }
+            expect(Object.keys(LOADERS).sort()).toEqual([...LOADER_UI_HOSTS].sort());
+        });
+
+        it('installs no loader anywhere else', () => {
+            for (const host of [undefined, 'elephant.org', 'achaea.com', 'stickmud.com', ...CLIENT_GUI_HOSTS]) {
+                expect(namesFor(host).filter(n => loaderNames.has(n)), `host ${host}`).toEqual([]);
+            }
+            // Exact hostnames, as Mudlet matches them — not a suffix.
+            expect(gameLoader('www.carrionfields.net')).toBeUndefined();
+        });
+
+        it('matches hosts case-insensitively', () => {
+            expect(namesFor(connectionHost({ mode: 'mud', host: 'CarrionFields.NET' }))).toContain('CF_Loader');
+            expect(gameLoader('ICESUS.ORG')?.name).toBe('icesus-loader');
+        });
+
+        it('keeps generic_mapper alongside the loader, as Mudlet does', () => {
+            // setupPreInstallPackages adds generic_mapper whenever the IRE mapper
+            // isn't picked. The Icesus and MorgenGrauen packages the loaders
+            // fetch remove it themselves; nothing here second-guesses that.
+            for (const host of Object.keys(LOADERS)) {
+                expect(namesFor(host), `host ${host}`).toContain('generic_mapper');
+            }
+        });
+
+        it('installs the loader on established profiles too, like every default but the starter UI', () => {
+            expect(namesFor('icesus.org', {})).toContain('icesus-loader');
+        });
     });
 
     describe('starter UI', () => {
@@ -338,6 +405,94 @@ describe('default packages', () => {
             });
         });
     }
+
+    describe('ensureDefaultPackages skips a loader whose interface is already installed', () => {
+        it('does not fetch the loader when the game package is present', async () => {
+            const fetchSpy = vi.fn(async () => { throw new Error('unexpected fetch'); });
+            vi.stubGlobal('fetch', fetchSpy);
+            try {
+                const id = useAppStore.getState().addConnection({
+                    name: 'icesus-has-ui', mode: 'mud', host: 'icesus.org', port: 23,
+                });
+                // Everything stock is installed already, plus the Icesus package
+                // the loader would have downloaded.
+                const present = stockDefaults('icesus.org', NEW_PROFILE)
+                    .filter(d => d.name !== 'icesus-loader')
+                    .map(d => ({ name: d.name, version: d.version, installedAt: '' }));
+                useAppStore.setState(s => ({
+                    connectionPackages: { ...s.connectionPackages, [id]: [...present, { name: 'Icesus', installedAt: '' }] },
+                }));
+                const installed = await ensureDefaultPackages(id, stubVfs());
+                expect(installed).toEqual([]);
+                expect(fetchSpy).not.toHaveBeenCalled();
+            } finally {
+                vi.unstubAllGlobals();
+            }
+        });
+    });
+
+    describe('setupIreDriverBugfix', () => {
+        // Host::setupIreDriverBugfix: a new profile for an IRE game starts with
+        // "fix unnecessary linebreaks" on, or every reply after a GA prompt
+        // opens with a blank line (#437).
+        const add = (conn: Record<string, unknown>) => useAppStore.getState().addConnection({
+            name: 'ire', mode: 'mud', port: 23, ...conn,
+        } as never);
+        const fixFor = (id: string) => useAppStore.getState().connectionProfile[id]?.config?.fixUnnecessaryLinebreaks;
+
+        it('covers the five IRE games, not every IRE-mapper game', () => {
+            expect([...IRE_DRIVER_BUGFIX_GAMES].sort())
+                .toEqual(['achaea.com', 'aetolia.com', 'imperian.com', 'lusternia.com', 'starmourn.com']);
+            // StickMUD gets the IRE mapper but sends no stray newline.
+            expect(IRE_DRIVER_BUGFIX_GAMES).not.toContain('stickmud.com');
+        });
+
+        it('turns the fix on for a new IRE profile', () => {
+            for (const host of IRE_DRIVER_BUGFIX_GAMES) {
+                const id = add({ host });
+                setupIreDriverBugfix(id);
+                expect(fixFor(id), `host ${host}`).toBe(true);
+            }
+        });
+
+        it('matches the host case-insensitively, and from a websocket URL', () => {
+            const typed = add({ host: ' Achaea.COM ' });
+            setupIreDriverBugfix(typed);
+            expect(fixFor(typed)).toBe(true);
+            const ws = add({ mode: 'websocket', host: undefined, port: undefined, url: 'wss://aetolia.com/socket' });
+            setupIreDriverBugfix(ws);
+            expect(fixFor(ws)).toBe(true);
+        });
+
+        it('leaves every other game alone', () => {
+            for (const host of ['stickmud.com', 'elephant.org', 'www.achaea.com', '']) {
+                const id = add({ host });
+                setupIreDriverBugfix(id);
+                expect(fixFor(id), `host ${host}`).toBeUndefined();
+            }
+        });
+
+        it('keeps an explicit choice and the rest of the config', () => {
+            const off = add({ host: 'achaea.com' });
+            useAppStore.getState().patchConnectionProfile(off, { config: { fixUnnecessaryLinebreaks: false, logInHTML: true } });
+            setupIreDriverBugfix(off);
+            expect(fixFor(off)).toBe(false);
+
+            const other = add({ host: 'achaea.com' });
+            useAppStore.getState().patchConnectionProfile(other, { config: { logInHTML: true } });
+            setupIreDriverBugfix(other);
+            expect(useAppStore.getState().connectionProfile[other]?.config)
+                .toEqual({ logInHTML: true, fixUnnecessaryLinebreaks: true });
+        });
+
+        it('skips profiles imported or linked from Mudlet, which bring their own setting', () => {
+            for (const flag of ['mudletImported', 'mudletLinked'] as const) {
+                const id = add({ host: 'achaea.com', [flag]: true });
+                setupIreDriverBugfix(id);
+                expect(fixFor(id), flag).toBeUndefined();
+            }
+        });
+    });
 
     describe('ensureDefaultPackages skips Mudlet-originated profiles', () => {
         // A profile imported or linked from Mudlet carries its own package set,

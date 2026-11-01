@@ -6,14 +6,12 @@
 // The old pattern (`ÿ.[^ÿ]`) treated *every* command as 3 bytes, so a 2-byte
 // IAC EOR/GA immediately followed by data (e.g. `IAC EOR \x1b[K`) ate the next
 // byte — orphaning the `\x1b` and leaking `[K` as literal text.
+//
+// Kept as the public reference for what a telnet sequence is; the client
+// itself strips with the linear scanner in gmcp.ts (`stripTelnetSequences`),
+// since the lazy SB branch rescans to end-of-buffer from every IAC SB whose
+// terminator never comes — quadratic on input a server controls.
 export const TELNET_OPTION_REGEX = /\xFF\xFA[\s\S]*?\xFF\xF0|\xFF[\xFB-\xFE][\s\S]|\xFF[\s\S]/g;
-
-// TELNET_OPTION_REGEX minus the subnegotiation branch, for buffers that hold
-// no IAC SE. The SB branch scans forward for its terminator, so without one
-// present it rescans to end-of-buffer from every IAC SB (quadratic: ~1.3s on
-// 160KB of IAC SB from a hostile server). Skipping it there is exact —
-// `IAC SB … IAC SE` cannot match when the buffer contains no IAC SE.
-export const TELNET_OPTION_REGEX_NO_SB = /\xFF[\xFB-\xFE][\s\S]|\xFF[\s\S]/g;
 
 // Telnet Go Ahead / End-of-Record — used by MUDs to signal a prompt line
 export const TELNET_GA  = "\xFF\xF9"; // IAC GA  (249)
@@ -92,8 +90,8 @@ export const GMCP_WILL = "\xFF\xFB\xC9"; // IAC WILL GMCP - server offers GMCP
 export const GMCP_DO   = "\xFF\xFD\xC9"; // IAC DO GMCP   - client requests GMCP
 
 // ATCP (Achaea Telnet Client Protocol) — telnet option 200, GMCP's predecessor.
-// Same `IAC SB <opt> <payload> IAC SE` framing as GMCP. Mudlet Web only sends it
-// (sendATCP); it doesn't negotiate ATCP inbound.
+// Same `IAC SB <opt> <payload> IAC SE` framing as GMCP. Taken up only while GMCP
+// is off (TelnetNegotiator); inbound messages fill the Lua `atcp` table (atcp.ts).
 export const ATCP_COMMAND_CODE = 200;
 export const OPT_ATCP = "\xC8"; // 200
 
@@ -184,13 +182,12 @@ export const MTTS_MSLP = 1024;
 export const MTTS_SSL = 2048;
 
 /** Live capabilities that toggle the dynamic MTTS bits. The static bits (ANSI,
- *  256 colours, OSC colour palette, truecolour) are always on. */
+ *  256 colours, OSC colour palette, truecolour, SSL) are always on. */
 export interface MttsCapabilities {
     /** UTF-8 is the active encoding (sets the UTF-8 bit). */
     utf8?: boolean;
-    /** The game-facing transport is TLS-encrypted (sets the SSL bit). */
-    tls?: boolean;
-    /** MNES is negotiated (sets the MNES bit). */
+    /** MNES is on — Mudlet sets the bit when the profile has both MNES and
+     *  NEW-ENVIRON enabled, negotiated or not (sets the MNES bit). */
     mnes?: boolean;
     /** A screen reader is being advertised (sets the SCREEN READER bit). */
     screenReader?: boolean;
@@ -198,15 +195,21 @@ export interface MttsCapabilities {
 
 /**
  * Compose the MTTS bitvector Mudlet Web advertises. Mirrors Mudlet's
- * `getNewEnvironMTTS`: ANSI + 256 COLORS + OSC COLOR PALETTE + TRUECOLOR are
- * always present (Mudlet Web's static terminal capabilities); UTF-8, SSL/TLS, MNES
- * and SCREEN READER are added from live state. With UTF-8 + TLS this yields
- * 2349, matching a default Mudlet connection.
+ * `getNewEnvironMTTS`: ANSI + 256 COLORS + OSC COLOR PALETTE + TRUECOLOR + SSL
+ * are always present; UTF-8, MNES and SCREEN READER are added from live state.
+ * With UTF-8 this yields 2349, matching a default Mudlet connection.
+ *
+ * SSL is a capability ("client supports SSL for data transmission"), not a
+ * report on the current link: Mudlet sets it whenever it was built with SSL,
+ * encrypted connection or not, and a server reads it as "this client could use
+ * the TLS port". Mudlet Web can — over `wss://` in websocket mode, and through
+ * the proxy's TLS leg to the game (`&tls=1`) in proxy mode — so it is always
+ * set. Whether the browser↔proxy hop happens to be `wss://` says nothing about
+ * the game link either way, and is deliberately not consulted.
  */
 export function computeMtts(caps: MttsCapabilities = {}): number {
-    let bits = MTTS_ANSI | MTTS_256_COLORS | MTTS_OSC_COLOR_PALETTE | MTTS_TRUECOLOR;
+    let bits = MTTS_ANSI | MTTS_256_COLORS | MTTS_OSC_COLOR_PALETTE | MTTS_TRUECOLOR | MTTS_SSL;
     if (caps.utf8) bits |= MTTS_UTF8;
-    if (caps.tls) bits |= MTTS_SSL;
     if (caps.mnes) bits |= MTTS_MNES;
     if (caps.screenReader) bits |= MTTS_SCREEN_READER;
     return bits;
@@ -237,5 +240,7 @@ export const OPT_CHARSET = "\x2A";           // 42
 export const CHARSET_REQUEST  = "\x01";      // 1 — "here are the charsets I support"
 export const CHARSET_ACCEPTED = "\x02";      // 2 — "I'll use this one"
 export const CHARSET_REJECTED = "\x03";      // 3 — "none of those work"
+export const CHARSET_TTABLE_IS       = "\x04"; // 4 — "here is a translation table"
+export const CHARSET_TTABLE_REJECTED = "\x05"; // 5 — "I don't do translation tables"
 export const CHARSET_WILL = "\xFF\xFB\x2A";  // IAC WILL CHARSET
 export const CHARSET_DO   = "\xFF\xFD\x2A";  // IAC DO CHARSET

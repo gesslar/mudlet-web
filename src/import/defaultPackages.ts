@@ -34,6 +34,11 @@ import mpkgUrl from './defaults/mpkg/mpkg.mpackage?url';
 import echoUrl from './defaults/echo/echo.mpackage?url';
 import enableAccessibilityUrl from './defaults/enable-accessibility/enable-accessibility.mpackage?url';
 import deleteOldProfilesUrl from './defaults/deleteOldProfiles/deleteOldProfiles.mpackage?url';
+// The four game loaders Mudlet preinstalls, each for its own game only.
+import cfLoaderUrl from './defaults/CF-loader/CF-loader.mpackage?url';
+import icesusLoaderUrl from './defaults/icesus-loader/icesus-loader.mpackage?url';
+import mgLoaderUrl from './defaults/mg-loader/mg-loader.mpackage?url';
+import medBootstrapUrl from './defaults/MedBootstrap/MedBootstrap.mpackage?url';
 
 interface DefaultPackage {
     /** Must match the manifest name produced by installPackageFromBytes. */
@@ -45,6 +50,11 @@ interface DefaultPackage {
     /** When set, an installed copy with a different manifest version is
      *  reinstalled fresh — how brands ship package updates to players. */
     version?: string;
+    /** For a loader that fetches a game's interface and then uninstalls itself:
+     *  that interface's package name. A profile that already has it is skipped,
+     *  so backfilling the loader into an existing profile can't re-download and
+     *  reinstall an interface the player set up by hand. */
+    replacedBy?: string;
 }
 
 const RUN_LUA_CODE: DefaultPackage = {
@@ -74,7 +84,7 @@ const MUDLET_MAPPER: DefaultPackage = {
  *  profiles that already have the old one — safe because the mapper keeps its
  *  state in `<profile>/map downloads/`, outside the package dir a reinstall wipes. */
 const GENERIC_MAPPER: DefaultPackage = {
-    name: 'generic_mapper', filename: 'generic_mapper.mpackage', url: genericMapperUrl, version: '2.1.11',
+    name: 'generic_mapper', filename: 'generic_mapper.mpackage', url: genericMapperUrl, version: '2.1.24',
 };
 
 /** Mudlet's starter interface: an adjustable dock with the map, tabbed chat and
@@ -84,7 +94,7 @@ const GENERIC_MAPPER: DefaultPackage = {
  *  pushes a GUI via `Client.GUI`. `version` is declared for the same reason the
  *  mapper's is: so a bumped archive reaches profiles that have the old one. */
 const BASE_UI: DefaultPackage = {
-    name: 'mudlet-base-ui', filename: 'mudlet-base-ui.mpackage', url: baseUiUrl, version: '1.7.1',
+    name: 'mudlet-base-ui', filename: 'mudlet-base-ui.mpackage', url: baseUiUrl, version: '1.9.3',
 };
 
 /** Drop an image file onto a console and it becomes a Geyser label inside an
@@ -94,7 +104,7 @@ const BASE_UI: DefaultPackage = {
  *  reason the mapper's is — and here it also carries the fixed archive to
  *  profiles still holding the versionless loose-XML install. */
 const GUI_DROP: DefaultPackage = {
-    name: 'gui-drop', filename: 'gui-drop.mpackage', url: guiDropUrl, version: '1.3',
+    name: 'gui-drop', filename: 'gui-drop.mpackage', url: guiDropUrl, version: '1.5',
 };
 
 /** Mudlet's package manager: `mpkg install/remove/search/show/list/update`
@@ -112,6 +122,47 @@ const GUI_DROP: DefaultPackage = {
 const MPKG: DefaultPackage = {
     name: 'mpkg', filename: 'mpkg.mpackage', url: mpkgUrl,
 };
+
+/*
+ * Game loaders: what a profile gets in place of the starter UI on the games whose
+ * catalogue entry says `ownUi: 'bundledLoader'`. The three that download an
+ * interface install it on the first connection and then uninstall themselves —
+ * which tombstones the loader's name, so it isn't put back on the next open —
+ * leaving the game's own package (CFGUI, Icesus, MorgenGrauen) in the list.
+ * Downloads go through `downloadFile`, which falls back to the proxy when the
+ * host answers no CORS. MedBootstrap stays installed: it installs MedUI through
+ * mpkg and upgrades it on later opens.
+ */
+const CF_LOADER: DefaultPackage = {
+    name: 'CF_Loader', filename: 'CF-loader.mpackage', url: cfLoaderUrl, replacedBy: 'CFGUI',
+};
+const ICESUS_LOADER: DefaultPackage = {
+    name: 'icesus-loader', filename: 'icesus-loader.mpackage', url: icesusLoaderUrl, replacedBy: 'Icesus',
+};
+const MG_LOADER: DefaultPackage = {
+    name: 'mg-loader', filename: 'mg-loader.mpackage', url: mgLoaderUrl, replacedBy: 'MorgenGrauen',
+};
+const MED_BOOTSTRAP: DefaultPackage = {
+    name: 'MedBootstrap', filename: 'MedBootstrap.mpackage', url: medBootstrapUrl,
+};
+
+/**
+ * Each game's loader and the hosts it is installed for — verbatim from the loader
+ * rows of `defaultScripts` in mudlet.cpp, MorgenGrauen by every name. Matched
+ * exactly (`QStringList::contains` on the lowercased url), not by suffix.
+ */
+const GAME_LOADERS: { pkg: DefaultPackage; hosts: string[] }[] = [
+    { pkg: CF_LOADER, hosts: ['carrionfields.net'] },
+    { pkg: ICESUS_LOADER, hosts: ['icesus.org'] },
+    { pkg: MG_LOADER, hosts: ['mg.mud.de', 'mud.morgengrauen.info', 'mg.morgengrauen.info', 'morgengrauen.info'] },
+    { pkg: MED_BOOTSTRAP, hosts: ['medievia.com'] },
+];
+
+/** The loader Mudlet preinstalls for the game at `host`, if it has one. */
+export function gameLoader(host: string | undefined): DefaultPackage | undefined {
+    if (!host) return undefined;
+    return GAME_LOADERS.find(l => l.hosts.includes(host.toLowerCase()))?.pkg;
+}
 
 /**
  * Whether this build is the one that carries Mudlet's spec corpus — Mudlet Web's
@@ -138,9 +189,43 @@ export const IRE_MAPPER_GAMES = [
     'imperian.com', 'starmourn.com', 'stickmud.com',
 ];
 
+/**
+ * Games whose new profiles start with "fix unnecessary linebreaks" on — verbatim
+ * from `Host::setupIreDriverBugfix`. The IRE mapper's list minus stickmud.com:
+ * IRE servers start every reply after a GA prompt with a stray newline, and other
+ * GA games (StickMUD included) don't.
+ */
+export const IRE_DRIVER_BUGFIX_GAMES = [
+    'achaea.com', 'lusternia.com', 'imperian.com', 'aetolia.com', 'starmourn.com',
+];
+
+/**
+ * Turn `fixUnnecessaryLinebreaks` on for a profile just created for an IRE game —
+ * Mudlet's `Host::setupIreDriverBugfix`, which `loadProfile` calls alongside
+ * `setupPreInstallPackages` when it sets up a brand-new profile.
+ *
+ * Called once, where a profile is created (the connection form, the game list,
+ * a brand's managed profile) — not on every open, so a player who turns the fix
+ * off keeps it off, and an existing profile is never changed under them. Like
+ * desktop it only ever turns the fix on, and it leaves an explicit value alone (a
+ * brand's `profileDefaults` may set one). Imported and linked Mudlet profiles
+ * bring their own setting and are skipped, as they are for the packages.
+ */
+export function setupIreDriverBugfix(connectionId: string): void {
+    const state = useAppStore.getState();
+    const conn = state.connections.find(c => c.id === connectionId);
+    if (!conn || conn.mudletImported || conn.mudletLinked) return;
+    const host = connectionHost(conn);
+    if (!host || !IRE_DRIVER_BUGFIX_GAMES.includes(host)) return;
+    const config = state.connectionProfile[connectionId]?.config;
+    if (config?.fixUnnecessaryLinebreaks !== undefined) return;
+    state.patchConnectionProfile(connectionId, { config: { ...config, fixUnnecessaryLinebreaks: true } });
+}
+
 /** Every bundled default, whatever the host — for tests and tooling. */
 export const ALL_DEFAULTS: DefaultPackage[] = [
-    RUN_LUA_CODE, ECHO, ENABLE_ACCESSIBILITY, DELETE_OLD_PROFILES, MUDLET_MAPPER, GENERIC_MAPPER, MPKG, GUI_DROP, BASE_UI];
+    RUN_LUA_CODE, ECHO, ENABLE_ACCESSIBILITY, DELETE_OLD_PROFILES, MUDLET_MAPPER, GENERIC_MAPPER, MPKG, GUI_DROP, BASE_UI,
+    ...GAME_LOADERS.map(l => l.pkg)];
 
 /**
  * The stock defaults for a profile on `host`.
@@ -153,7 +238,12 @@ export const ALL_DEFAULTS: DefaultPackage[] = [
  *
  * Exactly one mapper, always. `centerview()` is the only thing that moves the
  * map view and only a mapper calls it, so a profile with no mapper never follows
- * the player — and two mappers would both fire on the same movement.
+ * the player — and two mappers would both fire on the same movement. That holds
+ * for the loader games too: Mudlet gives them generic_mapper like everyone else,
+ * and the Icesus and MorgenGrauen packages their loaders fetch uninstall it
+ * themselves, since each brings a mapper of its own.
+ *
+ * A game with a bundled loader gets it ({@link gameLoader}), as Mudlet does.
  *
  * The starter UI is the one host-conditional pick: Mudlet skips it for players
  * who aren't new (`experiencedMudletPlayer()` — any profile folder older than
@@ -184,6 +274,8 @@ export function stockDefaults(
     // Every host gets the package manager, except under the spec corpus — see TEST_BUILD.
     if (!TEST_BUILD) packages.push(MPKG);
     packages.push(GUI_DROP);
+    const loader = gameLoader(host);
+    if (loader) packages.push(loader);
     if (isNewProfile(conn) && !ownUiArrives(host, serverGuiAccepted)) packages.push(BASE_UI);
     return packages;
 }
@@ -315,6 +407,7 @@ export async function ensureDefaultPackages(connectionId: string, vfs: ProfileVF
         // leave it alone. A version mismatch falls through to a clean
         // reinstall: how brands ship package updates to players.
         if (current && (!def.version || current.version === def.version)) continue;
+        if (def.replacedBy && installedPackages.some(p => p.name === def.replacedBy)) continue;
         if (!current && def.removable !== false && removedByUser.has(def.name)) continue;
         try {
             const res = await fetch(def.url);
