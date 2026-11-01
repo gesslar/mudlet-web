@@ -228,6 +228,18 @@ describe('default packages', () => {
             expect(resolveDefaultPackages(stock => [...stock, brandPkg], 'elephant.org').map(d => d.name))
                 .toContain('brand-mapper');
         });
+
+        it('hands a brand function a copy, so editing it leaves the stock defaults alone', () => {
+            const before = stockDefaults('elephant.org').map(p => ({ ...p }));
+            const mutate = (stock: { name: string; filename: string; url: string; removable?: boolean }[]) => {
+                stock.forEach(p => { p.removable = false; });
+                stock.push(brandPkg);
+                return stock;
+            };
+            resolveDefaultPackages(mutate, 'elephant.org');
+            resolveDefaultPackages(mutate, 'elephant.org');
+            expect(stockDefaults('elephant.org')).toEqual(before);
+        });
     });
 
     it('exposes every bundled default regardless of host', () => {

@@ -246,6 +246,10 @@ export interface BrandConfig {
      *   chosen per game), returns the exact list to install. Use it to drop or
      *   add to the stock set without vendoring it, e.g.
      *   `stock => stock.filter(p => p.name !== 'mudlet-base-ui')`.
+     *   It is handed its own copy, so editing it is harmless, but keep it cheap
+     *   and side-effect free: `isPackageRemovable` calls it once per package row
+     *   on every render of the package list, there handing it *every* bundled
+     *   default (both mappers, every game loader) rather than one game's pick.
      *
      * So a brand shipping its own mapper just lists it here and ours never
      * appears; nothing arbitrates between them at install time, which is why the

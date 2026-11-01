@@ -100,6 +100,13 @@ that file as the source of truth.
   Or pass a function: it is handed the stock defaults this game would get and
   returns the exact list, so you can drop one without vendoring the rest —
   `packages: stock => stock.filter(p => p.name !== 'mudlet-base-ui')`.
+  The function gets its own copy of the list and its entries, so editing them
+  does no harm, but keep it cheap and free of side effects: besides install, it
+  runs whenever the package list asks whether a package may be uninstalled —
+  once per row, on every render — and there it is handed *every* bundled
+  default (both mappers, every game loader), not just this game's. Decide by
+  package name rather than by what `stock` happens to contain, or the lock the
+  package list shows can disagree with what was installed.
   See [Bundling Lua packages](#bundling-lua-packages) below.
 - **`requestPersistentStorage`** — `false` stops the client from calling
   `navigator.storage.persist()` when a profile is opened or imported (default
